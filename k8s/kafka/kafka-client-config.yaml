@@ -1,0 +1,12 @@
+---
+# MirrordKafkaClientConfig - defines how to connect to Kafka cluster
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordKafkaClientConfig
+metadata:
+  name: kafka-test-config
+  namespace: mirrord
+spec:
+  properties:
+  - name: bootstrap.servers
+    value: kafka-cluster.test-mirrord.svc.cluster.local:9092
+

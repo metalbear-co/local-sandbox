@@ -1,0 +1,55 @@
+version: '3'
+
+# SQS/LocalStack-specific test operations
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "/Users/vrashkov/Projects/vrashkov/metalbear/work/mirrord/target/aarch64-apple-darwin/debug/mirrord"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+
+tasks:
+  send-message:
+    desc: Send test message to SQS queue
+    vars:
+      TENANT: '{{.TENANT | default "Avi.Test"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - kubectl exec -n localstack $(kubectl get pod -n localstack -l app.kubernetes.io/name=localstack -o jsonpath='{.items[0].metadata.name}') -- awslocal sqs send-message --queue-url {{.QUEUE_URL}} --region {{.REGION}} --message-body '{{.MESSAGE}}' --message-attributes 'tenant={StringValue={{.TENANT}},DataType=String}'
+
+  run:local:
+    desc: Run SQS consumer locally with mirrord
+    dir: '{{.ROOT_DIR}}/apps/sqs-consumer'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/sqs-consumer main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer'
+
+  logs:
+    desc: Show SQS consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=sqs-consumer --tail=100 -f
+
+  logs:localstack:
+    desc: Show LocalStack logs
+    cmds:
+      - kubectl logs -n localstack -l app.kubernetes.io/name=localstack --tail=100 -f
+
+  describe:
+    desc: Show SQS consumer pod details
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=sqs-consumer
+
+  shell:
+    desc: Get shell in SQS consumer pod
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=sqs-consumer -o jsonpath='{.items[0].metadata.name}') -- sh
+
+  registry:
+    desc: Show queue registry
+    cmds:
+      - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} -o yaml
+

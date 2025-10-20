@@ -1,0 +1,30 @@
+{
+    "operator": true,
+    "target": {
+        "path": "deployment/mysql-app",
+        "namespace": "test-mirrord"
+    },
+    "feature": {
+        "env": true,
+        "fs": "local",
+        "network": {
+            "incoming": "off",
+            "outgoing": true
+        },
+        "db_branches": [
+            {
+                "id": "mysql-dev-branch",
+                "type": "mysql",
+                "version": "8.0",
+                "name": "mydatabase",
+                "ttl_secs": 600,
+                "connection": {
+                    "url": {
+                        "type": "env",
+                        "variable": "DB_CONNECTION_URL"
+                    }
+                }
+            }
+        ]
+    }
+}

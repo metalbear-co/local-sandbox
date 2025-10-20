@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kafka-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka-consumer
+  template:
+    metadata:
+      labels:
+        app: kafka-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: kafka-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "kafka-cluster.test-mirrord.svc.cluster.local:9092"
+        - name: KAFKA_TOPIC_NAME
+          value: "test-topic"
+        - name: KAFKA_GROUP_ID
+          value: "test-consumer-group"
+

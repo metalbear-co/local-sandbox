@@ -1,0 +1,13 @@
+operator:
+  image: mirrord-operator
+  sqsSplitting: true
+  kafkaSplitting: true
+  mysqlBranching: true
+  awsRoleArn: arn:aws:iam::000000000000:role/dummy
+  metrics: true 
+  jsonLog: true
+license:
+  pemRef: "mirrord-operator-license-pem"
+createNamespace: false
+image:
+  pullPolicy: Never

@@ -1,0 +1,2 @@
+# MySQL deployment is in k8s/mysql/
+# This overlay only includes the mirrord config

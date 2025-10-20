@@ -1,0 +1,9 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: mirrord-operator
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "rootpassword"
+

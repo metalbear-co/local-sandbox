@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mysql-app
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mysql-app
+  template:
+    metadata:
+      labels:
+        app: mysql-app
+    spec:
+      containers:
+      - name: app
+        image: mysql-app:local
+        imagePullPolicy: Never
+        env:
+        - name: DB_CONNECTION_URL
+          value: "mysql://myuser:mypassword@mysql.test-mirrord.svc.cluster.local:3306/mydatabase?parseTime=true"
+

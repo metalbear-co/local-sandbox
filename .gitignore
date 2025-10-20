@@ -1,0 +1,10 @@
+.operator-built
+*.log
+scripts/*.license
+scripts/company-license.pem
+scripts/license-issuer.pem
+
+# Local environment overrides (optional)
+.env.local
+.env
+.DS_Store

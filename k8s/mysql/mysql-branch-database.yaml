@@ -1,0 +1,18 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MysqlBranchDatabase
+metadata:
+  name: mysql-app-branch
+  namespace: test-mirrord
+spec:
+  id: mysql-dev-branch
+  target:
+    deployment: mysql-app
+  connectionSource:
+    url:
+      env:
+        variable: DB_CONNECTION_URL
+        container: app
+  databaseName: mydatabase
+  mysqlVersion: "8.0"
+  ttlSecs: 600
+

@@ -1,0 +1,15 @@
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordWorkloadQueueRegistry
+metadata:
+  name: sqs-test-registry
+  namespace: test-mirrord
+spec:
+  queues:
+    test-queue:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_NAME
+  consumer:
+    name: sqs-consumer
+    workloadType: Deployment
+

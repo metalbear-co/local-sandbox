@@ -1,0 +1,18 @@
+{
+  "target": {
+    "path": "deployment/sqs-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "test-queue": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "tenant": "^Avi\\."
+        }
+      }
+    }
+  }
+}
+

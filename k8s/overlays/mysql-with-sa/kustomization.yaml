@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../mysql
+  - service-account.yaml
+
+patches:
+  - patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: mysql-app
+        namespace: test-mirrord
+      spec:
+        template:
+          spec:
+            serviceAccountName: mysql-test-sa
+

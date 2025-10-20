@@ -1,0 +1,197 @@
+version: '3'
+
+# MySQL-specific test operations
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "/Users/vrashkov/Projects/vrashkov/metalbear/work/mirrord/target/aarch64-apple-darwin/debug/mirrord"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+
+tasks:
+  insert-user:
+    desc: Insert test user into MySQL
+    vars:
+      NAME: '{{.NAME | default "TestUser"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=mysql -o jsonpath='{.items[0].metadata.name}')
+        echo "Inserting user {{.NAME}} into MySQL..."
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -u root -prootpassword -e "USE mydatabase; INSERT INTO app_users (name) VALUES ('{{.NAME}}');"
+        echo "User inserted"
+
+  run:local:
+    desc: Run MySQL app locally with mirrord (creates branch DB)
+    dir: '{{.ROOT_DIR}}/apps/mysql-app'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mysql/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/mysql-app main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/mysql-app'
+
+  logs:
+    desc: Show MySQL app logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=mysql-app --tail=100 -f
+
+  logs:mysql:
+    desc: Show MySQL server logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=mysql --tail=100 -f
+
+  describe:
+    desc: Show MySQL app pod details
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=mysql-app
+
+  describe:mysql:
+    desc: Show MySQL server pod details
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=mysql
+
+  shell:
+    desc: Get shell in MySQL app pod
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=mysql-app -o jsonpath='{.items[0].metadata.name}') -- sh
+
+  shell:mysql:
+    desc: Get shell in MySQL server pod
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=mysql -o jsonpath='{.items[0].metadata.name}') -- bash
+
+  query:
+    desc: Run SQL query in MAIN MySQL database
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM app_users;"}}'
+      DATABASE: '{{.DATABASE | default "mydatabase"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=mysql -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -u root -prootpassword -e "USE {{.DATABASE}}; {{.QUERY}}"
+
+  exec:
+    desc: Execute custom SQL on MAIN MySQL database (remote/production)
+    vars:
+      SQL: '{{.SQL}}'
+      DATABASE: '{{.DATABASE | default "mydatabase"}}'
+    cmds:
+      - |
+        if [ -z "{{.SQL}}" ]; then
+          echo "Error: SQL parameter is required"
+          echo "Usage: task mysql:exec SQL='YOUR SQL HERE'"
+          echo ""
+          echo "Examples:"
+          echo "  task mysql:exec SQL='SELECT COUNT(*) FROM app_users;'"
+          echo "  task mysql:exec SQL='UPDATE app_users SET name=\"Updated\" WHERE id=1;'"
+          echo "  task mysql:exec SQL='DELETE FROM app_users WHERE id > 5;'"
+          echo "  task mysql:exec SQL=\"SELECT * FROM app_users WHERE name LIKE '%Test%';\""
+          exit 1
+        fi
+        
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=mysql -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Main MySQL database not found"
+          exit 1
+        fi
+        
+        echo "Executing SQL on MAIN database pod: $POD"
+        echo "SQL: {{.SQL}}"
+        echo ""
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -u root -prootpassword -e "USE {{.DATABASE}}; {{.SQL}}"
+
+  branches:
+    desc: Show MySQL branch databases
+    cmds:
+      - |
+        echo "=== MySQL Branch Databases ==="
+        kubectl get mysqlbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,BRANCH_ID:.spec.id,PHASE:.status.phase,EXPIRES:.status.expireTime
+        echo ""
+        echo "=== Branch Database Pods ==="
+        kubectl get pods -n {{.NAMESPACE}} --no-headers | grep "mirrord-mysql-branch-db-pod" | awk '{print $1}'
+
+  query:branch:
+    desc: Query a specific branch database (use BRANCH_POD to specify, or picks first available)
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM app_users;"}}'
+      BRANCH_POD: '{{.BRANCH_POD | default ""}}'
+    cmds:
+      - |
+        # Get branch database pod name
+        if [ -n "{{.BRANCH_POD}}" ]; then
+          BRANCH_POD="{{.BRANCH_POD}}"
+        else
+          BRANCH_POD=$(kubectl get pods -n {{.NAMESPACE}} --no-headers | grep "mirrord-mysql-branch-db-pod" | awk '{print $1}' | head -n1)
+        fi
+        
+        if [ -z "$BRANCH_POD" ]; then
+          echo "Branch database not found or not ready"
+          echo ""
+          echo "Start local app first with: task mysql:run:local"
+          echo "Or specify a branch pod with: BRANCH_POD=<pod-name>"
+          echo ""
+          echo "Available branch databases:"
+          kubectl get mysqlbranchdatabases -n {{.NAMESPACE}}
+          exit 1
+        fi
+        
+        echo "Querying branch database pod: $BRANCH_POD"
+        kubectl exec -n {{.NAMESPACE}} "$BRANCH_POD" -- mysql -u root -pmysql-branch-pod-root-password -e "USE mydatabase; {{.QUERY}}"
+
+  insert:branch:
+    desc: Insert user into branch database (use BRANCH_POD to specify, or picks first available)
+    vars:
+      NAME: '{{.NAME | default "BranchUser"}}'
+      BRANCH_POD: '{{.BRANCH_POD | default ""}}'
+    cmds:
+      - |
+        # Get branch database pod name
+        if [ -n "{{.BRANCH_POD}}" ]; then
+          BRANCH_POD="{{.BRANCH_POD}}"
+        else
+          BRANCH_POD=$(kubectl get pods -n {{.NAMESPACE}} --no-headers | grep "mirrord-mysql-branch-db-pod" | awk '{print $1}' | head -n1)
+        fi
+        
+        if [ -z "$BRANCH_POD" ]; then
+          echo "Branch database not found. Start local app first with: task mysql:run:local"
+          exit 1
+        fi
+        
+        echo "Inserting '{{.NAME}}' into branch database pod: $BRANCH_POD"
+        kubectl exec -n {{.NAMESPACE}} "$BRANCH_POD" -- mysql -u root -pmysql-branch-pod-root-password -e "USE mydatabase; INSERT INTO app_users (name) VALUES ('{{.NAME}}');"
+        echo "User inserted into BRANCH database only"
+
+  exec:branch:
+    desc: Execute custom SQL on branch database (use BRANCH_POD to specify, or picks first available)
+    vars:
+      SQL: '{{.SQL}}'
+      BRANCH_POD: '{{.BRANCH_POD | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.SQL}}" ]; then
+          echo "Error: SQL parameter is required"
+          echo "Usage: task mysql:exec:branch SQL='YOUR SQL HERE' [BRANCH_POD=pod-name]"
+          echo ""
+          echo "Examples:"
+          echo "  task mysql:exec:branch SQL='SELECT COUNT(*) FROM app_users;'"
+          echo "  task mysql:exec:branch SQL='UPDATE app_users SET name=\"Updated\" WHERE id=1;'"
+          echo "  task mysql:exec:branch SQL='DELETE FROM app_users WHERE id > 5;'"
+          exit 1
+        fi
+        
+        # Get branch database pod name
+        if [ -n "{{.BRANCH_POD}}" ]; then
+          BRANCH_POD="{{.BRANCH_POD}}"
+        else
+          BRANCH_POD=$(kubectl get pods -n {{.NAMESPACE}} --no-headers | grep "mirrord-mysql-branch-db-pod" | awk '{print $1}' | head -n1)
+        fi
+        
+        if [ -z "$BRANCH_POD" ]; then
+          echo "Branch database not found. Start local app first with: task mysql:run:local"
+          exit 1
+        fi
+        
+        echo " Executing SQL on branch database pod: $BRANCH_POD"
+        echo "SQL: {{.SQL}}"
+        echo ""
+        kubectl exec -n {{.NAMESPACE}} "$BRANCH_POD" -- mysql -u root -pmysql-branch-pod-root-password -e "USE mydatabase; {{.SQL}}"
+

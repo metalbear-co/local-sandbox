@@ -1,0 +1,23 @@
+---
+# MirrordKafkaTopicsConsumer - defines which topics the app consumes
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordKafkaTopicsConsumer
+metadata:
+  name: kafka-consumer
+  namespace: test-mirrord
+spec:
+  consumerApiVersion: apps/v1
+  consumerKind: Deployment
+  consumerName: kafka-consumer
+  topics:
+  - id: test-topic
+    clientConfig: kafka-test-config
+    groupIdSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_GROUP_ID
+    nameSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_TOPIC_NAME
+

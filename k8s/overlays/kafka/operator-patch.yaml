@@ -1,0 +1,9 @@
+spec:
+  template:
+    spec:
+      containers:
+      - name: mirrord-operator
+        env:
+        - name: KAFKA_BROKERS
+          value: "kafka-cluster.test-mirrord.svc.cluster.local:9092"
+

@@ -1,0 +1,89 @@
+version: '3'
+
+# Kafka-specific test operations
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "/Users/vrashkov/Projects/vrashkov/metalbear/work/mirrord/target/aarch64-apple-darwin/debug/mirrord"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+
+tasks:
+  send-message:
+    desc: Send test message to Kafka topic with headers
+    vars:
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      USER_ID: '{{.USER_ID | default ""}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        if [ -n "{{.USER_ID}}" ]; then
+          echo "Sending message with header user_id={{.USER_ID}} to topic {{.TOPIC}}..."
+          printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic {{.TOPIC}} --property 'parse.headers=true' --property 'headers.delimiter=|'
+          echo "Message sent with header user_id={{.USER_ID}}"
+        else
+          echo "Sending message without headers to topic {{.TOPIC}}..."
+          printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic {{.TOPIC}}
+          echo "Message sent"
+        fi
+
+  run:local:
+    desc: Run Kafka consumer locally with mirrord
+    dir: '{{.ROOT_DIR}}/apps/kafka-consumer'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer'
+
+  logs:
+    desc: Show Kafka consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=kafka-consumer --tail=100 -f
+
+  logs:kafka:
+    desc: Show Kafka server logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=kafka-cluster --tail=100 -f
+
+  describe:
+    desc: Show Kafka consumer pod details
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-consumer
+
+  describe:kafka:
+    desc: Show Kafka cluster pod details
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-cluster
+
+  shell:
+    desc: Get shell in Kafka consumer pod
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-consumer -o jsonpath='{.items[0].metadata.name}') -- sh
+
+  shell:kafka:
+    desc: Get shell in Kafka cluster pod
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- bash
+
+  topics:
+    desc: List Kafka topics
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+
+  topics:create:
+    desc: Create Kafka topic
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      PARTITIONS: '{{.PARTITIONS | default "3"}}'
+      REPLICATION: '{{.REPLICATION | default "1"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --topic {{.TOPIC}} --partitions {{.PARTITIONS}} --replication-factor {{.REPLICATION}}
+
+  consume:
+    desc: Consume messages from Kafka topic
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --from-beginning
