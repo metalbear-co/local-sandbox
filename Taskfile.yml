@@ -52,7 +52,7 @@ tasks:
     desc: Build operator with custom tag
     dir: '{{.OPERATOR_DIR}}'
     cmds:
-      - docker build . -f Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" --no-cache
+      - docker build . -f Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)"
       - task: operator:tag-and-load
       - echo "Operator built and tagged as mirrord-operator:{{.CHART_VERSION}}"
 
