@@ -131,7 +131,8 @@ tasks:
   infra:all:
     desc: Install all infrastructure dependencies
     cmds:
-      - echo "Infrastructure ready (Argo Rollouts skipped - install manually with 'task infra:argo-rollouts' if needed)"
+      - task: infra:argo-rollouts
+      - echo "Infrastructure ready"
 
   infra:status:
     desc: Check infrastructure component status
