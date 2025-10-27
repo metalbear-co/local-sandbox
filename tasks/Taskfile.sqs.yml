@@ -5,7 +5,7 @@ version: '3'
 vars:
   ROOT_DIR:
     sh: cd .. && pwd
-  MIRRORD_BIN: '{{.MIRRORD_BIN | default "/Users/vrashkov/Projects/vrashkov/metalbear/work/mirrord/target/aarch64-apple-darwin/debug/mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN}}'
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
 
 tasks:
@@ -52,4 +52,3 @@ tasks:
     desc: Show queue registry
     cmds:
       - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} -o yaml
-
