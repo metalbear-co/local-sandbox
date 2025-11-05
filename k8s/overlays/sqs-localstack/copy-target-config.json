@@ -1,0 +1,15 @@
+{
+    "target": {
+        "path": "deployment/sqs-consumer",
+        "namespace": "test-mirrord"
+    },
+    "operator": true,
+    "feature": {
+        "copy_target": {
+            "enabled": true,
+            "scale_down": false
+        },
+        "env": false,
+        "fs": "local"
+    }
+}

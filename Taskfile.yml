@@ -52,7 +52,7 @@ tasks:
     desc: Build operator with custom tag
     dir: '{{.OPERATOR_DIR}}'
     cmds:
-      - docker build . -f Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)"
+      - docker build . -f Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem) --no-cache"
       - task: operator:tag-and-load
       - echo "Operator built and tagged as mirrord-operator:{{.CHART_VERSION}}"
 
@@ -60,7 +60,12 @@ tasks:
     desc: Tag and load existing operator image into minikube
     cmds:
       - docker tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.CHART_VERSION}}
+      - echo "Removing old image from minikube to ensure fresh load..."
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
+      - echo "Loading fresh operator image into minikube..."
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
+      - echo "Verifying image is loaded..."
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker images mirrord-operator:{{.CHART_VERSION}}"
 
   build:app:sqs:
     desc: Build SQS consumer app
@@ -178,6 +183,17 @@ tasks:
     cmds:
       - helm uninstall mirrord-operator -n mirrord || true
       - kubectl delete namespace mirrord --ignore-not-found=true
+
+  operator:update:
+    desc: Quick update - rebuild operator and upgrade in cluster (no cluster deletion)
+    cmds:
+      - task: build:operator
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - echo "Force deleting old operator pods to ensure fresh image is used..."
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - echo "Waiting for new operator pod to be ready..."
+      - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
+      - echo "Operator updated successfully"
 
   # Internal test runner
   _run-test:
@@ -425,6 +441,37 @@ tasks:
     desc: Show operator logs
     cmds:
       - kubectl logs -n mirrord deployment/mirrord-operator --tail=100 -f
+
+  # Copy target testing
+  test:copy-target:setup:
+    desc: Setup environment for copy-target testing
+    deps: [build:app:sqs, operator:install]
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack
+      - kubectl wait --for=condition=ready pod -l app=sqs-consumer -n {{.NAMESPACE}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=localstack -n localstack --timeout=120s
+      - echo "Environment ready. Run 'task test:copy-target:run' to create copy-target pod"
+
+  test:copy-target:run:
+    desc: Create a copy-target pod (foreground, runs 10min)
+    cmds:
+      - |
+        echo "Starting mirrord with copy_target..."
+        {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/sqs-localstack/copy-target-config.json -- sleep 10
+
+  test:copy-target:run-long:
+    desc: Create a long-running copy-target pod (10 minutes)
+    cmds:
+      - |
+        echo "Starting long-running mirrord copy-target (600s)..."
+        {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/sqs-localstack/copy-target-config.json -- sleep 600
+
+  test:copy-target:restart-operator:
+    desc: Restart the operator pod
+    cmds:
+      - kubectl delete pod -n mirrord -l app=mirrord-operator
+      - kubectl wait --for=condition=ready pod -n mirrord -l app=mirrord-operator --timeout=120s
+      - echo "Operator restarted"
 
   # Quick test cycle
   dev:
