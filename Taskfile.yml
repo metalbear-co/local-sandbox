@@ -27,7 +27,7 @@ vars:
   SCRIPTS_DIR: '{{.ROOT_DIR}}/scripts'
   MIRRORD_DIR: '{{.ROOT_DIR}}/../mirrord'
   OPERATOR_IMAGE: mirrord-operator:custom
-  CHART_VERSION:
+  CHART_VERSION: 
     sh: grep "appVersion:" {{.CHARTS_DIR}}/Chart.yaml | awk '{print $2}' | tr -d '"'
   NAMESPACE: test-mirrord
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}' # Set CLUSTER_NAME env var to use a custom cluster
@@ -100,12 +100,20 @@ tasks:
       - docker build -t mysql-app:local .
       - minikube -p {{.CLUSTER_NAME}} image load mysql-app:local
 
+  build:app:postgres:
+    desc: Build PostgreSQL app
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    cmds:
+      - docker build -t postgres-app:local .
+      - minikube -p {{.CLUSTER_NAME}} image load postgres-app:local
+
   build:app:
     desc: Build all consumer apps
     cmds:
       - task: build:app:sqs
       - task: build:app:kafka
       - task: build:app:mysql
+      - task: build:app:postgres
 
   build:
     desc: Build all images
@@ -365,10 +373,9 @@ tasks:
 
   test:postgres:
     desc: Run PostgreSQL branching test
-    deps: [operator:install]
+    deps: [cli:build, operator:install]
     cmds:
-      - task: postgres:deploy
-      - task: postgres:verify
+      - task: postgres:test
 
   test:postgres:verify:
     desc: Verify PostgreSQL test results

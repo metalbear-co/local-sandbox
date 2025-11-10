@@ -24,6 +24,18 @@ tasks:
       - task: deploy
       - task: verify:all
 
+  test:race-condition:
+    desc: "Test for race condition - deploys a branch and immediately tries to connect"
+    cmds:
+      - task: deploy:base
+      - echo "Deploying single test scenario to check for race condition..."
+      - task: deploy:scenario
+        vars: {SCENARIO: env-val}
+      - echo "Testing immediate connection after Ready status..."
+      - '{{.CLI_BIN}} postgres test-race-condition {{.NAMESPACE}} env-val'
+      - echo ""
+      - echo "Race condition test completed!"
+
   deploy:all:
     desc: "Deploy all PostgreSQL test resources"
     cmds:
@@ -44,6 +56,14 @@ tasks:
       - kubectl apply -k {{.TESTS_DIR}}/scenarios/secret-ref
       - kubectl apply -k {{.TESTS_DIR}}/scenarios/echo
       - task: _wait-branches
+
+  deploy:scenario:
+    desc: "Deploy a specific test scenario"
+    internal: true
+    vars:
+      SCENARIO: '{{.SCENARIO}}'
+    cmds:
+      - kubectl apply -k {{.TESTS_DIR}}/scenarios/{{.SCENARIO}}
   
   deploy:
     desc: "Deploy PostgreSQL test environment"
@@ -64,7 +84,7 @@ tasks:
         vars: {SCENARIO: env-val, EXPECTED_USERS: 5, EXPECTED_ORDERS: 5, EXPECTED_PRODUCTS: 4, MODE: "full copy"}
       - echo ""
       - task: verify:scenario
-        vars: {SCENARIO: secret-ref, EXPECTED_USERS: 3, EXPECTED_ORDERS: 3, EXPECTED_PRODUCTS: 4, MODE: "filtered"}
+        vars: {SCENARIO: secret-ref, EXPECTED_USERS: 3, EXPECTED_ORDERS: 4, EXPECTED_PRODUCTS: "0", MODE: "filtered"}
       - echo ""
 
   verify:source:

@@ -14,7 +14,7 @@ func ExecPostgres(namespace, podName, database, query string) (string, error) {
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return "", fmt.Errorf("postgres query failed: %w", err)
+		return "", fmt.Errorf("postgres query failed: %w\nOutput: %s", err, string(output))
 	}
 
 	return string(output), nil

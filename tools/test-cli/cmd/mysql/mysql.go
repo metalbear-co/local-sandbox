@@ -30,6 +30,8 @@ func Handle(ctx context.Context, args []string) error {
 		return WaitSource(ctx, cmdArgs)
 	case "wait-namespace-deletion":
 		return WaitNamespaceDeletion(ctx, cmdArgs)
+	case "test-race-condition":
+		return TestRaceCondition(ctx, cmdArgs)
 	default:
 		return fmt.Errorf("unknown mysql command: %s", command)
 	}
@@ -197,4 +199,72 @@ func WaitNamespaceDeletion(ctx context.Context, args []string) error {
 
 	fmt.Println("Namespace deleted")
 	return nil
+}
+
+// TestRaceCondition tests if the database is actually ready when status is marked Ready
+// This catches the race condition where pod is Running but MySQL isn't ready yet
+func TestRaceCondition(ctx context.Context, args []string) error {
+	if len(args) < 3 {
+		return fmt.Errorf("usage: test-race-condition <namespace> <scenario> <password>")
+	}
+
+	namespace := args[0]
+	scenario := args[1]
+	password := args[2]
+
+	client, err := k8s.NewClient()
+	if err != nil {
+		return fmt.Errorf("failed to create k8s client: %w", err)
+	}
+
+	branchName := fmt.Sprintf("mysql-test-branch-%s", scenario)
+
+	fmt.Printf("Watching for branch %s to become Ready...\n", branchName)
+
+	// Wait for CR to be marked Ready
+	if err := wait.ForBranchDatabaseReady(ctx, client, namespace, branchName, "MysqlBranchDatabase", 120*time.Second); err != nil {
+		return fmt.Errorf("branch database never became ready: %w", err)
+	}
+
+	fmt.Println("Status is Ready - attempting immediate connection (this should work without race condition)...")
+
+	// Get the branch pod
+	labelSelector := fmt.Sprintf("db-owner-name=%s", branchName)
+	branchPod, err := client.GetPod(ctx, namespace, labelSelector)
+	if err != nil {
+		return fmt.Errorf("failed to get branch pod: %w", err)
+	}
+
+	dbName := branchName
+
+	// Try to connect immediately (multiple attempts to catch race condition)
+	maxAttempts := 5
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		fmt.Printf("Connection attempt %d/%d...\n", attempt, maxAttempts)
+
+		// Try a simple query
+		query := "SELECT 1 as ready"
+		output, err := database.ExecMySQL(namespace, branchPod.Name, dbName, query, password)
+
+		if err != nil {
+			if attempt == maxAttempts {
+				return fmt.Errorf("RACE CONDITION DETECTED: Pod marked Ready but MySQL not accepting connections after %d attempts: %w", maxAttempts, err)
+			}
+			fmt.Printf("   Failed (attempt %d): %v\n", attempt, err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if strings.Contains(output, "ready") {
+			fmt.Printf("Connection successful on attempt %d\n", attempt)
+			if attempt > 1 {
+				fmt.Printf("WARNING: Connection failed on first attempt but succeeded later - potential race condition\n")
+			} else {
+				fmt.Println("No race condition detected - database ready immediately when status was Ready")
+			}
+			return nil
+		}
+	}
+
+	return fmt.Errorf("RACE CONDITION: Failed to connect after %d attempts", maxAttempts)
 }

@@ -7,13 +7,17 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
 
 type Client struct {
-	clientset *kubernetes.Clientset
+	clientset     *kubernetes.Clientset
+	dynamicClient dynamic.Interface
 }
 
 func NewClient() (*Client, error) {
@@ -27,7 +31,15 @@ func NewClient() (*Client, error) {
 		return nil, fmt.Errorf("failed to create kubernetes clientset: %w", err)
 	}
 
-	return &Client{clientset: clientset}, nil
+	dynamicClient, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create dynamic client: %w", err)
+	}
+
+	return &Client{
+		clientset:     clientset,
+		dynamicClient: dynamicClient,
+	}, nil
 }
 
 func getConfig() (*rest.Config, error) {
@@ -54,7 +66,16 @@ func (c *Client) GetPod(ctx context.Context, namespace, labelSelector string) (*
 		return nil, fmt.Errorf("no pods found with selector: %s", labelSelector)
 	}
 
-	return &pods.Items[0], nil
+	// Filter out job pods - we only want database pods (those without the "job-name" label)
+	for _, pod := range pods.Items {
+		if pod.Labels != nil {
+			if _, hasJobLabel := pod.Labels["job-name"]; !hasJobLabel {
+				return &pod, nil
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no non-job pods found with selector: %s", labelSelector)
 }
 
 func (c *Client) WaitForNamespaceDeletion(ctx context.Context, namespace string, timeout time.Duration) error {
@@ -114,3 +135,36 @@ func (c *Client) WaitForPodReady(ctx context.Context, namespace, labelSelector s
 	}
 }
 
+// IsBranchDatabaseReady checks if a branch database CR has status phase Ready
+func (c *Client) IsBranchDatabaseReady(ctx context.Context, namespace, branchName, kind string) (bool, error) {
+	// Get the custom resource
+	gvr := schema.GroupVersionResource{
+		Group:   "dbs.mirrord.metalbear.co",
+		Version: "v1alpha1",
+	}
+
+	// Set resource name based on kind
+	if kind == "MysqlBranchDatabase" {
+		gvr.Resource = "mysqlbranchdatabases"
+	} else if kind == "PgBranchDatabase" {
+		gvr.Resource = "pgbranchdatabases"
+	} else {
+		return false, fmt.Errorf("unsupported kind: %s", kind)
+	}
+
+	obj, err := c.dynamicClient.Resource(gvr).Namespace(namespace).Get(ctx, branchName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+
+	// Extract status.phase
+	status, found, err := unstructured.NestedString(obj.Object, "status", "phase")
+	if err != nil {
+		return false, fmt.Errorf("error reading status.phase: %w", err)
+	}
+	if !found {
+		return false, nil
+	}
+
+	return status == "Ready", nil
+}

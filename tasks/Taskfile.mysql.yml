@@ -25,6 +25,18 @@ tasks:
       - task: refresh
       - task: verify:all
 
+  test:race-condition:
+    desc: "Test for race condition - deploys a branch and immediately tries to connect"
+    cmds:
+      - task: deploy:base
+      - echo "Deploying single test scenario to check for race condition..."
+      - task: deploy:scenario
+        vars: {SCENARIO: env-val}
+      - echo "Testing immediate connection after Ready status..."
+      - '{{.CLI_BIN}} mysql test-race-condition {{.NAMESPACE}} env-val {{.MYSQL_ROOT_PASSWORD}}'
+      - echo ""
+      - echo "Race condition test completed!"
+
   
   deploy:all:
     desc: "Deploy all test scenarios"

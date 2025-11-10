@@ -1,11 +1,13 @@
 package wait
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/metalbear-co/test-cli/pkg/database"
+	"github.com/metalbear-co/test-cli/pkg/k8s"
 )
 
 // ForDatabase waits for a database to be ready by attempting connections
@@ -60,3 +62,28 @@ func ForPostgresDatabase(namespace, podName, dbName string, maxAttempts int) err
 	return fmt.Errorf("timeout waiting for database to be ready")
 }
 
+// ForBranchDatabaseReady waits for a branch database CR to have status Ready
+func ForBranchDatabaseReady(ctx context.Context, client *k8s.Client, namespace, branchName, kind string, timeout time.Duration) error {
+	fmt.Printf("Waiting for %s %s to become Ready...\n", kind, branchName)
+
+	deadline := time.Now().Add(timeout)
+	checkInterval := 2 * time.Second
+
+	for time.Now().Before(deadline) {
+		ready, err := client.IsBranchDatabaseReady(ctx, namespace, branchName, kind)
+		if err != nil {
+			fmt.Printf("Error checking status: %v\n", err)
+			time.Sleep(checkInterval)
+			continue
+		}
+
+		if ready {
+			fmt.Printf("%s %s is Ready\n", kind, branchName)
+			return nil
+		}
+
+		time.Sleep(checkInterval)
+	}
+
+	return fmt.Errorf("timeout waiting for %s %s to become Ready", kind, branchName)
+}
