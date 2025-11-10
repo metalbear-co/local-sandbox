@@ -1,35 +1,66 @@
-# Integration Tests
+# mirrord Operator Test Sandbox
 
-Clean test harness for mirrord operator
+Local testing environment for mirrord operator features.
 
 ## Prerequisites
 
-- **minikube** - https://minikube.sigs.k8s.io/docs/start/
-- **task** - https://taskfile.dev/installation/
-- **kubectl** - https://kubernetes.io/docs/tasks/tools/
-- **helm** - https://helm.sh/docs/intro/install/
-- **docker** - https://docs.docker.com/get-docker/
-- **go** - https://golang.org/dl/
+- minikube, task, kubectl, helm, docker
 
-## Quick Start 
-1.  create .env and modify it, "MIRRORD_BIN" is the only required one
-2. Run:
+## Quick Start
+
 ```bash
-# Generate license (first time only)
+# Setup
 task license:generate
+task cluster:create
+task operator:install
 
 # Run tests
-task test:sqs:clean         # SQS + LocalStack
-task test:kafka:clean       # Kafka
-task test:mysql:cleand      # MySQL
-
-task --list                 # List all tasks
+task test:mysql
+task test:postgres
 ```
 
-## Tips
+## MySQL Tests
 
-- Use `-nobuild` variants to skip operator rebuild (faster iteration)
-- ServiceAccount tests verify RBAC configurations
-- MySQL branches auto-delete after TTL (600s = 10 minutes)
-- Kafka message filtering uses headers (not keys)
-- Default test data: MySQL has `Alice` and `Bob` users
+```bash
+# Full test
+task test:mysql
+
+# Quick test (no cluster rebuild)
+task test:mysql:quick
+
+# Verify results
+task mysql:verify:all
+
+# Check status
+task mysql:status
+task mysql:branches
+```
+
+## Postgres Tests
+
+```bash
+task test:postgres
+task postgres:verify:all
+task postgres:status
+```
+
+## Other Tests
+
+```bash
+task test:sqs
+task test:kafka
+```
+
+## Development
+
+```bash
+# Rebuild operator
+task build:operator
+task operator:install
+
+# Build test CLI
+task cli:build
+
+# List all commands
+task --list
+```

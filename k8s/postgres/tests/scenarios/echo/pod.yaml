@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-server-echo
+  namespace: test-mirrord
+  labels:
+    test-scenario: echo
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres echo server running' && sleep 3600"]
+

@@ -1,0 +1,23 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MysqlBranchDatabase
+metadata:
+  name: mysql-test-branch-secret-ref
+spec:
+  id: mysql-test-secret-ref-branch
+  target:
+    pod: server-secret-ref
+  connectionSource:
+    url:
+      env:
+        variable: MYSQL_CONNECTION_URL
+        container: echo
+  databaseName: user
+  mysqlVersion: "8.0"
+  ttlSecs: 600
+  copy:
+    mode: schema  # Copy only schema with filtered data
+    tables:
+      users:
+        filter: "id > 1"  # Only Bob (id=2)
+      orders: {}  # All orders
+

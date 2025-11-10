@@ -12,6 +12,12 @@ includes:
   kafka:
     taskfile: ./tasks/Taskfile.kafka.yml
     dir: ./tasks
+  postgres:
+    taskfile: ./tasks/Taskfile.postgres.yml
+    dir: ./tasks
+  cli:
+    taskfile: ./tools/test-cli/Taskfile.yml
+    dir: ./tools/test-cli
 
 vars:
   ROOT_DIR:
@@ -50,11 +56,17 @@ tasks:
   # Build images
   build:operator:
     desc: Build operator with custom tag
-    dir: '{{.OPERATOR_DIR}}'
     cmds:
-      - docker build . -f Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem) --no-cache"
+      - cd {{.OPERATOR_DIR}}/.. && docker build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:tag-and-load
       - echo "Operator built and tagged as mirrord-operator:{{.CHART_VERSION}}"
+
+  build:operator:nocache:
+    desc: Build operator without any caching (clean build)
+    cmds:
+      - cd {{.OPERATOR_DIR}}/.. && docker build --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" --build-arg USE_SCCACHE=false operator
+      - task: operator:tag-and-load
+      - echo "Operator built without cache and tagged as mirrord-operator:{{.CHART_VERSION}}"
 
   operator:tag-and-load:
     desc: Tag and load existing operator image into minikube
@@ -160,6 +172,13 @@ tasks:
   operator:install:
     desc: Install operator with custom image (idempotent)
     deps: [infra:all, build:operator, license:create-secret]
+    cmds:
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
+
+  operator:install:nocache:
+    desc: Install operator with clean build (no cache, no sccache)
+    deps: [infra:all, build:operator:nocache, license:create-secret]
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
       - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
@@ -281,40 +300,39 @@ tasks:
           WAIT_NAMESPACE: localstack
 
   test:mysql:
-    desc: Run MySQL test
-    deps: [build:app:mysql, operator:install]
+    desc: "Run MySQL branching tests (modular test structure)"
+    deps: [cli:build, build:app:mysql, operator:install]
     cmds:
-      - task: _run-test
-        vars:
-          OVERLAY: mysql
-          PATCH_FILE: mysql
-          WAIT_SELECTOR: app=mysql
-          WAIT_NAMESPACE: test-mirrord
-          CONSUMER_APP: mysql-app
-          SKIP_REGISTRY: "true"
+      - task: mysql:test
+
+  test:mysql:quick:
+    desc: "Quick MySQL test - refresh data without cluster rebuild"
+    deps: [cli:build, operator:install]
+    cmds:
+      - task: mysql:test:quick
+
+  test:mysql:verify:
+    desc: "Verify MySQL test results only"
+    cmds:
+      - task: mysql:verify:all
 
   test:mysql:clean:
-    desc: Delete cluster and run MySQL test fresh
+    desc: "Delete cluster and run MySQL test fresh"
     cmds:
       - task: cluster:delete
       - task: cluster:create
-      - task: test:mysql
+      - task: operator:install
+      - task: mysql:test
 
   test:mysql:clean-nobuild:
-    desc: Delete cluster and run MySQL test (skip operator build)
+    desc: "Delete cluster and run MySQL test (skip operator build)"
     cmds:
       - task: cluster:delete
       - task: cluster:create
       - task: build:app:mysql
       - task: license:create-secret
       - task: operator:install-nobuild
-      - task: _run-test
-        vars:
-          OVERLAY: mysql
-          PATCH_FILE: mysql
-          WAIT_SELECTOR: app=mysql
-          WAIT_NAMESPACE: test-mirrord
-          CONSUMER_APP: mysql-app
+      - task: mysql:test
 
   test:mysql-sa:
     desc: Run MySQL test with service account
@@ -344,6 +362,37 @@ tasks:
           WAIT_NAMESPACE: test-mirrord
           CONSUMER_APP: mysql-app
           SKIP_REGISTRY: "true"
+
+  test:postgres:
+    desc: Run PostgreSQL branching test
+    deps: [operator:install]
+    cmds:
+      - task: postgres:deploy
+      - task: postgres:verify
+
+  test:postgres:verify:
+    desc: Verify PostgreSQL test results
+    cmds:
+      - task: postgres:verify
+
+  test:postgres:clean:
+    desc: Delete cluster and run PostgreSQL test fresh
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: operator:install
+      - task: postgres:deploy
+      - task: postgres:verify
+
+  test:postgres:clean-nobuild:
+    desc: Delete cluster and run PostgreSQL test (skip operator build)
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: license:create-secret
+      - task: operator:install-nobuild
+      - task: postgres:deploy
+      - task: postgres:verify
 
   test:kafka:
     desc: Run Kafka test
@@ -417,6 +466,7 @@ tasks:
       - task: test:kafka-sa:clean-nobuild
       - task: test:mysql:clean
       - task: test:mysql-sa:clean-nobuild
+      - task: test:postgres:clean-nobuild
 
   test:all:clean-nobuild:
     desc: Run all tests with fresh cluster for each (skip operator build)
@@ -427,6 +477,7 @@ tasks:
       - task: test:kafka-sa:clean-nobuild
       - task: test:mysql:clean-nobuild
       - task: test:mysql-sa:clean-nobuild
+      - task: test:postgres:clean-nobuild
 
   # Cleanup utilities
   clean:namespaces:

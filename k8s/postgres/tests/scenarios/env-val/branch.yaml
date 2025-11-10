@@ -1,0 +1,19 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: PgBranchDatabase
+metadata:
+  name: pg-test-branch-env-val
+  namespace: test-mirrord
+spec:
+  id: env-val-branch
+  ttlSecs: 3600
+  target:
+    pod: pg-server-env-val
+    container: app
+  connectionSource:
+    url:
+      env:
+        container: app
+        variable: DATABASE_URL
+  copy:
+    mode: all
+

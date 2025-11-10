@@ -3,8 +3,19 @@
 scripts/*.license
 scripts/company-license.pem
 scripts/license-issuer.pem
+# Build artifacts
+bin/
 
-# Local environment overrides (optional)
 .env.local
+# Environment
 .env
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
 .DS_Store
+
+# Test artifacts
+*.log

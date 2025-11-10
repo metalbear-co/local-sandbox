@@ -1,0 +1,211 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql-test
+  namespace: test-mirrord
+  labels:
+    app: mysql-test
+spec:
+  initContainers:
+    - name: init-db-script
+      image: mysql:8.0
+      command:
+        - sh
+        - -c
+        - |
+          cat <<'EOF' > /docker-entrypoint-initdb.d/01-init-user-db.sql
+          CREATE DATABASE IF NOT EXISTS user;
+          USE user;
+          CREATE TABLE IF NOT EXISTS users (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            name VARCHAR(50),
+            email VARCHAR(100)
+          );
+          INSERT INTO users (name, email) VALUES
+            ('Alice', 'alice@example.com'),
+            ('Bob', 'bob@example.com');
+          CREATE TABLE IF NOT EXISTS orders (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user VARCHAR(50),
+            created_at TIMESTAMP
+          );
+          INSERT INTO orders (user, created_at) VALUES
+            ('Alice', '2025-01-10 12:00:00'),
+            ('Alice', '2025-02-15 09:30:00'),
+            ('Bob',   '2025-03-22 17:45:00'),
+            ('Bob',   '2025-04-05 08:20:00');
+          EOF
+      volumeMounts:
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+  containers:
+    - name: mysql
+      image: mysql:8.0
+      env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: examplepassword
+      ports:
+        - containerPort: 3306
+      volumeMounts:
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+  volumes:
+    - name: initdb
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-test
+  namespace: test-mirrord
+spec:
+  selector:
+    app: mysql-test
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server-echo
+  namespace: test-mirrord
+  labels:
+    app: server-echo
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: server-echo
+  namespace: test-mirrord
+spec:
+  selector:
+    app: server-echo
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server-env-val
+  namespace: test-mirrord
+  labels:
+    app: server-env-val
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        - name: MYSQL_CONNECTION_URL
+          value: mysql://root:examplepassword@mysql-test/user
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-env-val
+  namespace: test-mirrord
+spec:
+  selector:
+    app: server-env-val
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mysql-connection-secret
+  namespace: test-mirrord
+type: Opaque
+stringData:
+  url: mysql://root:examplepassword@mysql-test/user
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server-secret-ref
+  namespace: test-mirrord
+  labels:
+    app: server-secret-ref
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        - name: MYSQL_CONNECTION_URL
+          valueFrom:
+            secretKeyRef:
+              name: mysql-connection-secret
+              key: url
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-secret-ref
+  namespace: test-mirrord
+spec:
+  selector:
+    app: server-secret-ref
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+---
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MysqlBranchDatabase
+metadata:
+  name: mysql-test-branch-env-val
+  namespace: test-mirrord
+spec:
+  id: mysql-test-env-val-branch
+  target:
+    pod: server-env-val
+  connectionSource:
+    url:
+      env:
+        variable: MYSQL_CONNECTION_URL
+        container: echo
+  databaseName: user
+  mysqlVersion: "8.0"
+  ttlSecs: 600
+  copy:
+    mode: all
+---
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MysqlBranchDatabase
+metadata:
+  name: mysql-test-branch-secret-ref
+  namespace: test-mirrord
+spec:
+  id: mysql-test-secret-ref-branch
+  target:
+    pod: server-secret-ref
+  connectionSource:
+    url:
+      env:
+        variable: MYSQL_CONNECTION_URL
+        container: echo
+  databaseName: user
+  mysqlVersion: "8.0"
+  ttlSecs: 600
+  copy:
+    mode: schema
+    tables:
+      users:
+        filter: "id > 1"
+      orders: {}
+

@@ -1,0 +1,18 @@
+{
+  "feature": {
+    "network": {
+      "incoming": "steal",
+      "outgoing": true
+    },
+    "fs": "local",
+    "env": true
+  },
+  "target": {
+    "path": {
+      "pod": "pg-server-env-val"
+    },
+    "namespace": "test-mirrord"
+  },
+  "operator": true
+}
+

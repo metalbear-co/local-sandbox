@@ -1,0 +1,19 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MysqlBranchDatabase
+metadata:
+  name: mysql-test-branch-env-val
+spec:
+  id: mysql-test-env-val-branch
+  target:
+    pod: server-env-val
+  connectionSource:
+    url:
+      env:
+        variable: MYSQL_CONNECTION_URL
+        container: echo
+  databaseName: user
+  mysqlVersion: "8.0"
+  ttlSecs: 600
+  copy:
+    mode: all  # Full database copy
+

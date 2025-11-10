@@ -1,0 +1,33 @@
+# Test scenario: Database branching with connection URL from Kubernetes secret
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server-secret-ref
+  labels:
+    app: server-secret-ref
+    test-scenario: secret-ref
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        - name: MYSQL_CONNECTION_URL
+          valueFrom:
+            secretKeyRef:
+              name: mysql-connection-secret
+              key: url
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-secret-ref
+spec:
+  selector:
+    app: server-secret-ref
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+

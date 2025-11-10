@@ -1,0 +1,85 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-test
+  namespace: test-mirrord
+  labels:
+    app: postgres-test
+spec:
+  containers:
+  - name: postgres
+    image: postgres:15
+    env:
+    - name: POSTGRES_PASSWORD
+      value: postgres
+    - name: POSTGRES_DB
+      value: userdb
+    ports:
+    - containerPort: 5432
+    volumeMounts:
+    - name: init-script
+      mountPath: /docker-entrypoint-initdb.d
+  volumes:
+  - name: init-script
+    configMap:
+      name: postgres-init-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init-script
+  namespace: test-mirrord
+data:
+  init.sql: |
+    CREATE TABLE users (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100),
+        email VARCHAR(100),
+        age INT
+    );
+
+    CREATE TABLE orders (
+        id SERIAL PRIMARY KEY,
+        user_id INT,
+        amount DECIMAL(10,2),
+        status VARCHAR(50)
+    );
+
+    CREATE TABLE products (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100),
+        price DECIMAL(10,2)
+    );
+
+    INSERT INTO users (name, email, age) VALUES
+    ('Alice', 'alice@example.com', 25),
+    ('Bob', 'bob@example.com', 30),
+    ('Charlie', 'charlie@example.com', 17),
+    ('Diana', 'diana@example.com', 22),
+    ('Eve', 'eve@example.com', 16);
+
+    INSERT INTO orders (user_id, amount, status) VALUES
+    (1, 100.00, 'completed'),
+    (2, 150.50, 'pending'),
+    (1, 75.25, 'completed'),
+    (3, 25.00, 'completed'),
+    (4, 200.00, 'completed');
+
+    INSERT INTO products (name, price) VALUES
+    ('Laptop', 999.99),
+    ('Mouse', 29.99),
+    ('Keyboard', 79.99),
+    ('Monitor', 299.99);
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-test
+  namespace: test-mirrord
+spec:
+  selector:
+    app: postgres-test
+  ports:
+  - port: 5432
+    targetPort: 5432
+

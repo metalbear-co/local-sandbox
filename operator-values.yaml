@@ -3,10 +3,11 @@ operator:
   sqsSplitting: true
   kafkaSplitting: true
   mysqlBranching: true
+  pgBranching: true
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true 
   jsonLog: true
-  logLevel: "info"
+  logLevel: "debug"
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false

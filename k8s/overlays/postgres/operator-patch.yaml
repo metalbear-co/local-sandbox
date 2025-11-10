@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mirrord-operator
+  namespace: mirrord
+spec:
+  template:
+    spec:
+      containers:
+        - name: operator
+          env:
+            - name: RUST_LOG
+              value: "info,operator_pg_branching=debug"
+            - name: MIRRORD_OPERATOR_ENABLE_PG_BRANCHING
+              value: "true"
+

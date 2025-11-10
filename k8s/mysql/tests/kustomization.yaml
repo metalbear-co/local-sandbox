@@ -1,0 +1,12 @@
+# Main kustomization file for all MySQL tests
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: test-mirrord
+
+resources:
+  - base
+  - scenarios/env-val
+  - scenarios/secret-ref
+  - scenarios/echo
+

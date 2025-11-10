@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-server-secret-ref
+  namespace: test-mirrord
+  labels:
+    test-scenario: secret-ref
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres secret-ref scenario running' && sleep 3600"]
+    env:
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: pg-connection-secret
+          key: connectionString
+

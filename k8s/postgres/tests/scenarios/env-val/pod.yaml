@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-server-env-val
+  namespace: test-mirrord
+  labels:
+    test-scenario: env-val
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres env-val scenario running' && sleep 3600"]
+    env:
+    - name: DATABASE_URL
+      value: "postgresql://postgres:postgres@postgres-test:5432/userdb"
+

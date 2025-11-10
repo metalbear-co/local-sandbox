@@ -1,0 +1,30 @@
+# Test scenario: Database branching with connection URL from environment variable
+apiVersion: v1
+kind: Pod
+metadata:
+  name: server-env-val
+  labels:
+    app: server-env-val
+    test-scenario: env-val
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        - name: MYSQL_CONNECTION_URL
+          value: mysql://root:examplepassword@mysql-test/user
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-env-val
+spec:
+  selector:
+    app: server-env-val
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+
