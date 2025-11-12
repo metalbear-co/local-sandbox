@@ -4,8 +4,9 @@ metadata:
   name: pg-test-branch-secret-ref
   namespace: test-mirrord
 spec:
-  id: secret-ref-branch
+  id: secret-ref
   ttlSecs: 3600
+  postgresVersion: "17"
   target:
     pod: pg-server-secret-ref
     container: app

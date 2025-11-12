@@ -8,7 +8,7 @@ metadata:
 spec:
   initContainers:
     - name: init-db-script
-      image: postgres:16
+      image: postgres:17
       command:
         - sh
         - -c
@@ -28,44 +28,44 @@ spec:
             ('Alice', 'alice@example.com', 25),
             ('Bob', 'bob@example.com', 30),
             ('Charlie', 'charlie@example.com', 17),
-            ('Diana', 'diana@example.com', 28);
+            ('Diana', 'diana@example.com', 22),
+            ('Eve', 'eve@example.com', 16);
           
           CREATE TABLE orders (
             id SERIAL PRIMARY KEY,
-            user_name VARCHAR(50),
+            user_id INT,
             amount DECIMAL(10, 2),
-            created_at TIMESTAMP DEFAULT NOW()
+            status VARCHAR(50)
           );
           
-          INSERT INTO orders (user_name, amount, created_at) VALUES
-            ('Alice', 99.99, '2025-01-10 12:00:00'),
-            ('Alice', 49.50, '2025-02-15 09:30:00'),
-            ('Bob', 150.00, '2025-03-22 17:45:00'),
-            ('Bob', 75.25, '2025-04-05 08:20:00'),
-            ('Charlie', 25.00, '2025-05-01 14:15:00');
+          INSERT INTO orders (user_id, amount, status) VALUES
+            (1, 100.00, 'completed'),
+            (2, 150.50, 'pending'),
+            (1, 75.25, 'completed'),
+            (3, 25.00, 'completed'),
+            (4, 200.00, 'completed');
           
           CREATE TABLE products (
             id SERIAL PRIMARY KEY,
             name VARCHAR(100),
-            price DECIMAL(10, 2),
-            in_stock BOOLEAN DEFAULT true
+            price DECIMAL(10, 2)
           );
           
-          INSERT INTO products (name, price, in_stock) VALUES
-            ('Laptop', 999.99, true),
-            ('Mouse', 29.99, true),
-            ('Keyboard', 79.99, false),
-            ('Monitor', 299.99, true);
+          INSERT INTO products (name, price) VALUES
+            ('Laptop', 999.99),
+            ('Mouse', 29.99),
+            ('Keyboard', 79.99),
+            ('Monitor', 299.99);
           EOF
       volumeMounts:
         - name: initdb
           mountPath: /docker-entrypoint-initdb.d
   containers:
     - name: postgres
-      image: postgres:16
+      image: postgres:17
       env:
         - name: POSTGRES_PASSWORD
-          value: examplepassword
+          value: postgres
         - name: POSTGRES_USER
           value: postgres
       ports:
@@ -99,147 +99,11 @@ spec:
       targetPort: 5432
 ---
 apiVersion: v1
-kind: Pod
-metadata:
-  name: pg-server-echo
-  namespace: test-mirrord
-  labels:
-    app: pg-server-echo
-spec:
-  containers:
-    - name: echo
-      image: ealen/echo-server:latest
-      ports:
-        - containerPort: 80
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: pg-server-echo
-  namespace: test-mirrord
-spec:
-  selector:
-    app: pg-server-echo
-  ports:
-    - port: 80
-      targetPort: 80
-  type: ClusterIP
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: pg-server-env-val
-  namespace: test-mirrord
-  labels:
-    app: pg-server-env-val
-spec:
-  containers:
-    - name: echo
-      image: ealen/echo-server:latest
-      env:
-        - name: PG_CONNECTION_URL
-          value: postgresql://postgres:examplepassword@postgres-test/userdb
-      ports:
-        - containerPort: 80
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: pg-service-env-val
-  namespace: test-mirrord
-spec:
-  selector:
-    app: pg-server-env-val
-  ports:
-    - port: 80
-      targetPort: 80
-  type: ClusterIP
----
-apiVersion: v1
 kind: Secret
 metadata:
   name: pg-connection-secret
   namespace: test-mirrord
 type: Opaque
 stringData:
-  url: postgresql://postgres:examplepassword@postgres-test/userdb
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: pg-server-secret-ref
-  namespace: test-mirrord
-  labels:
-    app: pg-server-secret-ref
-spec:
-  containers:
-    - name: echo
-      image: ealen/echo-server:latest
-      env:
-        - name: PG_CONNECTION_URL
-          valueFrom:
-            secretKeyRef:
-              name: pg-connection-secret
-              key: url
-      ports:
-        - containerPort: 80
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: pg-service-secret-ref
-  namespace: test-mirrord
-spec:
-  selector:
-    app: pg-server-secret-ref
-  ports:
-    - port: 80
-      targetPort: 80
-  type: ClusterIP
----
-apiVersion: dbs.mirrord.metalbear.co/v1alpha1
-kind: PgBranchDatabase
-metadata:
-  name: pg-test-branch-env-val
-  namespace: test-mirrord
-spec:
-  id: pg-test-env-val-branch
-  target:
-    pod: pg-server-env-val
-  connectionSource:
-    url:
-      env:
-        variable: PG_CONNECTION_URL
-        container: echo
-  databaseName: userdb
-  postgresVersion: "16"
-  ttlSecs: 600
-  copy:
-    mode: all
----
-apiVersion: dbs.mirrord.metalbear.co/v1alpha1
-kind: PgBranchDatabase
-metadata:
-  name: pg-test-branch-secret-ref
-  namespace: test-mirrord
-spec:
-  id: pg-test-secret-ref-branch
-  target:
-    pod: pg-server-secret-ref
-  connectionSource:
-    url:
-      env:
-        variable: PG_CONNECTION_URL
-        container: echo
-  databaseName: userdb
-  postgresVersion: "16"
-  ttlSecs: 600
-  copy:
-    mode: schema
-    tables:
-      users:
-        filter: "age > 18"
-      orders:
-        filter: "amount > 50"
-      products: {}
+  url: postgresql://postgres:postgres@postgres-test/userdb
 

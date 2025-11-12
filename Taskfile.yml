@@ -15,9 +15,6 @@ includes:
   postgres:
     taskfile: ./tasks/Taskfile.postgres.yml
     dir: ./tasks
-  cli:
-    taskfile: ./tools/test-cli/Taskfile.yml
-    dir: ./tools/test-cli
 
 vars:
   ROOT_DIR:
@@ -240,6 +237,23 @@ tasks:
       - kubectl get pods -n {{.NAMESPACE}}
       - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} || true
 
+
+  test:default:clean:
+    desc: Delete cluster and run fresh
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:postgres
+      - task: operator:install
+
+  test:default:clean:nocache:
+    desc: Delete cluster and run fresh without cache
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:postgres
+      - task: operator:install:nocache
+
   # Test scenarios
   test:sqs:
     desc: Run SQS LocalStack test
@@ -309,13 +323,13 @@ tasks:
 
   test:mysql:
     desc: "Run MySQL branching tests (modular test structure)"
-    deps: [cli:build, build:app:mysql, operator:install]
+    deps: [build:app:mysql, operator:install]
     cmds:
       - task: mysql:test
 
   test:mysql:quick:
     desc: "Quick MySQL test - refresh data without cluster rebuild"
-    deps: [cli:build, operator:install]
+    deps: [operator:install]
     cmds:
       - task: mysql:test:quick
 
@@ -373,7 +387,7 @@ tasks:
 
   test:postgres:
     desc: Run PostgreSQL branching test
-    deps: [cli:build, operator:install]
+    deps: [build:app:postgres, operator:install]
     cmds:
       - task: postgres:test
 
@@ -382,12 +396,32 @@ tasks:
     cmds:
       - task: postgres:verify
 
+  test:postgres:base:clean:
+    desc: Delete cluster and run PostgreSQL test fresh
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:postgres
+      - task: operator:install
+      - task: postgres:deploy:base
+
   test:postgres:clean:
     desc: Delete cluster and run PostgreSQL test fresh
     cmds:
       - task: cluster:delete
       - task: cluster:create
+      - task: build:app:postgres
       - task: operator:install
+      - task: postgres:deploy
+      - task: postgres:verify
+
+  test:postgres:clean:nocache:
+    desc: Delete cluster and run PostgreSQL test fresh
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:postgres
+      - task: operator:install:nocache
       - task: postgres:deploy
       - task: postgres:verify
 
@@ -396,6 +430,7 @@ tasks:
     cmds:
       - task: cluster:delete
       - task: cluster:create
+      - task: build:app:postgres
       - task: license:create-secret
       - task: operator:install-nobuild
       - task: postgres:deploy

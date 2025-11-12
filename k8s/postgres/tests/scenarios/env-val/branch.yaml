@@ -4,8 +4,9 @@ metadata:
   name: pg-test-branch-env-val
   namespace: test-mirrord
 spec:
-  id: env-val-branch
+  id: env-val
   ttlSecs: 3600
+  postgresVersion: "17"
   target:
     pod: pg-server-env-val
     container: app

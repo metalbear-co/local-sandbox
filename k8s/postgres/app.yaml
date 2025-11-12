@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-app
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-app
+  template:
+    metadata:
+      labels:
+        app: postgres-app
+    spec:
+      containers:
+      - name: app
+        image: postgres-app:local
+        imagePullPolicy: Never
+        env:
+        - name: DB_CONNECTION_URL
+          value: "postgresql://postgres:postgres@postgres-test.test-mirrord.svc.cluster.local:5432/userdb?sslmode=disable"
+

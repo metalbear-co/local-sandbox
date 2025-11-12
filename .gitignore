@@ -19,3 +19,5 @@ bin/
 
 # Test artifacts
 *.log
+*.task
+.task/

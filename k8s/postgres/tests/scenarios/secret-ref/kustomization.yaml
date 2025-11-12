@@ -4,7 +4,6 @@ kind: Kustomization
 namespace: test-mirrord
 
 resources:
-- ../../base
 - secret.yaml
 - pod.yaml
 - branch.yaml
