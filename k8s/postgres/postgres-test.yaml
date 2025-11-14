@@ -14,8 +14,8 @@ spec:
         - -c
         - |
           cat <<'EOF' > /docker-entrypoint-initdb.d/01-init-user-db.sql
-          CREATE DATABASE userdb;
-          \c userdb
+          CREATE DATABASE source_db;
+          \c source_db
           
           CREATE TABLE users (
             id SERIAL PRIMARY KEY,
@@ -105,5 +105,5 @@ metadata:
   namespace: test-mirrord
 type: Opaque
 stringData:
-  url: postgresql://postgres:postgres@postgres-test/userdb
+  url: postgresql://postgres:postgres@postgres-test/source_db
 

@@ -85,13 +85,20 @@ task postgres:clean
 **Query branches:**
 ```bash
 # Query source database
-kubectl exec -n test-mirrord postgres-test -- psql -U postgres -d userdb -c "SELECT * FROM users;"
+kubectl exec -n test-mirrord postgres-test -- psql -U postgres -d source_db -c "SELECT * FROM users;"
 
 # Query branch database
 task postgres:shell:branch SCENARIO=env-val
 # postgres=# \c branch_db
 # postgres=# SELECT * FROM users;
 # postgres=# INSERT INTO users (name, email, age) VALUES ('Test', 'test@example.com', 25);
+
+## branch
+# Find branch database
+kubectl get pods -n test-mirrord -l db-owner-name=pg-test-branch-env-val
+# Query branch database
+kubectl exec -n test-mirrord mirrord-postgres-branch-db-pod-w55p6 -- psql -U postgres -d branch_db -c "SELECT * FROM users"
+
 ```
 
 ## Development

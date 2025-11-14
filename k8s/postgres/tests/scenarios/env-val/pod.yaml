@@ -12,5 +12,5 @@ spec:
     command: ["sh", "-c", "echo 'Postgres env-val scenario running' && sleep 3600"]
     env:
     - name: DATABASE_URL
-      value: "postgresql://postgres:postgres@postgres-test:5432/userdb"
+      value: "postgresql://postgres:postgres@postgres-test:5432/source_db"
 

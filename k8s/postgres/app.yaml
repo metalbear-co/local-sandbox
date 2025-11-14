@@ -19,5 +19,5 @@ spec:
         imagePullPolicy: Never
         env:
         - name: DB_CONNECTION_URL
-          value: "postgresql://postgres:postgres@postgres-test.test-mirrord.svc.cluster.local:5432/userdb?sslmode=disable"
+          value: "postgresql://postgres:postgres@postgres-test.test-mirrord.svc.cluster.local:5432/source_db?sslmode=disable"
 
