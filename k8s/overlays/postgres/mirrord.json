@@ -1,18 +1,44 @@
 {
-  "feature": {
-    "network": {
-      "incoming": "steal",
-      "outgoing": true
-    },
-    "fs": "local",
-    "env": true
-  },
+  "operator": true,
   "target": {
     "path": {
       "pod": "pg-server-env-val"
     },
     "namespace": "test-mirrord"
   },
-  "operator": true
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "pg-dev-branch",
+        "type": "pg",
+        "version": "17",
+        "name": "source_db",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "copy": {
+          "mode": "schema",
+          "tables": {
+            "users": {
+              "filter": "age > 18"
+            },
+            "orders": {
+              "filter": "amount > 50"
+            }
+          }
+        }
+      }
+    ]
+  }
 }
-

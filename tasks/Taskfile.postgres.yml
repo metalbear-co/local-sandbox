@@ -6,6 +6,8 @@ vars:
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   TESTS_DIR: '{{.ROOT_DIR}}/k8s/postgres/tests'
   POSTGRES_DIR: '{{.ROOT_DIR}}/k8s/postgres'
+  
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 tasks:
   test:
@@ -164,3 +166,32 @@ tasks:
           sleep 2
         done
       - echo "Namespace {{.NAMESPACE}} deleted"
+
+  run:local:
+    desc: "Run PostgreSQL app locally with mirrord (creates branch DB with db_branches config)"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres/mirrord.json")}}'
+    preconditions:
+      - sh: test -f {{.MIRRORD_CONFIG}}
+        msg: "Config file not found at {{.MIRRORD_CONFIG}}"
+    cmds:
+      - echo "Building PostgreSQL app..."
+      - go build -o /tmp/postgres-app main.go
+      - echo "Running with mirrord (config{{":"}} {{.MIRRORD_CONFIG}})..."
+      - echo "This will create a branch database defined in the config's db_branches section"
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/postgres-app'
+
+  test:mirrord-config:
+    desc: "Test PostgreSQL with mirrord.json db_branches configuration"
+    cmds:
+      - echo "Testing PostgreSQL branch creation via mirrord.json..."
+      - task: deploy:base
+      - echo "Deploying source database..."
+      - kubectl apply -f {{.POSTGRES_DIR}}/postgres-test.yaml
+      - echo "Waiting for source database..."
+      - kubectl wait --for=condition=ready pod -l app=postgres-test -n {{.NAMESPACE}} --timeout=120s
+      - echo ""
+      - echo "Now run 'task postgres{{":"}}run{{":"}}local' in another terminal to test mirrord with db_branches"
+      - echo "The mirrord config is at{{":"}} k8s/overlays/postgres/mirrord.json"
+      - echo ""
