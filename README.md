@@ -20,12 +20,13 @@ task test:postgres
 
 ## MySQL Tests
 
+### Modular Tests (component-based)
 ```bash
-# Full test (clean cluster)
-task test:mysql:clean
+# Full modular test
+task mysql:test:modular
 
 # Quick test (reuse cluster)
-task test:mysql:quick
+task mysql:test:modular:quick
 
 # Verify
 task mysql:verify:all
@@ -36,7 +37,7 @@ task mysql:logs:branch SCENARIO=env-val
 task mysql:shell:branch SCENARIO=env-val
 
 # Cleanup
-task mysql:clean
+task mysql:clean:modular
 ```
 
 **Test Scenarios:**
@@ -56,6 +57,19 @@ task mysql:query:branch SCENARIO=secret-ref
 task mysql:shell:branch SCENARIO=env-val
 # mysql> SELECT * FROM users;
 # mysql> INSERT INTO users (name, email, age) VALUES ('Test', 'test@example.com', 25);
+```
+
+### Complete Tests (single-file)
+Simple all-in-one test files for quick testing:
+
+```bash
+# MySQL complete test
+task mysql:test:mysql:complete
+task mysql:clean:mysql:complete
+
+# MariaDB complete test (drop-in replacement for MySQL)
+task mysql:test:mariadb:complete
+task mysql:clean:mariadb:complete
 ```
 
 ## PostgreSQL Tests
@@ -97,7 +111,7 @@ task postgres:shell:branch SCENARIO=env-val
 # Find branch database
 kubectl get pods -n test-mirrord -l db-owner-name=pg-test-branch-env-val
 # Query branch database
-kubectl exec -n test-mirrord mirrord-postgres-branch-db-pod-w55p6 -- psql -U postgres -d branch_db -c "SELECT * FROM users"
+kubectl exec -n test-mirrord mirrord-postgres-branch-db-pod-hfgj6 -- psql -U postgres -d secret-ref-branch -c "SELECT * FROM users"
 
 ```
 

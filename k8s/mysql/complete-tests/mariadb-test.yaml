@@ -1,14 +1,14 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: mysql-test
+  name: mariadb-test
   namespace: test-mirrord
   labels:
-    app: mysql-test
+    app: mariadb-test
 spec:
   initContainers:
     - name: init-db-script
-      image: mysql:8.0
+      image: mariadb:10.11
       command:
         - sh
         - -c
@@ -39,8 +39,8 @@ spec:
         - name: initdb
           mountPath: /docker-entrypoint-initdb.d
   containers:
-    - name: mysql
-      image: mysql:8.0
+    - name: mariadb
+      image: mariadb:10.11
       env:
         - name: MYSQL_ROOT_PASSWORD
           value: examplepassword
@@ -56,68 +56,41 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: mysql-test
+  name: mariadb-test
   namespace: test-mirrord
 spec:
   selector:
-    app: mysql-test
+    app: mariadb-test
   ports:
-    - name: mysql
+    - name: mariadb
       port: 3306
       targetPort: 3306
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: server-echo
+  name: mariadb-server-env-val
   namespace: test-mirrord
   labels:
-    app: server-echo
-spec:
-  containers:
-    - name: echo
-      image: ealen/echo-server:latest
-      ports:
-        - containerPort: 80
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: server-echo
-  namespace: test-mirrord
-spec:
-  selector:
-    app: server-echo
-  ports:
-    - port: 80
-      targetPort: 80
-  type: ClusterIP
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: server-env-val
-  namespace: test-mirrord
-  labels:
-    app: server-env-val
+    app: mariadb-server-env-val
 spec:
   containers:
     - name: echo
       image: ealen/echo-server:latest
       env:
         - name: MYSQL_CONNECTION_URL
-          value: mysql://root:examplepassword@mysql-test/user
+          value: mysql://root:examplepassword@mariadb-test/user
       ports:
         - containerPort: 80
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: service-env-val
+  name: mariadb-service-env-val
   namespace: test-mirrord
 spec:
   selector:
-    app: server-env-val
+    app: mariadb-server-env-val
   ports:
     - port: 80
       targetPort: 80
@@ -126,19 +99,19 @@ spec:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: mysql-connection-secret
+  name: mariadb-connection-secret
   namespace: test-mirrord
 type: Opaque
 stringData:
-  url: mysql://root:examplepassword@mysql-test/user
+  url: mysql://root:examplepassword@mariadb-test/user
 ---
 apiVersion: v1
 kind: Pod
 metadata:
-  name: server-secret-ref
+  name: mariadb-server-secret-ref
   namespace: test-mirrord
   labels:
-    app: server-secret-ref
+    app: mariadb-server-secret-ref
 spec:
   containers:
     - name: echo
@@ -147,7 +120,7 @@ spec:
         - name: MYSQL_CONNECTION_URL
           valueFrom:
             secretKeyRef:
-              name: mysql-connection-secret
+              name: mariadb-connection-secret
               key: url
       ports:
         - containerPort: 80
@@ -155,11 +128,11 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: service-secret-ref
+  name: mariadb-service-secret-ref
   namespace: test-mirrord
 spec:
   selector:
-    app: server-secret-ref
+    app: mariadb-server-secret-ref
   ports:
     - port: 80
       targetPort: 80
@@ -168,12 +141,12 @@ spec:
 apiVersion: dbs.mirrord.metalbear.co/v1alpha1
 kind: MysqlBranchDatabase
 metadata:
-  name: mysql-test-branch-env-val
+  name: mariadb-test-branch-env-val
   namespace: test-mirrord
 spec:
-  id: mysql-test-env-val-branch
+  id: mariadb-test-env-val-branch
   target:
-    pod: server-env-val
+    pod: mariadb-server-env-val
   connectionSource:
     url:
       env:
@@ -188,12 +161,12 @@ spec:
 apiVersion: dbs.mirrord.metalbear.co/v1alpha1
 kind: MysqlBranchDatabase
 metadata:
-  name: mysql-test-branch-secret-ref
+  name: mariadb-test-branch-secret-ref
   namespace: test-mirrord
 spec:
-  id: mysql-test-secret-ref-branch
+  id: mariadb-test-secret-ref-branch
   target:
-    pod: server-secret-ref
+    pod: mariadb-server-secret-ref
   connectionSource:
     url:
       env:
