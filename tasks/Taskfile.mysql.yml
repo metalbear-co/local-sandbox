@@ -109,10 +109,6 @@ tasks:
     desc: "Verify all test results"
     cmds:
       - echo ""
-      - echo "========================================"
-      - echo "  MySQL Database Branching Test Results"
-      - echo "========================================"
-      - echo ""
       - task: verify:source
       - echo ""
       - task: verify:scenario
@@ -177,6 +173,40 @@ tasks:
     cmds:
       - task: _query-branch
         vars: {SCENARIO: "{{.SCENARIO}}", QUERY: "{{.QUERY}}"}
+
+  verify:mysql:branches:
+    desc: "Quick verification of MySQL branch databases"
+    cmds:
+      - echo "=== MySQL Source Database ==="
+      - kubectl exec -n {{.NAMESPACE}} mysql-test -- mysql -uroot -p{{.SOURCE_DB_PASSWORD}} user -e "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders;"
+      - echo ""
+      - echo "=== MySQL Branches ==="
+      - |
+        for SCENARIO in env-val secret-ref; do
+          POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name=mysql-test-branch-$SCENARIO -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -n "$POD" ]; then
+            echo "Branch{{":"}} $SCENARIO"
+            kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders;"
+            echo ""
+          fi
+        done
+
+  verify:mariadb:branches:
+    desc: "Quick verification of MariaDB branch databases"
+    cmds:
+      - echo "=== MariaDB Source Database ==="
+      - kubectl exec -n {{.NAMESPACE}} mariadb-test -- mysql -uroot -p{{.SOURCE_DB_PASSWORD}} user -e "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders;"
+      - echo ""
+      - echo "=== MariaDB Branches ==="
+      - |
+        for SCENARIO in env-val secret-ref; do
+          POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name=mariadb-test-branch-$SCENARIO -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -n "$POD" ]; then
+            echo "Branch{{":"}} $SCENARIO"
+            kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders;"
+            echo ""
+          fi
+        done
 
   clean:modular:
     desc: "Delete all modular test resources"
@@ -327,6 +357,14 @@ tasks:
       - task: _wait-branches
         vars: {DB_TYPE: mysql, BRANCH1: mysql-test-branch-env-val, BRANCH2: mysql-test-branch-secret-ref}
 
+  test:mysql:complete:clean:
+    desc: "MySQL complete test from clean cluster (delete + create cluster + test + verify)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:mysql:complete
+      - task: verify:mysql:branches
+
   test:mariadb:complete:
     desc: "Run MariaDB complete test (MySQL-compatible, single YAML file)"
     cmds:
@@ -338,6 +376,14 @@ tasks:
         vars: {DB_TYPE: mariadb, POD_NAME: mariadb-test}
       - task: _wait-branches
         vars: {DB_TYPE: mariadb, BRANCH1: mariadb-test-branch-env-val, BRANCH2: mariadb-test-branch-secret-ref}
+
+  test:mariadb:complete:clean:
+    desc: "MariaDB complete test from clean cluster (delete + create cluster + test + verify)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:mariadb:complete
+      - task: verify:mariadb:branches
 
   clean:mysql:complete:
     desc: "Clean up MySQL complete test"

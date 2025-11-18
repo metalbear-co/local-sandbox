@@ -4,42 +4,90 @@ vars:
   ROOT_DIR:
     sh: cd .. && pwd
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
-  TESTS_DIR: '{{.ROOT_DIR}}/k8s/postgres/tests'
+  MODULAR_TESTS_DIR: '{{.ROOT_DIR}}/k8s/postgres/modular-tests'
+  COMPLETE_TESTS_DIR: '{{.ROOT_DIR}}/k8s/postgres/complete-tests'
+  POSTGRES_COMPLETE_FILE: '{{.COMPLETE_TESTS_DIR}}/postgres-test.yaml'
   POSTGRES_DIR: '{{.ROOT_DIR}}/k8s/postgres'
   
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 tasks:
-  test:
-    desc: "Run PostgreSQL branching tests"
+  test:modular:
+    desc: "Run PostgreSQL modular test (component-based structure)"
     cmds:
-      - task: deploy
+      - task: deploy:modular
       - task: verify:all
 
 
-  deploy:base:
-    desc: "Deploy PostgreSQL test environment"
+  deploy:modular:base:
+    desc: "Deploy PostgreSQL modular base resources"
     cmds:
       - echo "Deploying source database..."
       - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
 
-  deploy:
-    desc: "Deploy PostgreSQL test environment"
+  deploy:modular:
+    desc: "Deploy PostgreSQL modular test environment"
     cmds:
-      - task: deploy:base
+      - task: deploy:modular:base
       - kubectl apply -k {{.POSTGRES_DIR}}
       - echo "Waiting for source database to be ready..."
       - kubectl wait --for=condition=ready pod -l app=postgres-test -n {{.NAMESPACE}} --timeout=120s
       - echo "Deploying test scenarios..."
-      - kubectl apply -k {{.TESTS_DIR}}/scenarios/env-val
-      - kubectl apply -k {{.TESTS_DIR}}/scenarios/secret-ref
-      - kubectl apply -k {{.TESTS_DIR}}/scenarios/echo
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/env-val
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/secret-ref
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/echo
       - echo "Waiting for branch databases to be ready..."
       - sleep 5
       - kubectl wait --for=jsonpath='{.status.phase}'=Ready pgbranchdatabase/pg-test-branch-env-val -n {{.NAMESPACE}} --timeout=180s || true
       - kubectl wait --for=jsonpath='{.status.phase}'=Ready pgbranchdatabase/pg-test-branch-secret-ref -n {{.NAMESPACE}} --timeout=180s || true
       - echo "Waiting for app to be ready..."
       - kubectl wait --for=condition=ready pod -l app=postgres-app -n {{.NAMESPACE}} --timeout=120s || true
+
+  test:postgres:complete:
+    desc: "Run PostgreSQL complete test (single YAML file)"
+    cmds:
+      - echo "Deploying PostgreSQL complete test..."
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.POSTGRES_COMPLETE_FILE}}
+      - echo "Waiting for source database to be ready..."
+      - kubectl wait --for=condition=ready pod/postgres-test -n {{.NAMESPACE}} --timeout=120s
+      - echo "Waiting for branch databases to be created and ready..."
+      - sleep 5
+      - kubectl wait --for=jsonpath='{.status.phase}'=Ready pgbranchdatabase/pg-test-branch-env-val -n {{.NAMESPACE}} --timeout=180s || echo "  Branch env-val not ready yet"
+      - kubectl wait --for=jsonpath='{.status.phase}'=Ready pgbranchdatabase/pg-test-branch-secret-ref -n {{.NAMESPACE}} --timeout=180s || echo "  Branch secret-ref not ready yet"
+      - echo ""
+      - kubectl get pgbranchdatabases -n {{.NAMESPACE}}
+      - echo ""
+      - kubectl get pods -n {{.NAMESPACE}} | grep -E "(postgres-test|pg-)" || echo "No pods yet"
+      - echo ""
+      - echo "PostgreSQL test deployed. Use 'task postgres:branches' to check status"
+
+  test:postgres:complete:clean:
+    desc: "PostgreSQL complete test from clean cluster (delete + create cluster + test + verify)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:postgres:complete
+      - task: verify:postgres:branches
+
+  clean:postgres:complete:
+    desc: "Clean up PostgreSQL complete test"
+    cmds:
+      - echo "Cleaning up PostgreSQL complete test..."
+      - kubectl delete -f {{.POSTGRES_COMPLETE_FILE}} --ignore-not-found=true
+      - echo "Cleanup complete"
+
+  clean:modular:
+    desc: "Delete all PostgreSQL modular test resources"
+    cmds:
+      - kubectl delete namespace {{.NAMESPACE}} --ignore-not-found=true
+      - echo "Waiting for namespace deletion..."
+      - |
+        while kubectl get namespace {{.NAMESPACE}} 2>/dev/null; do
+          echo "Waiting for namespace {{.NAMESPACE}} to be deleted..."
+          sleep 2
+        done
+      - echo "Namespace {{.NAMESPACE}} deleted"
 
   verify:all:
     desc: "Verify all PostgreSQL test results"
@@ -155,17 +203,42 @@ tasks:
         fi
         kubectl exec -it -n {{.NAMESPACE}} $POD -- sh
 
-  clean:
-    desc: "Delete all PostgreSQL test resources"
+  query:source:
+    desc: "Query source PostgreSQL database"
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
     cmds:
-      - kubectl delete namespace {{.NAMESPACE}} --ignore-not-found=true
-      - echo "Waiting for namespace deletion..."
+      - kubectl exec -n {{.NAMESPACE}} postgres-test -- psql -U postgres -d source_db -c "{{.QUERY}}"
+
+  query:branch:
+    desc: "Query a branch PostgreSQL database"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
       - |
-        while kubectl get namespace {{.NAMESPACE}} 2>/dev/null; do
-          echo "Waiting for namespace {{.NAMESPACE}} to be deleted..."
-          sleep 2
-        done
-      - echo "Namespace {{.NAMESPACE}} deleted"
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=pg-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "ERROR: No branch pod found for scenario {{.SCENARIO}}"
+          exit 1
+        fi
+        kubectl exec -n {{.NAMESPACE}} $POD -- psql -U postgres -d branch_db -c "{{.QUERY}}"
+
+  verify:postgres:branches:
+    desc: "Quick verification of all branch databases"
+    cmds:
+      - echo "=== Source Database ==="
+      - task: query:source
+        vars: {QUERY: "SELECT 'users' as table_name, COUNT(*) as count FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products;"}
+      - echo ""
+      - echo "=== Branch{{":"}} env-val (should have ALL data) ==="
+      - task: query:branch
+        vars: {SCENARIO: env-val, QUERY: "SELECT 'users' as table_name, COUNT(*) as count FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products;"}
+      - echo ""
+      - echo "=== Branch{{":"}} secret-ref (should have FILTERED data{{":"}} age>18, amount>50) ==="
+      - task: query:branch
+        vars: {SCENARIO: secret-ref, QUERY: "SELECT 'users' as table_name, COUNT(*) as count FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products;"}
+
 
   run:local:
     desc: "Run PostgreSQL app locally with mirrord (creates branch DB with db_branches config)"
@@ -186,9 +259,9 @@ tasks:
     desc: "Test PostgreSQL with mirrord.json db_branches configuration"
     cmds:
       - echo "Testing PostgreSQL branch creation via mirrord.json..."
-      - task: deploy:base
+      - task: deploy:modular:base
       - echo "Deploying source database..."
-      - kubectl apply -f {{.POSTGRES_DIR}}/postgres-test.yaml
+      - kubectl apply -f {{.POSTGRES_DIR}}/simple-app/postgres-deployment.yaml
       - echo "Waiting for source database..."
       - kubectl wait --for=condition=ready pod -l app=postgres-test -n {{.NAMESPACE}} --timeout=120s
       - echo ""

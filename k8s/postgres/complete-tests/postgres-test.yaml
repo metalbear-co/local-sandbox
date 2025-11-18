@@ -1,0 +1,189 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-test
+  namespace: test-mirrord
+  labels:
+    app: postgres-test
+spec:
+  initContainers:
+    - name: init-db-script
+      image: postgres:17
+      command:
+        - sh
+        - -c
+        - |
+          cat <<'EOF' > /docker-entrypoint-initdb.d/01-init-user-db.sql
+          CREATE DATABASE source_db;
+          \c source_db
+          
+          CREATE TABLE users (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(50),
+            email VARCHAR(100),
+            age INT
+          );
+          
+          INSERT INTO users (name, email, age) VALUES
+            ('Alice', 'alice@example.com', 25),
+            ('Bob', 'bob@example.com', 30),
+            ('Charlie', 'charlie@example.com', 17),
+            ('Diana', 'diana@example.com', 22),
+            ('Eve', 'eve@example.com', 16);
+          
+          CREATE TABLE orders (
+            id SERIAL PRIMARY KEY,
+            user_id INT,
+            amount DECIMAL(10, 2),
+            status VARCHAR(50)
+          );
+          
+          INSERT INTO orders (user_id, amount, status) VALUES
+            (1, 100.00, 'completed'),
+            (2, 150.50, 'pending'),
+            (1, 75.25, 'completed'),
+            (3, 25.00, 'completed'),
+            (4, 200.00, 'completed');
+          
+          CREATE TABLE products (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(100),
+            price DECIMAL(10, 2)
+          );
+          
+          INSERT INTO products (name, price) VALUES
+            ('Laptop', 999.99),
+            ('Mouse', 29.99),
+            ('Keyboard', 79.99),
+            ('Monitor', 299.99);
+          EOF
+      volumeMounts:
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+  containers:
+    - name: postgres
+      image: postgres:17
+      env:
+        - name: POSTGRES_PASSWORD
+          value: postgres
+        - name: POSTGRES_USER
+          value: postgres
+      ports:
+        - containerPort: 5432
+      volumeMounts:
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+      readinessProbe:
+        exec:
+          command:
+            - pg_isready
+            - -U
+            - postgres
+        initialDelaySeconds: 5
+        periodSeconds: 5
+  volumes:
+    - name: initdb
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-test
+  namespace: test-mirrord
+spec:
+  selector:
+    app: postgres-test
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-server-env-val
+  namespace: test-mirrord
+  labels:
+    test-scenario: env-val
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres env-val scenario running' && sleep 3600"]
+    env:
+    - name: DATABASE_URL
+      value: "postgresql://postgres:postgres@postgres-test:5432/source_db"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pg-connection-secret
+  namespace: test-mirrord
+type: Opaque
+stringData:
+  url: postgresql://postgres:postgres@postgres-test/source_db
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-server-secret-ref
+  namespace: test-mirrord
+  labels:
+    test-scenario: secret-ref
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres secret-ref scenario running' && sleep 3600"]
+    env:
+    - name: DATABASE_URL
+      valueFrom:
+        secretKeyRef:
+          name: pg-connection-secret
+          key: url
+---
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: PgBranchDatabase
+metadata:
+  name: pg-test-branch-env-val
+  namespace: test-mirrord
+spec:
+  id: env-val-branch
+  ttlSecs: 600
+  postgresVersion: "17"
+  target:
+    pod: pg-server-env-val
+    container: app
+  connectionSource:
+    url:
+      env:
+        container: app
+        variable: DATABASE_URL
+  copy:
+    mode: all
+---
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: PgBranchDatabase
+metadata:
+  name: pg-test-branch-secret-ref
+  namespace: test-mirrord
+spec:
+  id: secret-ref-branch
+  ttlSecs: 600
+  postgresVersion: "17"
+  target:
+    pod: pg-server-secret-ref
+    container: app
+  connectionSource:
+    url:
+      env:
+        container: app
+        variable: DATABASE_URL
+  copy:
+    mode: schema
+    tables:
+      users:
+        filter: "age > 18"
+      orders:
+        filter: "amount > 50"
+
