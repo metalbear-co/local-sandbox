@@ -1,0 +1,43 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# NOTE: This file is processed by envsubst in the deploy task.
+# The following environment variables must be set in .env:
+#   - QUEUE_NAME: AWS SQS queue name
+#   - AWS_REGION: AWS region (e.g., us-east-1)
+#   - AWS_ACCESS_KEY_ID: AWS access key
+#   - AWS_SECRET_ACCESS_KEY: AWS secret key
+#   - AWS_ACCOUNT_ID: AWS account ID (for queue URL)
+#
+# The operator-patch.yaml is applied separately via kubectl patch command.
+
+resources:
+  - ../../sqs
+
+patches:
+  - target:
+      kind: Deployment
+      name: sqs-consumer
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: sqs-consumer
+        namespace: test-mirrord
+      spec:
+        template:
+          spec:
+            containers:
+            - name: consumer
+              env:
+              - name: QUEUE_NAME
+                value: "${QUEUE_NAME}"
+              - name: AWS_REGION
+                value: "${AWS_REGION}"
+              - name: AWS_DEFAULT_REGION
+                value: "${AWS_REGION}"
+              - name: AWS_ACCESS_KEY_ID
+                value: "${AWS_ACCESS_KEY_ID}"
+              - name: AWS_SECRET_ACCESS_KEY
+                value: "${AWS_SECRET_ACCESS_KEY}"
+
