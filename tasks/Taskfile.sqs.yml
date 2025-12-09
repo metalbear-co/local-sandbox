@@ -9,8 +9,8 @@ vars:
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
 
 tasks:
-  send-message:
-    desc: Send test message to SQS queue
+  send:message:
+    desc: "Send test message to SQS queue (ex: task sqs:send:message MESSAGE='test' TENANT='Avi.Test')"
     vars:
       TENANT: '{{.TENANT | default "Avi.Test"}}'
       MESSAGE: '{{.MESSAGE | default "Test message"}}'

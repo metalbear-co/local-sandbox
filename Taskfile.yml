@@ -325,7 +325,7 @@ tasks:
     desc: "Run MySQL branching tests (modular test structure)"
     deps: [build:app:mysql, operator:install]
     cmds:
-      - task: mysql:test
+      - task: mysql:test:modular
 
   test:mysql:quick:
     desc: "Quick MySQL test - refresh data without cluster rebuild"
@@ -338,13 +338,45 @@ tasks:
     cmds:
       - task: mysql:verify:all
 
+  test:mariadb:
+    desc: "Run MariaDB complete test"
+    deps: [build:app:mysql, operator:install]
+    cmds:
+      - task: mysql:test:mariadb:complete
+
+  test:mariadb:verify:
+    desc: "Verify MariaDB test results"
+    cmds:
+      - task: mysql:verify:mariadb:branches
+
+  test:mariadb:clean:
+    desc: "Delete cluster and run MariaDB test fresh"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:mysql
+      - task: operator:install
+      - task: mysql:test:mariadb:complete
+      - task: mysql:verify:mariadb:branches
+
+  test:mariadb:clean-nobuild:
+    desc: "Delete cluster and run MariaDB test (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:mysql
+      - task: license:create-secret
+      - task: operator:install-nobuild
+      - task: mysql:test:mariadb:complete
+      - task: mysql:verify:mariadb:branches
+
   test:mysql:clean:
     desc: "Delete cluster and run MySQL test fresh"
     cmds:
       - task: cluster:delete
       - task: cluster:create
       - task: operator:install
-      - task: mysql:test
+      - task: mysql:test:modular
 
   test:mysql:clean-nobuild:
     desc: "Delete cluster and run MySQL test (skip operator build)"
@@ -354,7 +386,7 @@ tasks:
       - task: build:app:mysql
       - task: license:create-secret
       - task: operator:install-nobuild
-      - task: mysql:test
+      - task: mysql:test:modular
 
   test:mysql-sa:
     desc: Run MySQL test with service account
@@ -389,12 +421,12 @@ tasks:
     desc: Run PostgreSQL branching test
     deps: [build:app:postgres, operator:install]
     cmds:
-      - task: postgres:test
+      - task: postgres:test:modular
 
   test:postgres:verify:
     desc: Verify PostgreSQL test results
     cmds:
-      - task: postgres:verify
+      - task: postgres:verify:all
 
   test:postgres:base:clean:
     desc: Delete cluster and run PostgreSQL test fresh
@@ -403,7 +435,7 @@ tasks:
       - task: cluster:create
       - task: build:app:postgres
       - task: operator:install
-      - task: postgres:deploy:base
+      - task: postgres:deploy:modular:base
 
   test:postgres:clean:
     desc: Delete cluster and run PostgreSQL test fresh
@@ -412,8 +444,7 @@ tasks:
       - task: cluster:create
       - task: build:app:postgres
       - task: operator:install
-      - task: postgres:deploy
-      - task: postgres:verify
+      - task: postgres:test:complete:verify
 
   test:postgres:clean:nocache:
     desc: Delete cluster and run PostgreSQL test fresh
@@ -422,8 +453,8 @@ tasks:
       - task: cluster:create
       - task: build:app:postgres
       - task: operator:install:nocache
-      - task: postgres:deploy
-      - task: postgres:verify
+      - task: postgres:deploy:modular
+      - task: postgres:verify:all
 
   test:postgres:clean-nobuild:
     desc: Delete cluster and run PostgreSQL test (skip operator build)
@@ -433,8 +464,8 @@ tasks:
       - task: build:app:postgres
       - task: license:create-secret
       - task: operator:install-nobuild
-      - task: postgres:deploy
-      - task: postgres:verify
+      - task: postgres:deploy:modular
+      - task: postgres:verify:all
 
   test:kafka:
     desc: Run Kafka test
@@ -507,6 +538,7 @@ tasks:
       - task: test:kafka:clean
       - task: test:kafka-sa:clean-nobuild
       - task: test:mysql:clean
+      - task: test:mariadb:clean-nobuild
       - task: test:mysql-sa:clean-nobuild
       - task: test:postgres:clean-nobuild
 
@@ -518,6 +550,7 @@ tasks:
       - task: test:kafka:clean-nobuild
       - task: test:kafka-sa:clean-nobuild
       - task: test:mysql:clean-nobuild
+      - task: test:mariadb:clean-nobuild
       - task: test:mysql-sa:clean-nobuild
       - task: test:postgres:clean-nobuild
 

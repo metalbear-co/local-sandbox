@@ -12,9 +12,14 @@ vars:
   SOURCE_DB_PASSWORD: 'examplepassword'
   
   # Mirrord binary path (customize for your setup)
-  MIRRORD_BIN: '{{.MIRRORD_BIN | default "/Users/test/Projects/test/metalbear/work/mirrord/target/aarch64-apple-darwin/debug/mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 tasks:
+  test:
+    desc: "Run MySQL modular test (default test)"
+    cmds:
+      - task: test:modular
+
   test:modular:
     desc: "Run modular MySQL test (component-based structure)"
     cmds:
@@ -138,7 +143,7 @@ tasks:
       EXPECTED_ORDERS: '{{.EXPECTED_ORDERS | default "?"}}'
     cmds:
       - |
-        echo "Branch: {{.SCENARIO}} ({{.MODE}})"
+        echo "Branch {{.SCENARIO}} ({{.MODE}})"
         POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name=mysql-test-branch-{{.SCENARIO}} --no-headers -o custom-columns=":metadata.name" | head -1)
         BRANCH_ID=$(kubectl get mysqlbranchdatabases -n {{.NAMESPACE}} mysql-test-branch-{{.SCENARIO}} -o jsonpath='{.spec.id}' 2>/dev/null)
         
@@ -147,8 +152,8 @@ tasks:
           exit 1
         fi
         
-        echo "  Pod: $POD"
-        echo "  Branch ID: $BRANCH_ID"
+        echo "  Pod $POD"
+        echo "  Branch ID $BRANCH_ID"
         
         # Query the branch database (database name is 'user', not the branch ID)
         kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "
@@ -158,7 +163,7 @@ tasks:
         " 2>/dev/null || echo "Failed to query branch database"
 
   query:source:
-    desc: "Query source database"
+    desc: "Query source database (ex: task mysql:query:source QUERY='SELECT * FROM users')"
     vars:
       QUERY: '{{.QUERY | default "SELECT * FROM users"}}'
     cmds:
@@ -166,7 +171,7 @@ tasks:
         vars: {QUERY: "{{.QUERY}}"}
   
   query:branch:
-    desc: "Query a branch database"
+    desc: "Query a branch database (ex: task mysql:query:branch SCENARIO='env-val' QUERY='SELECT * FROM orders')"
     vars:
       SCENARIO: '{{.SCENARIO | default "env-val"}}'
       QUERY: '{{.QUERY | default "SELECT * FROM users"}}'
@@ -185,7 +190,7 @@ tasks:
         for SCENARIO in env-val secret-ref; do
           POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name=mysql-test-branch-$SCENARIO -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
           if [ -n "$POD" ]; then
-            echo "Branch{{":"}} $SCENARIO"
+            echo "Branch $SCENARIO"
             kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders;"
             echo ""
           fi
@@ -202,7 +207,7 @@ tasks:
         for SCENARIO in env-val secret-ref; do
           POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name=mariadb-test-branch-$SCENARIO -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
           if [ -n "$POD" ]; then
-            echo "Branch{{":"}} $SCENARIO"
+            echo "Branch $SCENARIO"
             kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders;"
             echo ""
           fi
@@ -269,7 +274,7 @@ tasks:
       - echo ""
   
   describe:scenario:
-    desc: "Describe a test scenario pod"
+    desc: "Describe a test scenario pod (ex: task mysql:describe:scenario SCENARIO='env-val')"
     vars:
       SCENARIO: '{{.SCENARIO}}'
     cmds:
@@ -336,7 +341,7 @@ tasks:
           exit 1
         fi
 
-  run:app:local:
+  run:local:
     desc: "Run MySQL app locally with mirrord (creates branch DB)"
     dir: '{{.ROOT_DIR}}/apps/mysql-app'
     vars:
@@ -357,14 +362,6 @@ tasks:
       - task: _wait-branches
         vars: {DB_TYPE: mysql, BRANCH1: mysql-test-branch-env-val, BRANCH2: mysql-test-branch-secret-ref}
 
-  test:mysql:complete:clean:
-    desc: "MySQL complete test from clean cluster (delete + create cluster + test + verify)"
-    cmds:
-      - task: cluster:delete
-      - task: cluster:create
-      - task: test:mysql:complete
-      - task: verify:mysql:branches
-
   test:mariadb:complete:
     desc: "Run MariaDB complete test (MySQL-compatible, single YAML file)"
     cmds:
@@ -376,14 +373,6 @@ tasks:
         vars: {DB_TYPE: mariadb, POD_NAME: mariadb-test}
       - task: _wait-branches
         vars: {DB_TYPE: mariadb, BRANCH1: mariadb-test-branch-env-val, BRANCH2: mariadb-test-branch-secret-ref}
-
-  test:mariadb:complete:clean:
-    desc: "MariaDB complete test from clean cluster (delete + create cluster + test + verify)"
-    cmds:
-      - task: cluster:delete
-      - task: cluster:create
-      - task: test:mariadb:complete
-      - task: verify:mariadb:branches
 
   clean:mysql:complete:
     desc: "Clean up MySQL complete test"

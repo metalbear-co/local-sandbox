@@ -12,6 +12,21 @@ vars:
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 tasks:
+  test:
+    desc: "Run PostgreSQL modular test (default test)"
+    cmds:
+      - task: test:modular
+
+  deploy:
+    desc: "Deploy PostgreSQL test environment (default to modular)"
+    cmds:
+      - task: deploy:modular
+
+  verify:
+    desc: "Verify PostgreSQL test results (default verification)"
+    cmds:
+      - task: verify:all
+
   test:modular:
     desc: "Run PostgreSQL modular test (component-based structure)"
     cmds:
@@ -43,7 +58,7 @@ tasks:
       - echo "Waiting for app to be ready..."
       - kubectl wait --for=condition=ready pod -l app=postgres-app -n {{.NAMESPACE}} --timeout=120s || true
 
-  test:postgres:complete:
+  test:complete:
     desc: "Run PostgreSQL complete test (single YAML file)"
     cmds:
       - echo "Deploying PostgreSQL complete test..."
@@ -62,15 +77,13 @@ tasks:
       - echo ""
       - echo "PostgreSQL test deployed. Use 'task postgres:branches' to check status"
 
-  test:postgres:complete:clean:
-    desc: "PostgreSQL complete test from clean cluster (delete + create cluster + test + verify)"
+  test:complete:verify:
+    desc: "Run PostgreSQL complete test and verify branches"
     cmds:
-      - task: cluster:delete
-      - task: cluster:create
-      - task: test:postgres:complete
-      - task: verify:postgres:branches
+      - task: test:complete
+      - task: verify:branches
 
-  clean:postgres:complete:
+  clean:complete:
     desc: "Clean up PostgreSQL complete test"
     cmds:
       - echo "Cleaning up PostgreSQL complete test..."
@@ -123,18 +136,18 @@ tasks:
       EXPECTED_PRODUCTS: '{{.EXPECTED_PRODUCTS | default "?"}}'
     cmds:
       - |
-        echo "Scenario: {{.SCENARIO}} ({{.MODE}})"
+        echo "Scenario {{.SCENARIO}} ({{.MODE}})"
         echo "Getting branch pod name..."
         POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=pg-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
         if [ -z "$POD" ]; then
-          echo "ERROR: No branch pod found for scenario {{.SCENARIO}}"
+          echo "ERROR - No branch pod found for scenario {{.SCENARIO}}"
           exit 1
         fi
-        echo "Branch Pod: $POD"
+        echo "Branch Pod $POD"
         echo "Querying branch database..."
         kubectl exec -n {{.NAMESPACE}} $POD -- psql -U postgres -d branch_db -c \
         "SELECT 'users' as tbl, COUNT(*) as cnt FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products ORDER BY tbl;" 2>/dev/null || echo "Query failed"
-        echo "Expected: users={{.EXPECTED_USERS}}, orders={{.EXPECTED_ORDERS}}, products={{.EXPECTED_PRODUCTS}}"
+        echo "Expected - users={{.EXPECTED_USERS}}, orders={{.EXPECTED_ORDERS}}, products={{.EXPECTED_PRODUCTS}}"
 
   branches:
     desc: "Show all PostgreSQL branch databases"
@@ -142,30 +155,30 @@ tasks:
       - kubectl get pgbranchdatabase -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode,AGE:.metadata.creationTimestamp
 
   logs:pod:
-    desc: "Show logs for a specific branch pod"
+    desc: "Show logs for a specific branch pod (ex: task postgres:logs:pod SCENARIO='env-val')"
     vars:
       SCENARIO: '{{.SCENARIO | default "env-val"}}'
     cmds:
       - |
         POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name={{.SCENARIO}} -o jsonpath='{.items[0].metadata.name}')
         if [ -z "$POD" ]; then
-          echo "ERROR: No branch pod found for scenario {{.SCENARIO}}"
+          echo "ERROR - No branch pod found for scenario {{.SCENARIO}}"
           exit 1
         fi
         kubectl logs -n {{.NAMESPACE}} $POD
 
   logs:job:
-    desc: "Show logs for the init job of a specific scenario"
+    desc: "Show logs for the init job of a specific scenario (ex: task postgres:logs:job SCENARIO='secret-ref')"
     vars:
       SCENARIO: '{{.SCENARIO | default "env-val"}}'
     cmds:
       - |
         JOB=$(kubectl get job -n {{.NAMESPACE}} -l db-owner-name={{.SCENARIO}} -o jsonpath='{.items[0].metadata.name}')
         if [ -z "$JOB" ]; then
-          echo "ERROR: No init job found for scenario {{.SCENARIO}}"
+          echo "ERROR - No init job found for scenario {{.SCENARIO}}"
           exit 1
         fi
-        echo "Init Job: $JOB"
+        echo "Init Job $JOB"
         kubectl logs -n {{.NAMESPACE}} job/$JOB
 
   logs:app:
@@ -179,17 +192,17 @@ tasks:
       - kubectl exec -it -n {{.NAMESPACE}} postgres-test -- psql -U postgres -d source_db
 
   shell:branch:
-    desc: "Open psql shell to a branch database"
+    desc: "Open psql shell to a branch database (ex: task postgres:shell:branch SCENARIO='env-val')"
     vars:
       SCENARIO: '{{.SCENARIO | default "env-val"}}'
     cmds:
       - |
         POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=pg-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
         if [ -z "$POD" ]; then
-          echo "ERROR: No branch pod found for scenario {{.SCENARIO}}"
+          echo "ERROR - No branch pod found for scenario {{.SCENARIO}}"
           exit 1
         fi
-        echo "Connecting to branch pod: $POD"
+        echo "Connecting to branch pod $POD"
         kubectl exec -it -n {{.NAMESPACE}} $POD -- psql -U postgres -d branch_db
 
   shell:app:
@@ -198,20 +211,20 @@ tasks:
       - |
         POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=postgres-app -o jsonpath='{.items[0].metadata.name}')
         if [ -z "$POD" ]; then
-          echo "ERROR: No postgres-app pod found"
+          echo "ERROR - No postgres-app pod found"
           exit 1
         fi
         kubectl exec -it -n {{.NAMESPACE}} $POD -- sh
 
   query:source:
-    desc: "Query source PostgreSQL database"
+    desc: "Query source PostgreSQL database (ex: task postgres:query:source QUERY='SELECT * FROM users')"
     vars:
       QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
     cmds:
       - kubectl exec -n {{.NAMESPACE}} postgres-test -- psql -U postgres -d source_db -c "{{.QUERY}}"
 
   query:branch:
-    desc: "Query a branch PostgreSQL database"
+    desc: "Query a branch PostgreSQL database (ex: task postgres:query:branch SCENARIO='env-val' QUERY='SELECT * FROM orders')"
     vars:
       SCENARIO: '{{.SCENARIO | default "env-val"}}'
       QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
@@ -219,23 +232,23 @@ tasks:
       - |
         POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=pg-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
         if [ -z "$POD" ]; then
-          echo "ERROR: No branch pod found for scenario {{.SCENARIO}}"
+          echo "ERROR - No branch pod found for scenario {{.SCENARIO}}"
           exit 1
         fi
         kubectl exec -n {{.NAMESPACE}} $POD -- psql -U postgres -d branch_db -c "{{.QUERY}}"
 
-  verify:postgres:branches:
+  verify:branches:
     desc: "Quick verification of all branch databases"
     cmds:
       - echo "=== Source Database ==="
       - task: query:source
         vars: {QUERY: "SELECT 'users' as table_name, COUNT(*) as count FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products;"}
       - echo ""
-      - echo "=== Branch{{":"}} env-val (should have ALL data) ==="
+      - echo "=== Branch env-val (should have ALL data) ==="
       - task: query:branch
         vars: {SCENARIO: env-val, QUERY: "SELECT 'users' as table_name, COUNT(*) as count FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products;"}
       - echo ""
-      - echo "=== Branch{{":"}} secret-ref (should have FILTERED data{{":"}} age>18, amount>50) ==="
+      - echo "=== Branch secret-ref (should have FILTERED data - age>18, amount>50) ==="
       - task: query:branch
         vars: {SCENARIO: secret-ref, QUERY: "SELECT 'users' as table_name, COUNT(*) as count FROM users UNION SELECT 'orders', COUNT(*) FROM orders UNION SELECT 'products', COUNT(*) FROM products;"}
 
@@ -251,11 +264,11 @@ tasks:
     cmds:
       - echo "Building PostgreSQL app..."
       - go build -o /tmp/postgres-app main.go
-      - echo "Running with mirrord (config{{":"}} {{.MIRRORD_CONFIG}})..."
+      - echo "Running with mirrord - config {{.MIRRORD_CONFIG}}"
       - echo "This will create a branch database defined in the config's db_branches section"
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/postgres-app'
 
-  test:mirrord-config:
+  test:mirrord:config:
     desc: "Test PostgreSQL with mirrord.json db_branches configuration"
     cmds:
       - echo "Testing PostgreSQL branch creation via mirrord.json..."
@@ -265,6 +278,6 @@ tasks:
       - echo "Waiting for source database..."
       - kubectl wait --for=condition=ready pod -l app=postgres-test -n {{.NAMESPACE}} --timeout=120s
       - echo ""
-      - echo "Now run 'task postgres{{":"}}run{{":"}}local' in another terminal to test mirrord with db_branches"
-      - echo "The mirrord config is at{{":"}} k8s/overlays/postgres/mirrord.json"
+      - echo "Now run 'task postgres:run:local' in another terminal to test mirrord with db_branches"
+      - echo "The mirrord config is at k8s/overlays/postgres/mirrord.json"
       - echo ""
