@@ -173,6 +173,11 @@ tasks:
         echo -n "Operator: "
         kubectl get deployment mirrord-operator -n mirrord >/dev/null 2>&1 && echo "Running" || echo "✗ Not running"
 
+  helm:update:
+    desc: Update helm
+    cmds:
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
   # Operator installation
   operator:install:
     desc: Install operator with custom image (idempotent)
@@ -243,7 +248,6 @@ tasks:
     cmds:
       - task: cluster:delete
       - task: cluster:create
-      - task: build:app:postgres
       - task: operator:install
 
   test:default:clean:nocache:
@@ -251,7 +255,6 @@ tasks:
     cmds:
       - task: cluster:delete
       - task: cluster:create
-      - task: build:app:postgres
       - task: operator:install:nocache
 
   # Test scenarios
