@@ -1,4 +1,4 @@
-version: '3'
+version: "3"
 
 # Kafka-specific test operations
 
@@ -20,22 +20,22 @@ tasks:
         POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
         if [ -n "{{.USER_ID}}" ]; then
           echo "Sending message with header user_id={{.USER_ID}} to topic {{.TOPIC}}..."
-          printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic {{.TOPIC}} --property 'parse.headers=true' --property 'headers.delimiter=|'
+          printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --property 'parse.headers=true' --property 'headers.delimiter=|'
           echo "Message sent with header user_id={{.USER_ID}}"
         else
           echo "Sending message without headers to topic {{.TOPIC}}..."
-          printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --broker-list localhost:9092 --topic {{.TOPIC}}
+          printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}}
           echo "Message sent"
         fi
 
   run:local:
     desc: Run Kafka consumer locally with mirrord
-    dir: '{{.ROOT_DIR}}/apps/kafka-consumer'
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
     vars:
       MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka/mirrord.json")}}'
     cmds:
       - go build -o /tmp/kafka-consumer main.go
-      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer'
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
 
   logs:
     desc: Show Kafka consumer logs

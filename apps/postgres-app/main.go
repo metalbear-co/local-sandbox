@@ -15,9 +15,18 @@ import (
 func main() {
 	log.Println("Starting PostgreSQL app...")
 
-	dbURL := os.Getenv("DB_CONNECTION_URL")
+	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		log.Fatal("DB_CONNECTION_URL environment variable is not set")
+		log.Fatal("DATABASE_URL environment variable is not set")
+	}
+
+	// Add sslmode=disable to the connection string if not already present
+	if !strings.Contains(dbURL, "sslmode=") {
+		if strings.Contains(dbURL, "?") {
+			dbURL += "&sslmode=disable"
+		} else {
+			dbURL += "?sslmode=disable"
+		}
 	}
 
 	log.Printf("Connecting to database: %s", maskPassword(dbURL))
