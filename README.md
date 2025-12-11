@@ -19,6 +19,7 @@ task test:sqs
 task test:kafka
 ```
 
+
 ## Clean Tests (Delete + Recreate Cluster)
 
 ```bash
@@ -44,16 +45,19 @@ task --list
 ## Discover All Available Commands
 
 List all available tasks:
+
 ```bash
 task --list
 ```
 
 List all tasks including internal ones:
+
 ```bash
 task --list-all
 ```
 
 Search for specific tasks:
+
 ```bash
 task --list | grep mysql
 task --list | grep postgres

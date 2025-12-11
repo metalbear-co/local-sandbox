@@ -16,41 +16,41 @@ spec:
           cat <<'EOF' > /docker-entrypoint-initdb.d/01-init-user-db.sql
           CREATE DATABASE source_db;
           \c source_db
-          
+
           CREATE TABLE users (
             id SERIAL PRIMARY KEY,
             name VARCHAR(50),
             email VARCHAR(100),
             age INT
           );
-          
+
           INSERT INTO users (name, email, age) VALUES
             ('Alice', 'alice@example.com', 25),
             ('Bob', 'bob@example.com', 30),
             ('Charlie', 'charlie@example.com', 17),
             ('Diana', 'diana@example.com', 22),
             ('Eve', 'eve@example.com', 16);
-          
+
           CREATE TABLE orders (
             id SERIAL PRIMARY KEY,
             user_id INT,
             amount DECIMAL(10, 2),
             status VARCHAR(50)
           );
-          
+
           INSERT INTO orders (user_id, amount, status) VALUES
             (1, 100.00, 'completed'),
             (2, 150.50, 'pending'),
             (1, 75.25, 'completed'),
             (3, 25.00, 'completed'),
             (4, 200.00, 'completed');
-          
+
           CREATE TABLE products (
             id SERIAL PRIMARY KEY,
             name VARCHAR(100),
             price DECIMAL(10, 2)
           );
-          
+
           INSERT INTO products (name, price) VALUES
             ('Laptop', 999.99),
             ('Mouse', 29.99),
@@ -105,14 +105,16 @@ metadata:
   namespace: test-mirrord
   labels:
     test-scenario: env-val
+    app: postgres-app
 spec:
   containers:
-  - name: app
-    image: busybox
-    command: ["sh", "-c", "echo 'Postgres env-val scenario running' && sleep 3600"]
-    env:
-    - name: DATABASE_URL
-      value: "postgresql://postgres:postgres@postgres-test:5432/source_db"
+    - name: app
+      image: busybox
+      command:
+        ["sh", "-c", "echo 'Postgres env-val scenario running' && sleep 3600"]
+      env:
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres-test:5432/source_db"
 ---
 apiVersion: v1
 kind: Secret
@@ -130,17 +132,23 @@ metadata:
   namespace: test-mirrord
   labels:
     test-scenario: secret-ref
+    app: postgres-app
 spec:
   containers:
-  - name: app
-    image: busybox
-    command: ["sh", "-c", "echo 'Postgres secret-ref scenario running' && sleep 3600"]
-    env:
-    - name: DATABASE_URL
-      valueFrom:
-        secretKeyRef:
-          name: pg-connection-secret
-          key: url
+    - name: app
+      image: busybox
+      command:
+        [
+          "sh",
+          "-c",
+          "echo 'Postgres secret-ref scenario running' && sleep 3600",
+        ]
+      env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: pg-connection-secret
+              key: url
 ---
 apiVersion: dbs.mirrord.metalbear.co/v1alpha1
 kind: PgBranchDatabase
@@ -186,4 +194,3 @@ spec:
         filter: "age > 18"
       orders:
         filter: "amount > 50"
-

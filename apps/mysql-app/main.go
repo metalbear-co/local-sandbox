@@ -15,25 +15,25 @@ import (
 
 func main() {
 	log.Println("Starting MySQL app...")
-	
-	dbURL := os.Getenv("DB_CONNECTION_URL")
+
+	dbURL := os.Getenv("MYSQL_CONNECTION_URL")
 	if dbURL == "" {
-		log.Fatal("DB_CONNECTION_URL environment variable is not set")
+		log.Fatal("MYSQL_CONNECTION_URL environment variable is not set")
 	}
-	
+
 	log.Printf("Connecting to database: %s", maskPassword(dbURL))
-	
+
 	// Parse MySQL URL (mysql://user:pass@host:port/db) to DSN format
 	dsn := parseMySQLURL(dbURL)
 	log.Printf("Using DSN: %s", maskPassword(dsn))
-	
+
 	// Connect to MySQL
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to open database connection: %v", err)
 	}
 	defer db.Close()
-	
+
 	// Test connection with retries (branch databases may take a few seconds to be ready)
 	maxRetries := 10
 	var pingErr error
@@ -52,7 +52,7 @@ func main() {
 	}
 
 	log.Println("Connected to MySQL database")
-	
+
 	// Create table
 	createTableQuery := `
 		CREATE TABLE IF NOT EXISTS app_users (
@@ -61,11 +61,11 @@ func main() {
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		)
 	`
-	
+
 	if _, err := db.Exec(createTableQuery); err != nil {
 		log.Fatalf("Failed to create table: %v", err)
 	}
-	
+
 	log.Println("Created/verified app_users table")
 
 	// Insert default test users if table is empty
@@ -94,7 +94,7 @@ func main() {
 		log.Fatalf("Failed to query users: %v", err)
 	}
 	defer rows.Close()
-	
+
 	log.Println("Current users in database:")
 	count = 0
 	for rows.Next() {
@@ -109,13 +109,13 @@ func main() {
 		log.Printf("  - ID: %d, Name: %s, Created: %s", id, name, createdAt.Format(time.RFC3339))
 	}
 	log.Printf("Total users: %d", count)
-	
+
 	// Setup signal handling
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	log.Println("App is running (press Ctrl+C to stop)...")
-	
+
 	// Keep running
 	<-sigChan
 	log.Println("Shutting down...")
@@ -125,40 +125,40 @@ func parseMySQLURL(urlStr string) string {
 	// Handle both formats:
 	// - mysql://user:pass@host:port/db?params (URL format)
 	// - user:pass@tcp(host:port)/db?params (DSN format)
-	
+
 	// If already in DSN format (contains @tcp), return as-is
 	if strings.Contains(urlStr, "@tcp(") {
 		return urlStr
 	}
-	
+
 	// If not mysql:// URL, return as-is
 	if !strings.HasPrefix(urlStr, "mysql://") {
 		return urlStr
 	}
-	
+
 	// Remove mysql:// prefix
 	urlStr = strings.TrimPrefix(urlStr, "mysql://")
-	
+
 	// Split by @ to separate credentials from host/db
 	atIdx := strings.Index(urlStr, "@")
 	if atIdx == -1 {
 		log.Printf("Warning: Invalid MySQL URL format (no @), using as-is")
 		return urlStr
 	}
-	
+
 	userPass := urlStr[:atIdx]
 	rest := urlStr[atIdx+1:]
-	
+
 	// Find the first / to separate host:port from /db
 	slashIdx := strings.Index(rest, "/")
 	if slashIdx == -1 {
 		log.Printf("Warning: Invalid MySQL URL format (no database), using as-is")
 		return urlStr
 	}
-	
+
 	hostPort := rest[:slashIdx]
 	dbAndParams := rest[slashIdx+1:]
-	
+
 	// Build DSN format: user:pass@tcp(host:port)/db?params
 	dsn := fmt.Sprintf("%s@tcp(%s)/%s", userPass, hostPort, dbAndParams)
 	return dsn
@@ -185,4 +185,3 @@ func maskPassword(dsn string) string {
 	}
 	return masked
 }
-

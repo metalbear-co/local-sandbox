@@ -1,6 +1,6 @@
-version: '3'
+version: "3"
 
-dotenv: ['.env']
+dotenv: [".env"]
 
 includes:
   sqs:
@@ -19,34 +19,34 @@ includes:
 vars:
   ROOT_DIR:
     sh: pwd
-  OPERATOR_DIR: '{{.ROOT_DIR}}/../operator'
-  CHARTS_DIR: '{{.ROOT_DIR}}/../charts/mirrord-operator'
-  SCRIPTS_DIR: '{{.ROOT_DIR}}/scripts'
-  MIRRORD_DIR: '{{.ROOT_DIR}}/../mirrord'
+  OPERATOR_DIR: "{{.ROOT_DIR}}/../operator"
+  CHARTS_DIR: "{{.ROOT_DIR}}/../charts/mirrord-operator"
+  SCRIPTS_DIR: "{{.ROOT_DIR}}/scripts"
+  MIRRORD_DIR: "{{.ROOT_DIR}}/../mirrord"
   OPERATOR_IMAGE: mirrord-operator:custom
-  CHART_VERSION: 
+  CHART_VERSION:
     sh: grep "appVersion:" {{.CHARTS_DIR}}/Chart.yaml | awk '{print $2}' | tr -d '"'
   NAMESPACE: test-mirrord
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}' # Set CLUSTER_NAME env var to use a custom cluster
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}' # Set CONTAINER_RUNTIME env var to use podman or docker
 
 tasks:
   # License management
   license:generate:
     desc: Generate new operator license
-    dir: '{{.SCRIPTS_DIR}}'
+    dir: "{{.SCRIPTS_DIR}}"
     cmds:
       - ./generate-license.sh
       - echo "License generated at {{.SCRIPTS_DIR}}/company-license.pem"
 
   license:create-secret:
-    desc: Create license secret in cluster
+    desc: Create license secret in cluster (namespace must already exist with Helm ownership)
     vars:
-      LICENSE_FILE: '{{.LICENSE_FILE | default .SCRIPTS_DIR}}/company-license.pem'
+      LICENSE_FILE: "{{.LICENSE_FILE | default .SCRIPTS_DIR}}/company-license.pem"
     preconditions:
       - sh: test -f {{.LICENSE_FILE}}
         msg: "License file not found at {{.LICENSE_FILE}}. Run 'task license:generate' first"
     cmds:
-      - kubectl create namespace mirrord --dry-run=client -o yaml | kubectl apply -f -
       - kubectl create secret generic mirrord-operator-license-pem --from-file=license.pem={{.LICENSE_FILE}} -n mirrord --dry-run=client -o yaml | kubectl apply -f -
       - echo "License secret created/updated"
 
@@ -54,54 +54,147 @@ tasks:
   build:operator:
     desc: Build operator with custom tag
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && docker build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:tag-and-load
       - echo "Operator built and tagged as mirrord-operator:{{.CHART_VERSION}}"
 
   build:operator:nocache:
     desc: Build operator without any caching (clean build)
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && docker build --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" --build-arg USE_SCCACHE=false operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" --build-arg USE_SCCACHE=false operator
       - task: operator:tag-and-load
       - echo "Operator built without cache and tagged as mirrord-operator:{{.CHART_VERSION}}"
+  
+  build:operator:gcs:
+    desc: Build operator with GCS sccache (requires GCS_CREDENTIALS_FILE and GCS_BUCKET env vars)
+    vars:
+      GCS_CREDENTIALS_FILE: '{{.GCS_CREDENTIALS_FILE | default ""}}'
+      GCS_BUCKET: '{{.GCS_BUCKET | default ""}}'
+      GCS_PATH_PREFIX: '{{.GCS_PATH_PREFIX | default "operator-local/"}}'
+    preconditions:
+      - sh: test -n "{{.GCS_CREDENTIALS_FILE}}"
+        msg: "GCS_CREDENTIALS_FILE env var is required (path to service account JSON)"
+      - sh: test -f "{{.GCS_CREDENTIALS_FILE}}"
+        msg: "GCS credentials file not found at {{.GCS_CREDENTIALS_FILE}}"
+      - sh: test -n "{{.GCS_BUCKET}}"
+        msg: "GCS_BUCKET env var is required (GCS bucket name for sccache)"
+    cmds:
+      - |
+        cd {{.OPERATOR_DIR}}/.. && docker build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
+          --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
+          --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
+          --build-arg GCS_RW_MODE=READ_WRITE \
+          --build-arg GCS_PATH_PREFIX={{.GCS_PATH_PREFIX}} \
+          operator
+      - task: operator:tag-and-load
+      - echo "Operator built with GCS sccache and tagged as mirrord-operator:{{.CHART_VERSION}}"
+
+  build:operator:gcs:custom-issuer:
+    desc: Build operator with GCS sccache and custom license issuer (requires GCS_CREDENTIALS_FILE and GCS_BUCKET env vars)
+    vars:
+      GCS_CREDENTIALS_FILE: '{{.GCS_CREDENTIALS_FILE | default ""}}'
+      GCS_BUCKET: '{{.GCS_BUCKET | default ""}}'
+      GCS_PATH_PREFIX: '{{.GCS_PATH_PREFIX | default "operator-local-custom-issuer/"}}'
+      CUSTOM_ISSUER_FILE: '{{.CUSTOM_ISSUER_FILE | default (printf "%s/tests/e2e_operator_license_issuer.pem" .OPERATOR_DIR)}}'
+    preconditions:
+      - sh: test -n "{{.GCS_CREDENTIALS_FILE}}"
+        msg: "GCS_CREDENTIALS_FILE env var is required (path to service account JSON)"
+      - sh: test -f "{{.GCS_CREDENTIALS_FILE}}"
+        msg: "GCS credentials file not found at {{.GCS_CREDENTIALS_FILE}}"
+      - sh: test -n "{{.GCS_BUCKET}}"
+        msg: "GCS_BUCKET env var is required (GCS bucket name for sccache)"
+      - sh: test -f "{{.CUSTOM_ISSUER_FILE}}"
+        msg: "Custom issuer file not found at {{.CUSTOM_ISSUER_FILE}}"
+    cmds:
+      - |
+        cd {{.OPERATOR_DIR}}/.. && docker build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
+          --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.CUSTOM_ISSUER_FILE}})" \
+          --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
+          --build-arg GCS_RW_MODE=READ_WRITE \
+          --build-arg GCS_PATH_PREFIX={{.GCS_PATH_PREFIX}} \
+          operator
+      - task: operator:tag-and-load
+      - echo "Operator built with GCS sccache + custom issuer and tagged as mirrord-operator:{{.CHART_VERSION}}"
 
   operator:tag-and-load:
     desc: Tag and load existing operator image into minikube
     cmds:
-      - docker tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.CHART_VERSION}}
+      - '{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.CHART_VERSION}}'
       - echo "Removing old image from minikube to ensure fresh load..."
-      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
       - echo "Loading fresh operator image into minikube..."
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
       - echo "Verifying image is loaded..."
-      - minikube -p {{.CLUSTER_NAME}} ssh "docker images mirrord-operator:{{.CHART_VERSION}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} images mirrord-operator:{{.CHART_VERSION}}"
+
+  build:mirrord-agent:gcs:
+    desc: Build mirrord agent with GCS sccache (requires GCS_CREDENTIALS_FILE and GCS_BUCKET env vars)
+    vars:
+      GCS_CREDENTIALS_FILE: '{{.GCS_CREDENTIALS_FILE | default ""}}'
+      GCS_BUCKET: '{{.GCS_BUCKET | default ""}}'
+      MIRRORD_AGENT_GCS_PREFIX: '{{.MIRRORD_AGENT_GCS_PREFIX | default "mirrord-agent-local/"}}'
+      AGENT_IMAGE: '{{.AGENT_IMAGE | default "mirrord-agent:local"}}'
+    preconditions:
+      - sh: test -n "{{.GCS_CREDENTIALS_FILE}}"
+        msg: "GCS_CREDENTIALS_FILE env var is required (path to service account JSON)"
+      - sh: test -f "{{.GCS_CREDENTIALS_FILE}}"
+        msg: "GCS credentials file not found at {{.GCS_CREDENTIALS_FILE}}"
+      - sh: test -n "{{.GCS_BUCKET}}"
+        msg: "GCS_BUCKET env var is required (GCS bucket name for sccache)"
+    cmds:
+      - |
+        cd {{.MIRRORD_DIR}} && docker build -f mirrord/agent/Dockerfile -t {{.AGENT_IMAGE}} \
+          --progress=plain \
+          --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
+          --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
+          --build-arg GCS_RW_MODE=READ_WRITE \
+          --build-arg GCS_PATH_PREFIX={{.MIRRORD_AGENT_GCS_PREFIX}} \
+          .
+      - task: mirrord-agent:tag-and-load
+        vars:
+          AGENT_IMAGE: '{{.AGENT_IMAGE}}'
+      - echo "Mirrord agent built with GCS sccache and tagged as {{.AGENT_IMAGE}}"
+
+  mirrord-agent:tag-and-load:
+    desc: Tag and load existing mirrord agent image into minikube
+    vars:
+      AGENT_IMAGE: '{{.AGENT_IMAGE | default "mirrord-agent:local"}}'
+    cmds:
+      - echo "Removing old image from minikube to ensure fresh load..."
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi {{.AGENT_IMAGE}} --force" || true
+      - echo "Loading fresh mirrord agent image into minikube..."
+      - minikube -p {{.CLUSTER_NAME}} image load {{.AGENT_IMAGE}}
+      - echo "Verifying image is loaded..."
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker images {{.AGENT_IMAGE}}"
 
   build:app:sqs:
     desc: Build SQS consumer app
-    dir: '{{.ROOT_DIR}}/apps/sqs-consumer'
+    dir: "{{.ROOT_DIR}}/apps/sqs-consumer"
     cmds:
-      - docker build -t sqs-consumer:local .
+      - '{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local .'
       - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
 
   build:app:kafka:
     desc: Build Kafka consumer app
-    dir: '{{.ROOT_DIR}}/apps/kafka-consumer'
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
     cmds:
-      - docker build -t kafka-consumer:local .
+      - '{{.CONTAINER_RUNTIME}} build -t kafka-consumer:local .'
       - minikube -p {{.CLUSTER_NAME}} image load kafka-consumer:local
 
   build:app:mysql:
     desc: Build MySQL app
-    dir: '{{.ROOT_DIR}}/apps/mysql-app'
+    dir: "{{.ROOT_DIR}}/apps/mysql-app"
     cmds:
-      - docker build -t mysql-app:local .
+      - '{{.CONTAINER_RUNTIME}} build -t mysql-app:local .'
       - minikube -p {{.CLUSTER_NAME}} image load mysql-app:local
 
   build:app:postgres:
     desc: Build PostgreSQL app
-    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    dir: "{{.ROOT_DIR}}/apps/postgres-app"
     cmds:
-      - docker build -t postgres-app:local .
+      - '{{.CONTAINER_RUNTIME}} build -t postgres-app:local .'
       - minikube -p {{.CLUSTER_NAME}} image load postgres-app:local
 
   build:app:
@@ -122,7 +215,7 @@ tasks:
   cluster:create:
     desc: Create fresh minikube cluster with infrastructure
     cmds:
-      - minikube -p {{.CLUSTER_NAME}} start --driver=docker
+      - minikube -p {{.CLUSTER_NAME}} start --driver={{.CONTAINER_RUNTIME}}
       - minikube -p {{.CLUSTER_NAME}} addons enable metrics-server
       - kubectl config use-context {{.CLUSTER_NAME}}
       - task: infra:all
@@ -181,24 +274,28 @@ tasks:
   # Operator installation
   operator:install:
     desc: Install operator with custom image (idempotent)
-    deps: [infra:all, build:operator, license:create-secret]
+    deps: [infra:all, build:operator]
     cmds:
-      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
+      - task: license:create-secret
       - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
 
   operator:install:nocache:
     desc: Install operator with clean build (no cache, no sccache)
-    deps: [infra:all, build:operator:nocache, license:create-secret]
+    deps: [infra:all, build:operator:nocache]
     cmds:
-      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
+      - task: license:create-secret
       - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
 
   operator:install-nobuild:
     desc: Install operator without building (reuse existing image)
-    deps: [infra:all, license:create-secret]
+    deps: [infra:all]
     cmds:
       - task: operator:tag-and-load
-      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
+      - task: license:create-secret
+      - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
       - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
 
   operator:install-with-new-license:
@@ -224,24 +321,34 @@ tasks:
       - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
       - echo "Operator updated successfully"
 
+  chart:update:
+    desc: Update only chart configuration (no image rebuild)
+    cmds:
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - echo "Chart updated successfully"
+
   # Internal test runner
   _run-test:
     internal: true
     vars:
-      OVERLAY: '{{.OVERLAY}}'
-      PATCH_FILE: '{{.PATCH_FILE}}'
-      WAIT_SELECTOR: '{{.WAIT_SELECTOR}}'
-      WAIT_NAMESPACE: '{{.WAIT_NAMESPACE | default .NAMESPACE}}'
+      OVERLAY: "{{.OVERLAY}}"
+      PATCH_FILE: "{{.PATCH_FILE}}"
+      WAIT_SELECTOR: "{{.WAIT_SELECTOR}}"
+      WAIT_NAMESPACE: "{{.WAIT_NAMESPACE | default .NAMESPACE}}"
       CONSUMER_APP: '{{.CONSUMER_APP | default "sqs-consumer"}}'
     cmds:
       - kubectl kustomize {{.ROOT_DIR}}/k8s/overlays/{{.OVERLAY}} | kubectl apply -f -
+      - |
+        # Fix: Ensure MirrordKafkaClientConfig is in mirrord namespace for Kafka tests
+        if [ "{{.OVERLAY}}" = "kafka" ] || [ "{{.OVERLAY}}" = "kafka-with-sa" ]; then
+          kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+        fi
       - kubectl patch deployment mirrord-operator -n mirrord --patch-file {{.ROOT_DIR}}/k8s/overlays/{{.PATCH_FILE}}/operator-patch.yaml --type=strategic || true
       - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=300s || true
       - kubectl wait --for=condition=ready pod -l {{.WAIT_SELECTOR}} -n {{.WAIT_NAMESPACE}} --timeout=300s || true
       - kubectl wait --for=condition=ready pod -l app={{.CONSUMER_APP}} -n {{.NAMESPACE}} --timeout=300s || true
       - kubectl get pods -n {{.NAMESPACE}}
       - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} || true
-
 
   test:default:clean:
     desc: Delete cluster and run fresh
@@ -323,6 +430,61 @@ tasks:
           PATCH_FILE: sqs-localstack
           WAIT_SELECTOR: app.kubernetes.io/name=localstack
           WAIT_NAMESPACE: localstack
+
+  # AWS SQS Init Tasks (modular setup for development)
+  
+  init:sqs:aws:clean:
+    desc: "Full AWS SQS setup: delete cluster, create new, build everything, deploy consumer"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:sqs
+      - task: license:create-secret
+      - task: operator:install
+      - task: _init:sqs:aws:deploy
+
+  init:sqs:aws:
+    desc: "Quick AWS SQS setup: update operator and redeploy consumer (cluster must exist)"
+    deps: [build:app:sqs]
+    cmds:
+      - echo "Updating operator..."
+      - task: operator:update
+      - task: _init:sqs:aws:deploy
+
+  init:sqs:aws:deploy:
+    desc: "Deploy only: just redeploy the AWS SQS consumer (operator must be running)"
+    cmds:
+      - task: _init:sqs:aws:deploy
+
+  _init:sqs:aws:deploy:
+    internal: true
+    preconditions:
+      - sh: test -n "${QUEUE_NAME}"
+        msg: "QUEUE_NAME not set. Create a .env file with QUEUE_NAME, AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ACCOUNT_ID"
+      - sh: test -n "${AWS_REGION}"
+        msg: "AWS_REGION not set in .env"
+      - sh: test -n "${AWS_ACCESS_KEY_ID}"
+        msg: "AWS_ACCESS_KEY_ID not set in .env"
+      - sh: test -n "${AWS_SECRET_ACCESS_KEY}"
+        msg: "AWS_SECRET_ACCESS_KEY not set in .env"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - echo "Applying AWS SQS consumer configuration..."
+      - |
+        # Render kustomize, substitute env vars, then apply
+        kubectl kustomize {{.ROOT_DIR}}/k8s/overlays/sqs-aws | envsubst | kubectl apply -f -
+      - echo "Patching operator with AWS credentials..."
+      - |
+        # Substitute env vars in operator patch and apply
+        envsubst < {{.ROOT_DIR}}/k8s/overlays/sqs-aws/operator-patch.yaml | \
+          kubectl patch deployment mirrord-operator -n mirrord --patch-file /dev/stdin --type=strategic || true
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s || true
+      - echo "Restarting SQS consumer..."
+      - kubectl rollout restart deployment/sqs-consumer -n {{.NAMESPACE}} || true
+      - kubectl wait --for=condition=ready pod -l app=sqs-consumer -n {{.NAMESPACE}} --timeout=120s
+      - echo ""
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --timeout=120s
+      - echo "AWS SQS setup complete!"
 
   test:mysql:
     desc: "Run MySQL branching tests (modular test structure)"
@@ -470,6 +632,69 @@ tasks:
       - task: postgres:deploy:modular
       - task: postgres:verify:all
 
+  test:postgres:ssl:setup:
+    desc: Generate SSL certificates and create secret for PostgreSQL SSL tests
+    cmds:
+      - chmod +x {{.ROOT_DIR}}/k8s/postgres/ssl-tests/generate-ssl-certs.sh
+      - cd {{.ROOT_DIR}}/k8s/postgres/ssl-tests && ./generate-ssl-certs.sh
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create secret generic postgres-ssl-certs -n {{.NAMESPACE}} --from-file=server.crt={{.ROOT_DIR}}/k8s/postgres/ssl-tests/certs/server.crt --from-file=server.key={{.ROOT_DIR}}/k8s/postgres/ssl-tests/certs/server.key --dry-run=client -o yaml | kubectl apply -f -
+      - echo "SSL certificates generated and secret created"
+
+  test:postgres:ssl:deploy:
+    desc: Deploy PostgreSQL with SSL enabled
+    deps: [test:postgres:ssl:setup]
+    cmds:
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/postgres/ssl-tests/postgres-ssl-test.yaml
+      - echo "Waiting for postgres-ssl-test to be ready..."
+      - kubectl wait --for=condition=ready pod/postgres-ssl-test -n {{.NAMESPACE}} --timeout=120s
+      - echo "Waiting for pg-ssl-server-env-val to be ready..."
+      - kubectl wait --for=condition=ready pod/pg-ssl-server-env-val -n {{.NAMESPACE}} --timeout=60s
+      - echo "PostgreSQL SSL test environment deployed"
+
+  test:postgres:ssl:verify:
+    desc: Verify PostgreSQL SSL test environment
+    cmds:
+      - echo "=== Checking SSL status on postgres-ssl-test ==="
+      - kubectl exec -n {{.NAMESPACE}} postgres-ssl-test -- psql -U postgres -d source_db -c "SHOW ssl;"
+      - echo ""
+      - echo "=== Testing SSL connection ==="
+      - kubectl exec -n {{.NAMESPACE}} postgres-ssl-test -- psql "postgresql://postgres:postgres@localhost:5432/source_db?sslmode=require" -c "SELECT 'SSL connection works!' as result;"
+      - echo ""
+      - echo "=== Checking branch database status ==="
+      - kubectl get pgbranchdatabase pg-ssl-test-branch-env-val -n {{.NAMESPACE}} || echo "Branch not created yet"
+
+  test:postgres:ssl:clean:
+    desc: Delete cluster and run PostgreSQL SSL test fresh
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:postgres
+      - task: operator:install
+      - task: test:postgres:ssl:deploy
+      - task: test:postgres:ssl:verify
+      - echo ""
+      - echo "=== PostgreSQL SSL Test Environment Ready ==="
+      - echo "To test with mirrord, run your Go app with the SSL-enabled database"
+
+  test:postgres:ssl:clean-nobuild:
+    desc: Delete cluster and run PostgreSQL SSL test (skip operator build)
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:postgres
+      - task: license:create-secret
+      - task: operator:install-nobuild
+      - task: test:postgres:ssl:deploy
+      - task: test:postgres:ssl:verify
+
+  test:postgres:ssl:cleanup:
+    desc: Remove SSL test resources
+    cmds:
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/postgres/ssl-tests/postgres-ssl-test.yaml --ignore-not-found=true
+      - kubectl delete secret postgres-ssl-certs -n {{.NAMESPACE}} --ignore-not-found=true
+      - echo "SSL test resources removed"
+
   test:kafka:
     desc: Run Kafka test
     deps: [build:app:kafka, operator:install]
@@ -571,6 +796,17 @@ tasks:
     cmds:
       - kubectl logs -n mirrord deployment/mirrord-operator --tail=100 -f
 
+  # Testing utilities
+  test:tls-certs:
+    desc: Test TLS certificate configuration in operator pod
+    cmds:
+      - '{{.SCRIPTS_DIR}}/test-tls-certificates.sh'
+
+  test:tls-quick:
+    desc: Quick TLS test (just curl an HTTPS endpoint)
+    cmds:
+      - '{{.SCRIPTS_DIR}}/quick-tls-test.sh'
+
   # Copy target testing
   test:copy-target:setup:
     desc: Setup environment for copy-target testing
@@ -609,4 +845,3 @@ tasks:
       - task: build
       - task: clean:namespaces
       - task: test:sqs
-

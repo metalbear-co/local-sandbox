@@ -16,59 +16,60 @@ spec:
         app: kafka-cluster
     spec:
       containers:
-      - name: kafka
-        image: apache/kafka:3.7.0
-        ports:
-        - containerPort: 9092
-          name: kafka
-        - containerPort: 9093
-          name: controller
-        env:
-        - name: KAFKA_NODE_ID
-          value: "1"
-        - name: KAFKA_PROCESS_ROLES
-          value: "broker,controller"
-        - name: KAFKA_LISTENERS
-          value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
-        - name: KAFKA_ADVERTISED_LISTENERS
-          value: "PLAINTEXT://kafka-cluster.test-mirrord.svc.cluster.local:9092"
-        - name: KAFKA_CONTROLLER_LISTENER_NAMES
-          value: "CONTROLLER"
-        - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
-          value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
-        - name: KAFKA_CONTROLLER_QUORUM_VOTERS
-          value: "1@localhost:9093"
-        - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
-          value: "1"
-        - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
-          value: "1"
-        - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
-          value: "1"
-        - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
-          value: "0"
-        - name: KAFKA_NUM_PARTITIONS
-          value: "3"
-        - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
-          value: "true"
-        - name: KAFKA_DELETE_TOPIC_ENABLE
-          value: "true"
-        resources:
-          requests:
-            memory: "512Mi"
-            cpu: "100m"
-          limits:
-            memory: "1Gi"
-            cpu: "500m"
-        readinessProbe:
-          tcpSocket:
-            port: 9092
-          initialDelaySeconds: 15
-          periodSeconds: 5
-        livenessProbe:
-          tcpSocket:
-            port: 9092
-          initialDelaySeconds: 30
-          periodSeconds: 10
+        - name: kafka
+          image: apache/kafka:4.1.0
+          ports:
+            - containerPort: 9092
+              name: kafka
+            - containerPort: 9093
+              name: controller
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093"
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://kafka-cluster.test-mirrord.svc.cluster.local:9092"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@localhost:9093"
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_NUM_PARTITIONS
+              value: "3"
+            # TODO: If we want to enable auto-create topics, we need to add this env var
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "true"
+            - name: KAFKA_DELETE_TOPIC_ENABLE
+              value: "true"
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+          readinessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: 9092
+            initialDelaySeconds: 30
+            periodSeconds: 10
 ---
 apiVersion: v1
 kind: Service
@@ -79,11 +80,10 @@ spec:
   selector:
     app: kafka-cluster
   ports:
-  - name: kafka
-    port: 9092
-    targetPort: 9092
-  - name: controller
-    port: 9093
-    targetPort: 9093
+    - name: kafka
+      port: 9092
+      targetPort: 9092
+    - name: controller
+      port: 9093
+      targetPort: 9093
   type: ClusterIP
-
