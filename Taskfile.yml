@@ -58,9 +58,11 @@ tasks:
       - task: operator:image:load
 
   build:operator:nocache:
-    desc: Build operator without cache
+    desc: Build operator without any cache (clears sccache + Docker layers)
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" --build-arg USE_SCCACHE=false operator
+      - echo "Clearing sccache and target cache mounts..."
+      - docker builder prune --filter type=exec.cachemount --force || true
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache --progress=plain -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:gcs:
