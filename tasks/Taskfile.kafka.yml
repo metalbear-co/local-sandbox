@@ -1,16 +1,44 @@
 version: "3"
 
-# Kafka-specific test operations
-
 vars:
   ROOT_DIR:
     sh: cd .. && pwd
-  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 tasks:
-  send:message:
-    desc: "Send test message to Kafka topic (ex: task kafka:send:message MESSAGE='hello' TOPIC='my-topic' USER_ID='123')"
+  deploy:
+    desc: "Deploy Kafka test environment"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer
+
+  test:
+    desc: "Full Kafka test (deploy + send message)"
+    cmds:
+      - task: deploy
+      - task: send
+      - echo "Check logs with 'task kafka:logs'"
+
+  test:quick:
+    desc: "Quick test - send message only (no deploy)"
+    cmds:
+      - task: send
+      - echo "Check logs with 'task kafka:logs'"
+
+  run:local:
+    desc: "Run Kafka consumer locally with mirrord"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  send:
+    desc: "Send test message to Kafka (MESSAGE='hello' TOPIC='test-topic' USER_ID='123')"
     vars:
       MESSAGE: '{{.MESSAGE | default "Test message"}}'
       TOPIC: '{{.TOPIC | default "test-topic"}}'
@@ -28,62 +56,93 @@ tasks:
           echo "Message sent"
         fi
 
-  run:local:
-    desc: Run Kafka consumer locally with mirrord
-    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+  consume:
+    desc: "Consume messages from Kafka topic (TOPIC='test-topic')"
     vars:
-      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka/mirrord.json")}}'
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
     cmds:
-      - go build -o /tmp/kafka-consumer main.go
-      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --from-beginning
 
   logs:
-    desc: Show Kafka consumer logs
+    desc: "Show Kafka consumer logs"
     cmds:
       - kubectl logs -n {{.NAMESPACE}} -l app=kafka-consumer --tail=100 -f
 
   logs:kafka:
-    desc: Show Kafka server logs
+    desc: "Show Kafka server logs"
     cmds:
       - kubectl logs -n {{.NAMESPACE}} -l app=kafka-cluster --tail=100 -f
 
-  describe:
-    desc: Show Kafka consumer pod details
-    cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-consumer
-
-  describe:kafka:
-    desc: Show Kafka cluster pod details
-    cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-cluster
-
   shell:
-    desc: Get shell in Kafka consumer pod
+    desc: "Shell into Kafka consumer pod"
     cmds:
-      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-consumer -o jsonpath='{.items[0].metadata.name}') -- sh
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-consumer -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- sh
 
   shell:kafka:
-    desc: Get shell in Kafka cluster pod
+    desc: "Shell into Kafka cluster pod"
     cmds:
-      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- bash
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- bash
 
-  topics:
-    desc: List Kafka topics
+  status:
+    desc: "Show Kafka test environment status"
     cmds:
-      - kubectl exec -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+      - echo "=== Kafka Cluster ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-cluster 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Kafka Consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Topics ==="
+      - task: topics:list
+
+  topics:list:
+    desc: "List Kafka topics"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
 
   topics:create:
-    desc: "Create Kafka topic (ex: task kafka:topics:create TOPIC='my-topic' PARTITIONS='3')"
+    desc: "Create Kafka topic (TOPIC='my-topic' PARTITIONS='3')"
     vars:
       TOPIC: '{{.TOPIC | default "test-topic"}}'
       PARTITIONS: '{{.PARTITIONS | default "3"}}'
       REPLICATION: '{{.REPLICATION | default "1"}}'
     cmds:
-      - kubectl exec -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --topic {{.TOPIC}} --partitions {{.PARTITIONS}} --replication-factor {{.REPLICATION}}
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --topic {{.TOPIC}} --partitions {{.PARTITIONS}} --replication-factor {{.REPLICATION}}
 
-  consume:
-    desc: "Consume messages from Kafka topic (ex: task kafka:consume TOPIC='test-topic')"
-    vars:
-      TOPIC: '{{.TOPIC | default "test-topic"}}'
+  describe:
+    desc: "Describe Kafka consumer pod"
     cmds:
-      - kubectl exec -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}') -- /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --from-beginning
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-consumer
+
+  describe:kafka:
+    desc: "Describe Kafka cluster pod"
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-cluster
+
+  clean:
+    desc: "Clean Kafka test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/kafka --ignore-not-found=true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml --ignore-not-found=true
+
+  _wait:kafka:
+    internal: true
+    cmds:
+      - echo "Waiting for Kafka cluster..."
+      - kubectl wait --for=condition=ready pod -l app=kafka-cluster -n {{.NAMESPACE}} --timeout=300s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Kafka consumer..."
+      - kubectl wait --for=condition=ready pod -l app=kafka-consumer -n {{.NAMESPACE}} --timeout=120s

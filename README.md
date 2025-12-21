@@ -1,65 +1,211 @@
-# mirrord Operator Test Sandbox
+# mirrord Operator Local Sandbox
 
 Local testing environment for mirrord operator features.
 
 ## Prerequisites
 
-- minikube, task, kubectl, helm, docker
+- minikube
+- docker (or podman)
+- kubectl
+- helm
+- task (go-task)
 
-## Quick Start
+## Setup
+
+1. Copy and configure environment:
+
+```bash
+cp .env.example .env
+# Edit .env with your settings
+```
+
+2. Generate license and create cluster:
 
 ```bash
 task license:generate
 task cluster:create
-
-task test:mysql
-task test:mariadb
-task test:postgres
-task test:sqs
-task test:kafka
 ```
 
+## Running Tests
 
-## Clean Tests (Delete + Recreate Cluster)
+Each module follows the same pattern:
+
+| Command | Description |
+|---------|-------------|
+| `task <module>:test` | Full test (deploy + verify) |
+| `task <module>:test:quick` | Verify only (no deploy) |
+| `task <module>:deploy` | Deploy resources |
+| `task <module>:verify` | Verify results |
+| `task <module>:run:local` | Run app locally with mirrord |
+| `task <module>:logs` | View logs |
+| `task <module>:shell` | Shell into pod |
+| `task <module>:status` | Show status |
+| `task <module>:clean` | Cleanup |
+
+### Quick Examples
+
+```bash
+# MySQL branching
+task test:mysql
+task mysql:verify
+task mysql:run:local
+
+# PostgreSQL branching
+task test:postgres
+task postgres:shell:branch SCENARIO=env-val
+
+# Kafka message splitting
+task test:kafka
+task kafka:send MESSAGE="hello" USER_ID="123"
+
+# SQS (LocalStack)
+task test:sqs
+task sqs:run:local
+```
+
+### Clean Tests (Fresh Cluster)
 
 ```bash
 task test:mysql:clean
-task test:mariadb:clean
 task test:postgres:clean
-task test:sqs:clean
 task test:kafka:clean
+task test:sqs:clean
+```
+
+### Skip Operator Build
+
+For faster iteration when operator is unchanged:
+
+```bash
+task test:mysql:clean:nobuild
+task test:postgres:clean:nobuild
 ```
 
 ## Development
 
 ```bash
-task build:operator
+# Rebuild and update operator
 task operator:update
 
+# View operator logs
 task logs:operator
 
+# Delete cluster
 task cluster:delete
+
+# List all tasks
 task --list
-```
 
-## Discover All Available Commands
-
-List all available tasks:
-
-```bash
-task --list
-```
-
-List all tasks including internal ones:
-
-```bash
-task --list-all
-```
-
-Search for specific tasks:
-
-```bash
+# List module-specific tasks
 task --list | grep mysql
 task --list | grep postgres
-task --list | grep kafka
+```
+
+## Directory Structure
+
+The tasks expect this standard layout (no configuration needed):
+
+```
+your-workspace/
+├── charts/mirrord-operator/
+├── local-sandbox/          ← run tasks from here
+├── mirrord/
+└── operator/
+```
+
+If your layout differs, override paths in `.env`:
+
+```bash
+OPERATOR_DIR=/path/to/operator
+CHARTS_DIR=/path/to/charts/mirrord-operator
+MIRRORD_DIR=/path/to/mirrord
+```
+
+## PostgreSQL Testing
+
+```bash
+# Full test (deploy + verify)
+task test:postgres
+
+# Deploy only
+task postgres:deploy
+
+# Verify branch data
+task postgres:verify
+
+# Query databases
+task postgres:query:source QUERY="SELECT * FROM users"
+task postgres:query:branch SCENARIO=env-val QUERY="SELECT * FROM users"
+
+# Interactive shells
+task postgres:shell              # Source DB
+task postgres:shell:branch SCENARIO=env-val
+
+# View logs
+task postgres:logs               # App logs
+task postgres:logs:source        # Source DB logs
+
+# Local branch (Docker)
+task postgres:branch:local              # Schema only
+task postgres:branch:local:full         # Full data copy
+task postgres:branch:local:shell        # Connect to local branch
+task postgres:branch:local:stop         # Stop container
+
+# Run app locally with mirrord
+task postgres:run:local
+
+# Status and cleanup
+task postgres:status
+task postgres:branches
+task postgres:clean
+```
+
+## Redis Testing
+
+```bash
+# Full test (deploy + seed + run)
+task test:redis
+
+# Deploy Redis to cluster
+task redis:deploy
+
+# Build the test app
+task redis:build
+
+# Seed test data
+task redis:seed
+
+# Run app locally
+task redis:run:local     # Uses local Redis (outgoing filter)
+task redis:run:cluster   # Connects to cluster Redis
+
+# View logs
+task redis:logs          # App logs
+task redis:logs:redis    # Redis server logs
+
+# Interactive access
+task redis:shell         # Shell into app pod
+task redis:shell:redis   # Redis CLI
+
+# Status and cleanup
+task redis:status
+task redis:clean
+```
+
+## Other Modules
+
+### MySQL
+
+```bash
+task mysql:branches
+task mysql:query:source
+task mysql:query:branch SCENARIO=env-val
+```
+
+### SQS/Kafka
+
+```bash
+task sqs:send MESSAGE="test" TENANT="Avi.Test"
+task kafka:send MESSAGE="hello" USER_ID="123"
+task kafka:topics:list
 ```

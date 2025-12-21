@@ -1,28 +1,47 @@
 version: '3'
 
-# SQS/LocalStack-specific test operations
-# Note: dotenv is loaded from main Taskfile.yml
-
 vars:
   ROOT_DIR:
     sh: cd .. && pwd
-  MIRRORD_BIN: '{{.MIRRORD_BIN}}'
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 tasks:
-  # LocalStack SQS Tasks
-  send:message:
-    desc: "Send test message to LocalStack SQS (ex: task sqs:send:message MESSAGE='test' TENANT='Avi.Test')"
-    vars:
-      TENANT: '{{.TENANT | default "Avi.Test"}}'
-      MESSAGE: '{{.MESSAGE | default "Test message"}}'
-      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
-      REGION: '{{.REGION | default "eu-north-1"}}'
+  deploy:
+    desc: "Deploy SQS LocalStack test environment"
     cmds:
-      - kubectl exec -n localstack $(kubectl get pod -n localstack -l app.kubernetes.io/name=localstack -o jsonpath='{.items[0].metadata.name}') -- awslocal sqs send-message --queue-url {{.QUEUE_URL}} --region {{.REGION}} --message-body '{{.MESSAGE}}' --message-attributes 'tenant={StringValue={{.TENANT}},DataType=String}'
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack
+      - task: _wait:localstack
+      - task: _wait:consumer
+
+  deploy:aws:
+    desc: "Deploy SQS AWS test environment"
+    preconditions:
+      - sh: test -n "${QUEUE_NAME}"
+        msg: "QUEUE_NAME not set in .env"
+      - sh: test -n "${AWS_REGION}"
+        msg: "AWS_REGION not set in .env"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl kustomize {{.ROOT_DIR}}/k8s/overlays/sqs-aws | envsubst | kubectl apply -f -
+      - task: _patch:operator:aws
+      - task: _wait:consumer
+
+  test:
+    desc: "Full SQS LocalStack test (deploy + send message)"
+    cmds:
+      - task: deploy
+      - task: send
+      - echo "Check logs with 'task sqs:logs'"
+
+  test:quick:
+    desc: "Quick test - send message only (no deploy)"
+    cmds:
+      - task: send
+      - echo "Check logs with 'task sqs:logs'"
 
   run:local:
-    desc: Run SQS consumer locally with mirrord (LocalStack)
+    desc: "Run SQS consumer locally with mirrord (LocalStack)"
     dir: '{{.ROOT_DIR}}/apps/sqs-consumer'
     vars:
       MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
@@ -30,96 +49,111 @@ tasks:
       - go build -o /tmp/sqs-consumer main.go
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer'
 
-  logs:
-    desc: Show SQS consumer logs
-    cmds:
-      - kubectl logs -n {{.NAMESPACE}} -l app=sqs-consumer --tail=100 -f
-
-  logs:localstack:
-    desc: Show LocalStack logs
-    cmds:
-      - kubectl logs -n localstack -l app.kubernetes.io/name=localstack --tail=100 -f
-
-  describe:
-    desc: Show SQS consumer pod details
-    cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=sqs-consumer
-
-  shell:
-    desc: Get shell in SQS consumer pod
-    cmds:
-      - kubectl exec -it -n {{.NAMESPACE}} $(kubectl get pod -n {{.NAMESPACE}} -l app=sqs-consumer -o jsonpath='{.items[0].metadata.name}') -- sh
-
-  registry:
-    desc: Show queue registry
-    cmds:
-      - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} -o yaml
-
-  # AWS SQS Tasks
-  aws:start:
-    desc: "Start local app with mirrord connected to AWS SQS (run this FIRST, then send messages)"
+  run:local:aws:
+    desc: "Run SQS consumer locally with mirrord (AWS)"
     dir: '{{.ROOT_DIR}}/apps/sqs-consumer'
     vars:
       MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-aws/mirrord.json")}}'
     cmds:
       - echo "Building SQS consumer..."
       - go build -o /tmp/sqs-consumer main.go
-      - echo ""
       - echo "Starting mirrord with AWS SQS config..."
-      - echo "Messages matching filter 'test=.*' will be received here."
-      - echo "Press Ctrl+C to stop."
-      - echo ""
+      - echo "Messages matching filter will be received here."
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer'
 
-  aws:send:
-    desc: "Send test message to AWS SQS WITH 'test' attribute (will go to LOCAL app)"
+  send:
+    desc: "Send test message to LocalStack SQS"
+    vars:
+      TENANT: '{{.TENANT | default "Avi.Test"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n localstack -l app.kubernetes.io/name=localstack -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n localstack $POD -- awslocal sqs send-message \
+          --queue-url {{.QUEUE_URL}} \
+          --region {{.REGION}} \
+          --message-body '{{.MESSAGE}}' \
+          --message-attributes 'tenant={StringValue={{.TENANT}},DataType=String}'
+
+  send:aws:
+    desc: "Send test message to AWS SQS WITH 'test' attribute (goes to LOCAL app)"
     vars:
       MESSAGE: '{{.MESSAGE | default "Test message for LOCAL app"}}'
       TEST_VALUE: '{{.TEST_VALUE | default "mirrord"}}'
     cmds:
       - |
-        echo "Sending message to AWS SQS with 'test={{.TEST_VALUE}}' attribute..."
-        echo "This message WILL match the filter and go to your LOCAL app."
+        echo "Sending message with 'test={{.TEST_VALUE}}' attribute..."
         aws sqs send-message \
           --queue-url https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${QUEUE_NAME} \
           --region ${AWS_REGION} \
           --message-body '{{.MESSAGE}}' \
           --message-attributes 'test={StringValue={{.TEST_VALUE}},DataType=String}' \
           --output json
-        echo ""
-        echo "Message sent! Check your local terminal running 'task sqs:aws:start'"
+        echo "Message sent! Check local terminal running 'task sqs:run:local:aws'"
 
-  aws:send:nomatch:
-    desc: "Send test message to AWS SQS WITHOUT 'test' attribute (will go to CLUSTER consumer)"
+  send:aws:nomatch:
+    desc: "Send test message to AWS SQS WITHOUT 'test' attribute (goes to CLUSTER)"
     vars:
       MESSAGE: '{{.MESSAGE | default "Test message for CLUSTER consumer"}}'
     cmds:
       - |
-        echo "Sending message to AWS SQS WITHOUT 'test' attribute..."
-        echo "This message will NOT match the filter and go to the CLUSTER consumer."
+        echo "Sending message WITHOUT 'test' attribute..."
         aws sqs send-message \
           --queue-url https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${QUEUE_NAME} \
           --region ${AWS_REGION} \
           --message-body '{{.MESSAGE}}' \
           --output json
-        echo ""
         echo "Message sent! Check cluster logs with 'task sqs:logs'"
 
-  aws:send:both:
-    desc: "Send two test messages - one for LOCAL, one for CLUSTER"
+  send:aws:both:
+    desc: "Send two messages - one for LOCAL, one for CLUSTER"
     cmds:
-      - task: aws:send
-        vars:
-          MESSAGE: "Message 1 - for LOCAL app (has test attribute)"
+      - task: send:aws
+        vars: {MESSAGE: "Message 1 - for LOCAL app (has test attribute)"}
       - echo ""
-      - echo "---"
-      - echo ""
-      - task: aws:send:nomatch
-        vars:
-          MESSAGE: "Message 2 - for CLUSTER (no test attribute)"
+      - task: send:aws:nomatch
+        vars: {MESSAGE: "Message 2 - for CLUSTER (no test attribute)"}
 
-  aws:status:
-    desc: "Show AWS SQS test status (pods, registry, queue attributes)"
+  logs:
+    desc: "Show SQS consumer logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=sqs-consumer --tail=100 -f
+
+  logs:localstack:
+    desc: "Show LocalStack logs"
+    cmds:
+      - kubectl logs -n localstack -l app.kubernetes.io/name=localstack --tail=100 -f
+
+  shell:
+    desc: "Shell into SQS consumer pod"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=sqs-consumer -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n {{.NAMESPACE}} $POD -- sh
+
+  shell:localstack:
+    desc: "Shell into LocalStack pod"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n localstack -l app.kubernetes.io/name=localstack -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n localstack $POD -- bash
+
+  status:
+    desc: "Show SQS test environment status"
+    cmds:
+      - echo "=== SQS Consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=sqs-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== LocalStack ==="
+      - kubectl get pods -n localstack -l app.kubernetes.io/name=localstack 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Queue Registry ==="
+      - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} 2>/dev/null || echo "No registry"
+
+  status:aws:
+    desc: "Show AWS SQS test status"
     cmds:
       - echo "=== Pods in {{.NAMESPACE}} ==="
       - kubectl get pods -n {{.NAMESPACE}}
@@ -128,7 +162,48 @@ tasks:
       - kubectl get pods -n mirrord
       - echo ""
       - echo "=== Queue Registry ==="
-      - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} -o yaml 2>/dev/null || echo "No registry found"
+      - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} -o yaml 2>/dev/null || echo "No registry"
       - echo ""
-      - echo "=== AWS SQS Queue Attributes ==="
-      - aws sqs get-queue-attributes --queue-url https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${QUEUE_NAME} --region ${AWS_REGION} --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible 2>/dev/null || echo "Could not fetch queue attributes"
+      - echo "=== AWS SQS Queue ==="
+      - aws sqs get-queue-attributes --queue-url https://sqs.${AWS_REGION}.amazonaws.com/${AWS_ACCOUNT_ID}/${QUEUE_NAME} --region ${AWS_REGION} --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible 2>/dev/null || echo "Could not fetch"
+
+  registry:
+    desc: "Show queue registry details"
+    cmds:
+      - kubectl get mirrordworkloadqueueregistries -n {{.NAMESPACE}} -o yaml
+
+  describe:
+    desc: "Describe SQS consumer pod"
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=sqs-consumer
+
+  clean:
+    desc: "Clean SQS LocalStack test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack --ignore-not-found=true
+      - kubectl delete namespace localstack --ignore-not-found=true
+
+  clean:aws:
+    desc: "Clean SQS AWS test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/sqs-aws --ignore-not-found=true
+
+  _wait:localstack:
+    internal: true
+    cmds:
+      - echo "Waiting for LocalStack..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=localstack -n localstack --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for SQS consumer..."
+      - kubectl wait --for=condition=ready pod -l app=sqs-consumer -n {{.NAMESPACE}} --timeout=120s
+
+  _patch:operator:aws:
+    internal: true
+    cmds:
+      - |
+        envsubst < {{.ROOT_DIR}}/k8s/overlays/sqs-aws/operator-patch.yaml | \
+          kubectl patch deployment mirrord-operator -n mirrord --patch-file /dev/stdin --type=strategic || true
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s || true
