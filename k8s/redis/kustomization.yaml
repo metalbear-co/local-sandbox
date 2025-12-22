@@ -1,0 +1,10 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: redis-test
+
+resources:
+  - namespace.yaml
+  - redis-deployment.yaml
+  - app-deployment.yaml
+

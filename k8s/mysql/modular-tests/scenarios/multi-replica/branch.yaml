@@ -1,0 +1,78 @@
+# Test scenario: Database branching targeting deployment with multiple replicas
+# The operator will select one replica from the deployment to extract
+# the connection source, rather than targeting a specific pod.
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MysqlBranchDatabase
+metadata:
+  name: mysql-test-branch-multi-replica
+spec:
+  id: mysql-test-multi-replica-branch
+  target:
+    # Target the deployment instead of a specific pod
+    # The operator will pick one replica to extract connection info from
+    deployment: server-multi-replica
+  connectionSource:
+    url:
+      env:
+        variable: MYSQL_CONNECTION_URL
+        container: echo
+  databaseName: user
+  mysqlVersion: "8.0"
+  ttlSecs: 600
+  copy:
+    mode: all
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

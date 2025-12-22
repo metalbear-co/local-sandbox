@@ -1,0 +1,103 @@
+# Test scenario: Deployment with multiple replicas
+# This tests targeting a deployment instead of a specific pod,
+# allowing the operator to pick one replica for the branch.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: server-multi-replica
+  labels:
+    app: server-multi-replica
+    test-scenario: multi-replica
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: server-multi-replica
+  template:
+    metadata:
+      labels:
+        app: server-multi-replica
+        test-scenario: multi-replica
+    spec:
+      containers:
+        - name: echo
+          image: ealen/echo-server:latest
+          env:
+            - name: MYSQL_CONNECTION_URL
+              value: mysql://root:examplepassword@mysql-test/user
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-multi-replica
+spec:
+  selector:
+    app: server-multi-replica
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

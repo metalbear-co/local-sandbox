@@ -1,0 +1,133 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "redis-test"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: "{{.ROOT_DIR}}/apps/redis-app"
+
+tasks:
+  deploy:
+    desc: "Deploy Redis test environment to cluster"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/redis
+      - task: _wait:redis
+      - task: _wait:app
+
+  test:
+    desc: "Full Redis test (deploy + seed + run local)"
+    cmds:
+      - task: deploy
+      - task: build
+      - sleep 5
+      - task: seed
+      - echo "Starting app with local Redis..."
+      - task: run:local
+
+  test:quick:
+    desc: "Quick test - seed and run (no deploy)"
+    cmds:
+      - task: seed
+      - task: run:local
+
+  build:
+    desc: "Build Redis test app"
+    cmds:
+      - cd {{.APP_DIR}} && go mod tidy && go build -o redis-app .
+
+  build:docker:
+    desc: "Build Redis test app Docker image for minikube"
+    cmds:
+      - cd {{.APP_DIR}} && eval $(minikube docker-env) && docker build -t redis-app:latest .
+
+  run:local:
+    desc: "Run app locally with local Redis (uses outgoing.filter.local config)"
+    cmds:
+      - |
+        cd {{.APP_DIR}} && {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-app \
+          -n {{.NAMESPACE}} \
+          -f mirrord-local.json \
+          -- ./redis-app
+
+  run:cluster:
+    desc: "Run app locally connecting to cluster Redis"
+    cmds:
+      - |
+        cd {{.APP_DIR}} && {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-app \
+          -n {{.NAMESPACE}} \
+          -- ./redis-app
+
+  seed:
+    desc: "Seed test data into cluster Redis"
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} exec -t deploy/redis-main -n {{.NAMESPACE}} -- redis-cli SET greeting "Hello from cluster!"
+      - |
+        {{.MIRRORD_BIN}} exec -t deploy/redis-main -n {{.NAMESPACE}} -- redis-cli SET counter "42"
+      - |
+        {{.MIRRORD_BIN}} exec -t deploy/redis-main -n {{.NAMESPACE}} -- redis-cli SET app_version "1.0.0"
+      - |
+        {{.MIRRORD_BIN}} exec -t deploy/redis-main -n {{.NAMESPACE}} -- redis-cli SET source "local"
+
+  logs:
+    desc: "Show Redis app logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=redis-app --tail=100 -f
+
+  logs:redis:
+    desc: "Show Redis server logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=redis-main --tail=100 -f
+
+  shell:
+    desc: "Shell into Redis app pod"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=redis-app -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- sh
+
+  shell:redis:
+    desc: "Redis CLI to cluster Redis"
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} exec -t deploy/redis-main -n {{.NAMESPACE}} -- redis-cli
+
+  status:
+    desc: "Show Redis test environment status"
+    cmds:
+      - echo "=== Redis Server ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=redis-main 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Redis App ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=redis-app 2>/dev/null || echo "Not deployed"
+
+  describe:
+    desc: "Describe Redis app pod"
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=redis-app
+
+  describe:redis:
+    desc: "Describe Redis server pod"
+    cmds:
+      - kubectl describe pod -n {{.NAMESPACE}} -l app=redis-main
+
+  clean:
+    desc: "Clean Redis test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/redis --ignore-not-found=true
+      - docker rm -f mirrord-redis-6379 2>/dev/null || true
+
+  _wait:redis:
+    internal: true
+    cmds:
+      - echo "Waiting for Redis..."
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.NAMESPACE}} --timeout=120s || true
+
+  _wait:app:
+    internal: true
+    cmds:
+      - echo "Waiting for Redis app..."
+      - kubectl wait --for=condition=ready pod -l app=redis-app -n {{.NAMESPACE}} --timeout=120s || true

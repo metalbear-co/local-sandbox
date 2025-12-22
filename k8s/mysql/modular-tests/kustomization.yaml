@@ -9,4 +9,5 @@ resources:
   - scenarios/env-val
   - scenarios/secret-ref
   - scenarios/echo
+  - scenarios/multi-replica
 

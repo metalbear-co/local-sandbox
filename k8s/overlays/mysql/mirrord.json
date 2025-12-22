@@ -1,28 +1,33 @@
 {
     "operator": true,
     "target": {
-        "path": "deployment/mysql-app",
+        "path": "pod/server-env-val",
         "namespace": "test-mirrord"
     },
     "feature": {
-        "env": true,
-        "fs": "local",
-        "network": {
-            "incoming": "off",
-            "outgoing": true
-        },
         "db_branches": [
             {
                 "id": "mysql-dev-branch",
                 "type": "mysql",
                 "version": "8.0",
-                "name": "mydatabase",
+                "name": "user",
                 "ttl_secs": 600,
                 "creation_timeout_secs": 60,
                 "connection": {
                     "url": {
                         "type": "env",
-                        "variable": "DB_CONNECTION_URL"
+                        "variable": "MYSQL_CONNECTION_URL"
+                    }
+                },
+                "copy": {
+                    "mode": "schema",
+                    "tables": {
+                        "users": {
+                            "filter": "name = 'Alice'"
+                        },
+                        "orders": {
+                            "filter": "user = 'Alice'"
+                        }
                     }
                 }
             }
