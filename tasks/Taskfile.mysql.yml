@@ -199,6 +199,47 @@ tasks:
           exit 1
         fi
 
+  query:mirrord:
+    desc: "Query the latest mirrord-created branch"
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          echo ""
+          echo "Branch Pod: $POD"
+          echo ""
+          echo "=== ORDERS ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT * FROM orders" 2>/dev/null
+          echo ""
+          echo "=== USERS ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT * FROM users" 2>/dev/null
+          echo ""
+        else
+          echo "No branch found. Run 'task mysql:run:local' first."
+          exit 1
+        fi
+
+  test:local:
+    desc: "Run app locally with mirrord, then query the branch"
+    cmds:
+      - task: run:local
+      - task: query:mirrord
+
+  setup:local:
+    desc: "Clean and setup minimal environment for local testing"
+    cmds:
+      - echo "Cleaning up..."
+      - kubectl delete mysqlbranchdatabase --all -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete pod -l db-owner-name -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete -k {{.MODULAR_TESTS_DIR}}/scenarios/secret-ref --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.MODULAR_TESTS_DIR}}/scenarios/echo --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.MODULAR_TESTS_DIR}}/scenarios/multi-replica --ignore-not-found=true 2>/dev/null || true
+      - echo ""
+      - echo "Deploying source database + env-val scenario..."
+      - task: deploy:base
+      - task: deploy:scenario
+        vars: {SCENARIO: env-val}
+
   logs:
     desc: "Show MySQL app logs"
     cmds:
