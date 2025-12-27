@@ -1,0 +1,24 @@
+# GCP Cloud SQL Configuration
+# Copy this to local-sandbox/tasks/.env and fill in your values
+
+# Cloud SQL instance private IP or public IP
+# For Cloud SQL Auth Proxy, use 127.0.0.1
+CLOUDSQL_HOST=10.x.x.x
+
+# PostgreSQL port (usually 5432)
+CLOUDSQL_PORT=5432
+
+# Database name
+CLOUDSQL_DATABASE=your_database
+
+# IAM database user
+# Format for service account: service-account@project.iam
+# Format for user account: user@example.com
+CLOUDSQL_USER=your-sa@your-project.iam
+
+# GCP project ID
+GCP_PROJECT=your-project-id
+
+# Path to service account key JSON file
+# GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+

@@ -358,6 +358,148 @@ tasks:
     cmds:
       - PGPASSWORD=postgres psql -h 127.0.0.1 -p {{.LOCAL_PORT}} -U postgres -d {{.BRANCH_DB}}
 
+  deploy:aws:
+    desc: "Deploy PostgreSQL app connected to AWS RDS"
+    preconditions:
+      - sh: test -n "${RDS_HOST}"
+        msg: "RDS_HOST not set in .env"
+      - sh: test -n "${RDS_DATABASE}"
+        msg: "RDS_DATABASE not set in .env"
+      - sh: test -n "${RDS_USER}"
+        msg: "RDS_USER not set in .env"
+      - sh: test -n "${AWS_REGION}"
+        msg: "AWS_REGION not set in .env"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl kustomize {{.ROOT_DIR}}/k8s/overlays/postgres-aws | envsubst | kubectl apply -f -
+      - task: _patch:operator:aws
+      - task: _wait:app:aws
+
+  run:local:aws:
+    desc: "Run PostgreSQL app locally with mirrord (AWS RDS + IAM auth)"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres-aws/mirrord.json")}}'
+    preconditions:
+      - sh: test -f {{.MIRRORD_CONFIG}}
+        msg: "Config file not found at {{.MIRRORD_CONFIG}}"
+    cmds:
+      - echo "Building PostgreSQL app..."
+      - go build -o /tmp/postgres-app main.go
+      - echo "Running with mirrord (AWS RDS + IAM auth)"
+      - echo "Config -> {{.MIRRORD_CONFIG}}"
+      - echo ""
+      - echo "The init container will generate an IAM token to connect to RDS."
+      - echo "Your local app will connect to an ephemeral branch database."
+      - echo ""
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/postgres-app'
+
+  test:aws:
+    desc: "Full AWS RDS test (deploy + run local)"
+    cmds:
+      - task: deploy:aws
+      - echo ""
+      - echo "AWS RDS app deployed. Now run 'task postgres:run:local:aws' to test IAM auth branching."
+
+  verify:aws:rds:
+    desc: "Verify connection to AWS RDS (requires psql and AWS credentials)"
+    preconditions:
+      - sh: test -n "${RDS_HOST}"
+        msg: "RDS_HOST not set"
+    cmds:
+      - |
+        echo "=== Testing AWS RDS Connection ==="
+        echo "Host: ${RDS_HOST}"
+        echo "Database: ${RDS_DATABASE}"
+        echo "User: ${RDS_USER}"
+        echo ""
+        echo "Generating IAM token..."
+        TOKEN=$(aws rds generate-db-auth-token \
+          --hostname ${RDS_HOST} \
+          --port ${RDS_PORT:-5432} \
+          --username ${RDS_USER} \
+          --region ${AWS_REGION})
+        echo "Token generated (first 50 chars): ${TOKEN:0:50}..."
+        echo ""
+        echo "Connecting to RDS..."
+        PGPASSWORD="$TOKEN" psql \
+          "host=${RDS_HOST} port=${RDS_PORT:-5432} dbname=${RDS_DATABASE} user=${RDS_USER} sslmode=require" \
+          -c "SELECT version();"
+
+  status:aws:
+    desc: "Show AWS RDS test environment status"
+    cmds:
+      - echo "=== Pods in {{.NAMESPACE}} ==="
+      - kubectl get pods -n {{.NAMESPACE}}
+      - echo ""
+      - echo "=== Operator pods ==="
+      - kubectl get pods -n mirrord
+      - echo ""
+      - echo "=== Branch Databases ==="
+      - kubectl get pgbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,IAM_AUTH:.spec.iamAuth 2>/dev/null || echo "No branches"
+      - echo ""
+      - echo "=== RDS Connection Info ==="
+      - echo "Host -> ${RDS_HOST:-<not set>}"
+      - echo "Database ->${RDS_DATABASE:-<not set>}"
+      - echo "User -> ${RDS_USER:-<not set>}"
+      - echo "Region -> ${AWS_REGION:-<not set>}"
+
+  logs:aws:target:
+    desc: "Show AWS RDS target pod logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} pg-rds-target --tail=100 -f
+
+  logs:aws:branch:
+    desc: "Show AWS RDS branch pod logs (init container + postgres)"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found. Checking all pods with db-owner-name label..."
+          kubectl get pods -n {{.NAMESPACE}} -l db-owner-name
+          exit 1
+        fi
+        echo "Branch pod: $POD"
+        echo ""
+        echo "=== Init Container Logs (pg-branch-init) ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c pg-branch-init 2>/dev/null || echo "Init container logs not available"
+        echo ""
+        echo "=== Postgres Container Logs ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c postgres --tail=50
+
+  clean:aws:
+    desc: "Clean AWS RDS test resources"
+    cmds:
+      - kubectl delete pod pg-rds-target -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete service pg-rds-service -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete pgbranchdatabase --all -n {{.NAMESPACE}} --ignore-not-found=true
+
+  shell:aws:branch:
+    desc: "Shell into AWS RDS branch database"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found"
+          exit 1
+        fi
+        echo "Connecting to branch database in pod: $POD"
+        kubectl exec -it -n {{.NAMESPACE}} $POD -- psql -U postgres
+
+  _patch:operator:aws:
+    internal: true
+    cmds:
+      - |
+        envsubst < {{.ROOT_DIR}}/k8s/overlays/postgres-aws/operator-patch.yaml | \
+          kubectl patch deployment mirrord-operator -n mirrord --patch-file /dev/stdin --type=strategic || true
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s || true
+
+  _wait:app:aws:
+    internal: true
+    cmds:
+      - echo "Waiting for RDS target pod..."
+      - kubectl wait --for=condition=ready pod/pg-rds-target -n {{.NAMESPACE}} --timeout=120s
+
   _wait:source:
     internal: true
     cmds:
@@ -383,3 +525,120 @@ tasks:
     cmds:
       - echo "Waiting for app..."
       - kubectl wait --for=condition=ready pod -l app=postgres-app -n {{.NAMESPACE}} --timeout=120s || true
+
+  # ============================================================================
+  # GCP Cloud SQL IAM Authentication Tasks
+  # ============================================================================
+
+  deploy:gcp:
+    desc: "Deploy GCP Cloud SQL target app for IAM auth testing"
+    preconditions:
+      - sh: test -n "${CLOUDSQL_HOST}"
+        msg: "CLOUDSQL_HOST not set. Create .env file from k8s/overlays/postgres-gcp/env-template.txt"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl kustomize {{.ROOT_DIR}}/k8s/overlays/postgres-gcp | envsubst | kubectl apply -f -
+      - task: _patch:operator:gcp
+      - task: _wait:app:gcp
+
+  run:local:gcp:
+    desc: "Run local app with mirrord, creating a database branch from GCP Cloud SQL"
+    preconditions:
+      - sh: test -n "${CLOUDSQL_HOST}"
+        msg: "CLOUDSQL_HOST not set"
+    cmds:
+      - |
+        echo "=== Starting mirrord with GCP Cloud SQL IAM auth ==="
+        echo "Cloud SQL Host: ${CLOUDSQL_HOST}"
+        echo "Database: ${CLOUDSQL_DATABASE}"
+        echo "User: ${CLOUDSQL_USER}"
+        echo "Project: ${GCP_PROJECT}"
+        echo ""
+        echo "This will:"
+        echo "1. Create a branch database pod"
+        echo "2. Generate GCP IAM token to connect to Cloud SQL"
+        echo "3. Copy schema from Cloud SQL to the branch"
+        echo "4. Your local app connects to the branch"
+        echo ""
+        mirrord exec -f {{.ROOT_DIR}}/k8s/overlays/postgres-gcp/mirrord.json -- echo "Database branch ready!"
+
+  test:gcp:
+    desc: "Full GCP Cloud SQL IAM auth test: deploy, run with mirrord, and verify"
+    cmds:
+      - task: deploy:gcp
+      - echo ""
+      - echo "GCP Cloud SQL app deployed. Now run 'task postgres:run:local:gcp' to test IAM auth branching."
+
+  status:gcp:
+    desc: "Show GCP Cloud SQL test environment status"
+    cmds:
+      - echo "=== Pods in {{.NAMESPACE}} ==="
+      - kubectl get pods -n {{.NAMESPACE}}
+      - echo ""
+      - echo "=== Operator pods ==="
+      - kubectl get pods -n mirrord
+      - echo ""
+      - echo "=== Branch Databases ==="
+      - kubectl get pgbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,IAM_AUTH:.spec.iamAuth 2>/dev/null || echo "No branches"
+      - echo ""
+      - echo "=== Cloud SQL Connection Info ==="
+      - echo "Host -> ${CLOUDSQL_HOST:-<not set>}"
+      - echo "Database -> ${CLOUDSQL_DATABASE:-<not set>}"
+      - echo "User -> ${CLOUDSQL_USER:-<not set>}"
+      - echo "Project -> ${GCP_PROJECT:-<not set>}"
+
+  logs:gcp:target:
+    desc: "Show GCP Cloud SQL target pod logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} pg-cloudsql-target --tail=100 -f
+
+  logs:gcp:branch:
+    desc: "Show GCP Cloud SQL branch pod logs (init container + postgres)"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found. Checking all pods with db-owner-name label..."
+          kubectl get pods -n {{.NAMESPACE}} -l db-owner-name
+          exit 1
+        fi
+        echo "Branch pod: $POD"
+        echo ""
+        echo "=== Init Container Logs (pg-branch-init) ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c pg-branch-init 2>/dev/null || echo "Init container logs not available"
+        echo ""
+        echo "=== Postgres Container Logs ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c postgres --tail=50
+
+  clean:gcp:
+    desc: "Clean GCP Cloud SQL test resources"
+    cmds:
+      - kubectl delete pod pg-cloudsql-target -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete service pg-cloudsql-service -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete pgbranchdatabase --all -n {{.NAMESPACE}} --ignore-not-found=true
+
+  shell:gcp:branch:
+    desc: "Shell into GCP Cloud SQL branch database"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found"
+          exit 1
+        fi
+        echo "Connecting to branch database in pod: $POD"
+        kubectl exec -it -n {{.NAMESPACE}} $POD -- psql -U postgres
+
+  _patch:operator:gcp:
+    internal: true
+    cmds:
+      - |
+        envsubst < {{.ROOT_DIR}}/k8s/overlays/postgres-gcp/operator-patch.yaml | \
+          kubectl patch deployment mirrord-operator -n mirrord --patch-file /dev/stdin --type=strategic || true
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s || true
+
+  _wait:app:gcp:
+    internal: true
+    cmds:
+      - echo "Waiting for Cloud SQL target pod..."
+      - kubectl wait --for=condition=ready pod/pg-cloudsql-target -n {{.NAMESPACE}} --timeout=120s

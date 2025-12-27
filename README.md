@@ -19,7 +19,7 @@ cp .env.example .env
 # Edit .env with your settings
 ```
 
-2. Generate license and create cluster:
+1. Generate license and create cluster:
 
 ```bash
 task license:generate
@@ -208,4 +208,34 @@ task mysql:query:branch SCENARIO=env-val
 task sqs:send MESSAGE="test" TENANT="Avi.Test"
 task kafka:send MESSAGE="hello" USER_ID="123"
 task kafka:topics:list
+```
+
+### AWS RDS
+
+```bash
+task postgres:deploy:aws      # Deploy target app
+task postgres:run:local:aws   # Run with mirrord
+task postgres:status:aws      # Check status
+task postgres:logs:aws:branch # View branch logs
+task postgres:clean:aws       # Clean up
+```
+
+```bash
+task postgres:deploy:aws
+task postgres:run:local:aws
+```
+
+### GCP Cloud SQL
+
+```bash
+task postgres:deploy:gcp      # Deploy target app
+task postgres:run:local:gcp   # Run with mirrord
+task postgres:status:gcp      # Check status
+task postgres:logs:gcp:branch # View branch logs
+task postgres:clean:gcp       # Clean up
+```
+
+```bash
+task postgres:deploy:gcp
+task postgres:run:local:gcp
 ```

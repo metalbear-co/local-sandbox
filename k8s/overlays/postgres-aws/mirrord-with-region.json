@@ -1,0 +1,38 @@
+{
+  "operator": true,
+  "target": {
+    "path": "pod/pg-rds-target",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "rds-branch",
+        "type": "pg",
+        "version": "16",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "iam_auth": {
+          "type": "aws_rds",
+          "region": { "type": "env", "variable": "AWS_REGION" }
+        },
+        "copy": {
+          "mode": "schema"
+        }
+      }
+    ]
+  },
+  "_comment": "This config explicitly specifies which env var to read the region from."
+}
