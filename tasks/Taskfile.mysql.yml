@@ -177,7 +177,7 @@ tasks:
       - go build -o /tmp/mysql-app main.go
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/mysql-app'
 
-  query:source:
+  query:source:query:
     desc: "Query source database (QUERY='SELECT * FROM users')"
     vars:
       QUERY: '{{.QUERY | default "SELECT * FROM users"}}'
@@ -199,6 +199,21 @@ tasks:
           exit 1
         fi
 
+  query:source:
+    desc: "Query the latest mirrord-created branch"
+    cmds:
+      - |
+        echo ""
+        echo "=== TABLES ==="
+        kubectl exec -n {{.NAMESPACE}} mysql-test -- mysql -uroot -p{{.SOURCE_DB_PASSWORD}} user -e "SHOW TABLES" 2>/dev/null
+        echo ""
+        echo "=== ORDERS ==="
+        kubectl exec -n {{.NAMESPACE}} mysql-test  -- mysql -uroot -p{{.SOURCE_DB_PASSWORD}} user -e "SELECT * FROM orders" 2>/dev/null
+        echo ""
+        echo "=== USERS ==="
+        kubectl exec -n {{.NAMESPACE}} mysql-test  -- mysql -uroot -p{{.SOURCE_DB_PASSWORD}} user -e "SELECT * FROM users" 2>/dev/null
+        echo ""
+
   query:mirrord:
     desc: "Query the latest mirrord-created branch"
     cmds:
@@ -207,6 +222,9 @@ tasks:
         if [ -n "$POD" ]; then
           echo ""
           echo "Branch Pod: $POD"
+          echo ""
+          echo "=== TABLES ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SHOW TABLES" 2>/dev/null
           echo ""
           echo "=== ORDERS ==="
           kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_ROOT_PASSWORD}} user -e "SELECT * FROM orders" 2>/dev/null

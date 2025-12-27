@@ -1,0 +1,26 @@
+# AWS RDS PostgreSQL Configuration
+# Copy this file to local-sandbox/tasks/.env and fill in your values
+
+# RDS endpoint (without port)
+RDS_HOST=your-db-instance.xxxxx.us-east-1.rds.amazonaws.com
+
+# RDS port (default: 5432)
+RDS_PORT=5432
+
+# Database name
+RDS_DATABASE=your_database
+
+# IAM database user (must have rds_iam role granted)
+RDS_USER=iam_user
+
+# AWS region where RDS is located
+AWS_REGION=us-east-1
+
+# AWS credentials (for development/testing)
+# In production, use IRSA (IAM Roles for Service Accounts)
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+
+# AWS account ID (for constructing ARNs)
+AWS_ACCOUNT_ID=123456789012
+

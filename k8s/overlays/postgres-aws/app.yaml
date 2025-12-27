@@ -1,0 +1,48 @@
+# Test scenario: Database branching with AWS RDS using IAM authentication
+# This pod holds the connection URL - mirrord reads it from here.
+# The pod itself doesn't connect to RDS.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-mirrord
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-rds-target
+  namespace: test-mirrord
+  labels:
+    app: pg-rds-target
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        # DATABASE_URL format: postgres://user:placeholder@host:port/database
+        # The password is a placeholder - IAM auth generates the real token
+        - name: DATABASE_URL
+          value: "postgres://${RDS_USER}:placeholder@${RDS_HOST}:${RDS_PORT}/${RDS_DATABASE}?sslmode=require"
+        # AWS credentials for the init container
+        - name: AWS_REGION
+          value: "${AWS_REGION}"
+        - name: AWS_DEFAULT_REGION
+          value: "${AWS_REGION}"
+        - name: AWS_ACCESS_KEY_ID
+          value: "${AWS_ACCESS_KEY_ID}"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "${AWS_SECRET_ACCESS_KEY}"
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-rds-service
+  namespace: test-mirrord
+spec:
+  selector:
+    app: pg-rds-target
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP

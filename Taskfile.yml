@@ -54,7 +54,7 @@ tasks:
   build:operator:
     desc: Build operator image
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --progress=plain -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:nocache:
@@ -62,7 +62,7 @@ tasks:
     cmds:
       - echo "Clearing sccache and target cache mounts..."
       - docker builder prune --filter type=exec.cachemount --force || true
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache --progress=plain -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:gcs:

@@ -24,9 +24,6 @@
                     "tables": {
                         "users": {
                             "filter": "name = 'Alice'"
-                        },
-                        "orders": {
-                            "filter": "user = 'Alice'"
                         }
                     }
                 }

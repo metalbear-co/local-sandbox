@@ -1,0 +1,22 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# NOTE: This file is processed by envsubst in the deploy task.
+# The following environment variables must be set in .env:
+#   - CLOUDSQL_HOST: Cloud SQL private IP or connection name
+#   - CLOUDSQL_PORT: Cloud SQL port (default: 5432)
+#   - CLOUDSQL_DATABASE: Database name
+#   - CLOUDSQL_USER: IAM database user (e.g., user@project.iam)
+#   - GCP_PROJECT: GCP project ID
+#
+# For IAM auth, the password in DATABASE_URL is ignored - the init container
+# generates a temporary token using GCP credentials.
+#
+# The operator-patch.yaml is applied separately via kubectl patch command.
+
+namespace: test-mirrord
+
+resources:
+  - app.yaml
+
+
