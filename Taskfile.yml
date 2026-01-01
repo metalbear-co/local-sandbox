@@ -18,6 +18,9 @@ includes:
   redis:
     taskfile: ./tasks/Taskfile.redis.yml
     dir: ./tasks
+  multicluster:
+    taskfile: ./tasks/Taskfile.multicluster.yml
+    dir: ./tasks
 
 vars:
   ROOT_DIR:
@@ -492,6 +495,56 @@ tasks:
       - task: operator:install
       - task: redis:test
 
+  test:multicluster:clean:
+    desc: "Full multicluster setup from scratch - build, create clusters, deploy apps"
+    cmds:
+      - task: multicluster:teardown:all
+      - echo "Building operator image..."
+      - task: build:operator:multicluster
+      - echo "Building echo-app..."
+      - task: multicluster:echo-app:build
+      - echo "Creating minikube profiles..."
+      - task: multicluster:clusters:create
+      - task: multicluster:kubeconfig:generate
+      - echo "Waiting for clusters to be ready..."
+      - sleep 5
+      - task: multicluster:test:verify:clusters
+      - echo "Loading images to minikube clusters..."
+      - task: multicluster:operator:load:images
+      - task: multicluster:echo-app:load:all
+      - echo "Installing operators..."
+      - task: multicluster:operator:install:all
+      - echo "Waiting for operators..."
+      - sleep 10
+      - task: multicluster:test:verify:operator
+      - echo "Deploying echo apps..."
+      - task: multicluster:test:deploy:echo-apps
+      - echo "Waiting for apps to be ready..."
+      - 'kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - 'kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - 'kubectl --context mirrord-remote-2 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - echo ""
+      - echo "============================================"
+      - echo "  SETUP COMPLETE - Ready for testing!"
+      - echo "============================================"
+      - echo ""
+      - echo "Terminal 1 - Generate traffic:"
+      - echo "  task multicluster:test:generate:traffic"
+      - echo ""
+      - echo "Terminal 2 - Steal from all clusters:"
+      - echo "  task multicluster:test:steal:multi-cluster"
+      - echo ""
+
+  build:operator:multicluster:
+    desc: Build operator image for multicluster testing (no auto-load)
+    cmds:
+      - |
+        cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
+          operator
+
   test:all:clean:
     desc: Run all tests with fresh cluster
     cmds:
@@ -566,6 +619,187 @@ tasks:
     desc: Show operator logs
     cmds:
       - kubectl logs -n mirrord deployment/mirrord-operator --tail=100 -f
+
+  events:
+    desc: Show recent cluster events (pod crashes, errors, etc.)
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+      LINES: '{{.LINES | default "50"}}'
+    cmds:
+      - |
+        echo "=== Recent Cluster Events ==="
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get events -n {{.NAMESPACE}} --sort-by='.lastTimestamp' | tail -{{.LINES}}
+        else
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -{{.LINES}}
+        fi
+
+  events:watch:
+    desc: Watch cluster events in real-time
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get events -n {{.NAMESPACE}} --watch
+        else
+          kubectl get events --all-namespaces --watch
+        fi
+
+  events:warnings:
+    desc: Show only warning/error events
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+    cmds:
+      - |
+        echo "=== Warning Events ==="
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get events -n {{.NAMESPACE}} --field-selector type!=Normal --sort-by='.lastTimestamp'
+        else
+          kubectl get events --all-namespaces --field-selector type!=Normal --sort-by='.lastTimestamp'
+        fi
+
+  pods:failed:
+    desc: Show failed/error pods across all namespaces
+    cmds:
+      - |
+        echo "=== Failed/Error Pods ==="
+        kubectl get pods --all-namespaces --field-selector=status.phase=Failed 2>/dev/null || echo "No failed pods"
+        echo ""
+        echo "=== Pods with errors (ImagePull, CrashLoop, etc.) ==="
+        kubectl get pods --all-namespaces | grep -E "Error|CrashLoop|ImagePull|Pending|Unknown" || echo "No pods with errors"
+
+  pods:restarts:
+    desc: Show pods with high restart counts
+    cmds:
+      - |
+        echo "=== Pods with restarts (sorted by restart count) ==="
+        kubectl get pods --all-namespaces -o wide | head -1
+        kubectl get pods --all-namespaces --no-headers | awk '$5 > 0 {print $0}' | sort -t' ' -k5 -rn
+
+  pods:all:
+    desc: Show all pods including completed/failed
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get pods -n {{.NAMESPACE}} --show-labels
+        else
+          kubectl get pods --all-namespaces --show-labels
+        fi
+
+  describe:pod:
+    desc: Describe a pod (shows events and state history)
+    vars:
+      POD: '{{.POD}}'
+      NAMESPACE: '{{.NAMESPACE | default "default"}}'
+    preconditions:
+      - sh: test -n "{{.POD}}"
+        msg: "POD is required (e.g., task describe:pod POD=my-pod NAMESPACE=test-mirrord)"
+    cmds:
+      - kubectl describe pod {{.POD}} -n {{.NAMESPACE}}
+
+  logs:previous:
+    desc: Show logs from previous container instance (after crash)
+    vars:
+      POD: '{{.POD}}'
+      NAMESPACE: '{{.NAMESPACE | default "default"}}'
+    preconditions:
+      - sh: test -n "{{.POD}}"
+        msg: "POD is required (e.g., task logs:previous POD=my-pod NAMESPACE=test-mirrord)"
+    cmds:
+      - kubectl logs {{.POD}} -n {{.NAMESPACE}} --previous --tail=100
+
+  logs:crashed:
+    desc: Auto-find crashed/restarted pods and show their previous logs
+    vars:
+      COUNT: '{{.COUNT | default "2"}}'
+      LINES: '{{.LINES | default "100"}}'
+    cmds:
+      - |
+        echo "=== Finding last {{.COUNT}} crashed/restarted pods ==="
+        echo ""
+        
+        # Get pods with restarts > 0 or in error state, sorted by restart time
+        PODS=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | \
+          awk '($5 > 0) || ($4 ~ /Error|CrashLoop|OOMKilled/) {print $1, $2, $5}' | \
+          head -{{.COUNT}})
+        
+        if [ -z "$PODS" ]; then
+          echo "No crashed or restarted pods found."
+          echo ""
+          echo "Looking for pods with any issues..."
+          kubectl get pods --all-namespaces | grep -v "Running\|Completed\|NAMESPACE" | head -{{.COUNT}}
+          exit 0
+        fi
+        
+        echo "$PODS" | while read ns pod restarts; do
+          echo "=============================================="
+          echo "POD: $pod"
+          echo "NAMESPACE: $ns"
+          echo "RESTARTS: $restarts"
+          echo "=============================================="
+          echo ""
+          
+          # Try to get previous logs
+          if kubectl logs "$pod" -n "$ns" --previous --tail={{.LINES}} 2>/dev/null; then
+            echo ""
+          else
+            echo "(No previous logs available - trying current logs)"
+            kubectl logs "$pod" -n "$ns" --tail={{.LINES}} 2>/dev/null || echo "(No logs available)"
+            echo ""
+          fi
+          echo ""
+        done
+
+  logs:recent:
+    desc: Show logs from most recently active pods (by events)
+    vars:
+      COUNT: '{{.COUNT | default "2"}}'
+      LINES: '{{.LINES | default "100"}}'
+    cmds:
+      - |
+        echo "=== Pods with recent warning events ==="
+        echo ""
+        
+        # Get pods from recent warning events
+        PODS=$(kubectl get events --all-namespaces --field-selector type!=Normal \
+          --sort-by='.lastTimestamp' -o jsonpath='{range .items[*]}{.involvedObject.namespace}{" "}{.involvedObject.name}{"\n"}{end}' 2>/dev/null | \
+          grep -v "^$" | tail -{{.COUNT}} | tac)
+        
+        if [ -z "$PODS" ]; then
+          echo "No recent warning events found."
+          exit 0
+        fi
+        
+        echo "$PODS" | while read ns pod; do
+          if [ -n "$pod" ] && kubectl get pod "$pod" -n "$ns" >/dev/null 2>&1; then
+            echo "=============================================="
+            echo "POD: $pod"
+            echo "NAMESPACE: $ns"
+            echo "=============================================="
+            kubectl logs "$pod" -n "$ns" --previous --tail={{.LINES}} 2>/dev/null || \
+              kubectl logs "$pod" -n "$ns" --tail={{.LINES}} 2>/dev/null || \
+              echo "(No logs available)"
+            echo ""
+          fi
+        done
+
+  status:
+    desc: Quick cluster health overview
+    cmds:
+      - |
+        echo "=== Cluster Status ==="
+        echo ""
+        echo "--- Nodes ---"
+        kubectl get nodes
+        echo ""
+        echo "--- Problem Pods ---"
+        kubectl get pods --all-namespaces | grep -v "Running\|Completed" | grep -v "^NAMESPACE" || echo "All pods healthy!"
+        echo ""
+        echo "--- Recent Warning Events ---"
+        kubectl get events --all-namespaces --field-selector type!=Normal --sort-by='.lastTimestamp' | tail -10 || echo "No warnings"
 
   dev:
     desc: Quick dev cycle - rebuild and test

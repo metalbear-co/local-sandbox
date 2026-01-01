@@ -15,7 +15,7 @@
       {
         "id": "cloudsql-branch",
         "type": "pg",
-        "version": "16",
+        "version": "17",
         "ttl_secs": 600,
         "creation_timeout_secs": 120,
         "connection": {
@@ -25,13 +25,21 @@
           }
         },
         "iam_auth": {
-          "type": "gcp_cloud_sql"
+          "type": "gcp_cloud_sql",
+          "credentials_json": {
+            "type": "env",
+            "variable": "GCP_CREDENTIALS_JSON"
+          }
         },
         "copy": {
-          "mode": "schema"
+          "mode": "schema",
+          "tables": {
+            "users": {
+              "filter": "name != 'Alice'"
+            }
+          }
         }
       }
     ]
   }
 }
-

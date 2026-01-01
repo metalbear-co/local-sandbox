@@ -6,9 +6,11 @@ spec:
         env:
         - name: GOOGLE_CLOUD_PROJECT
           value: "${GCP_PROJECT}"
-        # For service account key auth (non-GKE or without Workload Identity):
-        # Mount the key file and set GOOGLE_APPLICATION_CREDENTIALS
-        # - name: GOOGLE_APPLICATION_CREDENTIALS
-        #   value: "/var/secrets/google/key.json"
+        # GCP credentials JSON for inline auth
+        - name: GCP_CREDENTIALS_JSON
+          valueFrom:
+            secretKeyRef:
+              name: gcp-credentials-json
+              key: credentials.json
 
 

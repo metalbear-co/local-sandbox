@@ -12,7 +12,8 @@
                 },
                 "local": {
                     "port": 6379,
-                    "runtime": "docker"
+                    "runtime": "container",
+                    "container_runtime": "docker"
                 }
             }
         ]

@@ -526,17 +526,27 @@ tasks:
       - echo "Waiting for app..."
       - kubectl wait --for=condition=ready pod -l app=postgres-app -n {{.NAMESPACE}} --timeout=120s || true
 
-  # ============================================================================
-  # GCP Cloud SQL IAM Authentication Tasks
-  # ============================================================================
-
   deploy:gcp:
     desc: "Deploy GCP Cloud SQL target app for IAM auth testing"
     preconditions:
       - sh: test -n "${CLOUDSQL_HOST}"
         msg: "CLOUDSQL_HOST not set. Create .env file from k8s/overlays/postgres-gcp/env-template.txt"
+      - sh: test -n "${GOOGLE_APPLICATION_CREDENTIALS}" && test -f "${GOOGLE_APPLICATION_CREDENTIALS}"
+        msg: "GOOGLE_APPLICATION_CREDENTIALS not set or file not found"
     cmds:
       - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # Create secret in target namespace (for target pod)
+      - |
+        kubectl create secret generic gcp-credentials-json \
+          --from-file=credentials.json="${GOOGLE_APPLICATION_CREDENTIALS}" \
+          -n {{.NAMESPACE}} \
+          --dry-run=client -o yaml | kubectl apply -f -
+      # Create secret in mirrord namespace (for operator)
+      - |
+        kubectl create secret generic gcp-credentials-json \
+          --from-file=credentials.json="${GOOGLE_APPLICATION_CREDENTIALS}" \
+          -n mirrord \
+          --dry-run=client -o yaml | kubectl apply -f -
       - kubectl kustomize {{.ROOT_DIR}}/k8s/overlays/postgres-gcp | envsubst | kubectl apply -f -
       - task: _patch:operator:gcp
       - task: _wait:app:gcp
@@ -554,13 +564,7 @@ tasks:
         echo "User: ${CLOUDSQL_USER}"
         echo "Project: ${GCP_PROJECT}"
         echo ""
-        echo "This will:"
-        echo "1. Create a branch database pod"
-        echo "2. Generate GCP IAM token to connect to Cloud SQL"
-        echo "3. Copy schema from Cloud SQL to the branch"
-        echo "4. Your local app connects to the branch"
-        echo ""
-        mirrord exec -f {{.ROOT_DIR}}/k8s/overlays/postgres-gcp/mirrord.json -- echo "Database branch ready!"
+        {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres-gcp/mirrord.json -- echo "Database branch ready!"
 
   test:gcp:
     desc: "Full GCP Cloud SQL IAM auth test: deploy, run with mirrord, and verify"
@@ -568,6 +572,64 @@ tasks:
       - task: deploy:gcp
       - echo ""
       - echo "GCP Cloud SQL app deployed. Now run 'task postgres:run:local:gcp' to test IAM auth branching."
+
+  debug:branch-pod:
+    desc: "Debug failing branch pods - watches and captures logs from ephemeral pods"
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+    cmds:
+      - |
+        echo "=== Watching for branch pods in {{.NAMESPACE}} ==="
+        echo "Waiting for a pod with label 'db-owner-name' to appear..."
+        echo "Run your mirrord command in another terminal."
+        echo ""
+        
+        # Loop until we find a pod
+        while true; do
+          POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -n "$POD" ]; then
+            echo "========================================"
+            echo "FOUND POD: $POD"
+            echo "========================================"
+            
+            # Immediately save pod spec
+            echo ""
+            echo "=== Pod Spec (init container args) ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.spec.initContainers[1].args}' 2>/dev/null | jq . 2>/dev/null || \
+              kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.spec.initContainers[1].args}'
+            
+            echo ""
+            echo "=== Init container env vars ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.spec.initContainers[1].env[*].name}'
+            
+            echo ""
+            echo ""
+            echo "=== Waiting for init container to run... ==="
+            
+            # Poll for init container logs
+            for i in $(seq 1 30); do
+              LOGS=$(kubectl logs -n {{.NAMESPACE}} "$POD" -c pg-branch-init 2>&1)
+              if [ -n "$LOGS" ] && [[ ! "$LOGS" =~ "waiting to start" ]] && [[ ! "$LOGS" =~ "PodInitializing" ]]; then
+                echo ""
+                echo "=== pg-branch-init LOGS ==="
+                echo "$LOGS"
+                break
+              fi
+              sleep 0.3
+            done
+            
+            echo ""
+            echo "=== Pod Status ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "(deleted)"
+            
+            echo ""
+            echo "=== Init Container Termination Status ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.status.initContainerStatuses[1].state}' 2>/dev/null | jq . 2>/dev/null || echo "(not available)"
+            
+            break
+          fi
+          sleep 0.1
+        done
 
   status:gcp:
     desc: "Show GCP Cloud SQL test environment status"
