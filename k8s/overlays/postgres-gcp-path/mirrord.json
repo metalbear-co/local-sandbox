@@ -32,7 +32,12 @@
           }
         },
         "copy": {
-          "mode": "schema"
+          "mode": "schema",
+          "tables": {
+            "users": {
+              "filter": "name = 'Alice'"
+            }
+          }
         }
       }
     ]
