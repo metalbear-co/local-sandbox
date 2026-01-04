@@ -10,9 +10,10 @@ kind: Kustomization
 #   - AWS_REGION: AWS region (e.g., us-east-1)
 #
 # For IAM auth, the password in DATABASE_URL is ignored - the init container
-# generates a temporary token using AWS credentials.
+# generates a temporary token using AWS credentials from the target pod.
 #
-# The operator-patch.yaml is applied separately via kubectl patch command.
+# AWS credentials (AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) must be
+# set on the target pod - mirrord resolves them from there.
 
 namespace: test-mirrord
 

@@ -1,0 +1,40 @@
+{
+  "operator": true,
+  "target": {
+    "path": "pod/pg-cloudsql-target-path",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "cloudsql-branch-path",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 180,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "iam_auth": {
+          "type": "gcp_cloud_sql",
+          "credentials_path": {
+            "type": "env",
+            "variable": "GOOGLE_APPLICATION_CREDENTIALS_PATH"
+          }
+        },
+        "copy": {
+          "mode": "schema"
+        }
+      }
+    ]
+  }
+}

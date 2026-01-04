@@ -1,0 +1,25 @@
+# GCP Cloud SQL credentials_path test environment variables
+# Copy this file to .env in the local-sandbox directory and fill in values.
+#
+# This test uses credentials_path instead of credentials_json.
+# mirrord reads the file path from the target pod's env var, finds the
+# volume mount that provides it, and reads the content from the Secret.
+
+# Cloud SQL instance IP (use public IP for external access)
+CLOUDSQL_HOST=x.x.x.x
+
+# Database name
+CLOUDSQL_DATABASE=testdb
+
+# IAM user format: service-account-name@project-id.iam
+# (without .gserviceaccount.com suffix)
+CLOUDSQL_USER=your-sa-name@your-project.iam
+
+# Port (default 5432)
+CLOUDSQL_PORT=5432
+
+# GCP Project ID
+GCP_PROJECT=your-project-id
+
+# Path to service account key JSON file (local path for creating Secret)
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/your-service-account-key.json

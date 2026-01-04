@@ -8,7 +8,7 @@ OPERATOR_DIR="$(cd "${INTEGRATION_DIR}/../operator" && pwd)"
 
 # Get current year and next year
 CURRENT_YEAR=$(date +%Y)
-NEXT_YEAR=$((CURRENT_YEAR + 1))
+NEXT_YEAR=$((CURRENT_YEAR + 2))
 
 # Default dates (current year to next year)
 DEFAULT_VALID_FROM="${CURRENT_YEAR}-01-01 00:00:00 UTC"

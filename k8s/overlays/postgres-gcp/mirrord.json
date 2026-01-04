@@ -28,7 +28,7 @@
           "type": "gcp_cloud_sql",
           "credentials_json": {
             "type": "env",
-            "variable": "GCP_CREDENTIALS_JSON"
+            "variable": "GOOGLE_APPLICATION_CREDENTIALS_JSON"
           }
         },
         "copy": {

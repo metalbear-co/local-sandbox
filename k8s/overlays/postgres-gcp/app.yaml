@@ -24,7 +24,7 @@ spec:
         - name: DATABASE_URL
           value: "postgres://${CLOUDSQL_USER}:placeholder@${CLOUDSQL_HOST}:${CLOUDSQL_PORT}/${CLOUDSQL_DATABASE}?sslmode=require"
         # GCP credentials - loaded from secret as inline JSON (no file mounting needed)
-        - name: GCP_CREDENTIALS_JSON
+        - name: GOOGLE_APPLICATION_CREDENTIALS_JSON
           valueFrom:
             secretKeyRef:
               name: gcp-credentials-json

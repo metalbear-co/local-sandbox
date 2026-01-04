@@ -112,8 +112,14 @@ func handleEcho(w http.ResponseWriter, r *http.Request) {
 	// Echo back the request with cluster info
 	body, _ := io.ReadAll(r.Body)
 
-	log.Printf("[%s] ECHO #%d: %s %s - Body: %s",
-		clusterID, reqNum, r.Method, r.URL.Path, string(body))
+	// Check for source cluster header (set by traffic generator)
+	sourceCluster := r.Header.Get("X-Source-Cluster")
+	if sourceCluster == "" {
+		sourceCluster = "unknown"
+	}
+
+	log.Printf("[%s] ECHO #%d: %s %s - From: %s - Body: %s",
+		clusterID, reqNum, r.Method, r.URL.Path, sourceCluster, string(body))
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Cluster-ID", clusterID)

@@ -1,6 +1,32 @@
 # Multi-Cluster Test Environment
-# Sets up a simulated multi-cluster environment using kind
+# Sets up a simulated multi-cluster environment using minikube
 # for testing mirrord operator's multi-cluster features
+#
+# Usage:
+#   task multicluster:setup                              # 2 clusters, primary has workloads
+#   NUM_CLUSTERS=3 task multicluster:setup               # 3 clusters, primary has workloads
+#   PRIMARY_MANAGEMENT_ONLY=true task multicluster:setup # 2 clusters, primary is management-only
+#
+#   task multicluster:test:generate:traffic    # Generate traffic
+#   task multicluster:test:steal:multi-cluster # Steal from all clusters
+#
+# Variables:
+#   NUM_CLUSTERS=2|3           - Number of clusters (default: 2)
+#   PRIMARY_MANAGEMENT_ONLY    - If "true", primary only runs Envoy, no workloads (default: false)
+#   PRIMARY_CLUSTER            - Name of primary cluster (default: mirrord-primary)
+#   REMOTE_CLUSTER_1           - Name of first remote cluster (default: mirrord-remote-1)
+#   REMOTE_CLUSTER_2           - Name of second remote cluster (default: mirrord-remote-2)
+#
+# Modes:
+#   PRIMARY_MANAGEMENT_ONLY=false (default):
+#     - Primary cluster runs Envoy AND has workloads (echo-app)
+#     - Traffic comes from primary + remote clusters
+#     - default_cluster = primary
+#
+#   PRIMARY_MANAGEMENT_ONLY=true:
+#     - Primary cluster ONLY runs Envoy (no workloads)
+#     - Traffic comes from remote clusters only
+#     - default_cluster = remote-1 (first remote cluster)
 
 version: "3"
 
@@ -16,7 +42,19 @@ vars:
   REMOTE_CLUSTER_1: '{{.REMOTE_CLUSTER_1 | default "mirrord-remote-1"}}'
   REMOTE_CLUSTER_2: '{{.REMOTE_CLUSTER_2 | default "mirrord-remote-2"}}'
   
-  NAMESPACE: '{{.NAMESPACE | default "test-multicluster"}}'
+  # Number of clusters: 2 (primary + 1 remote) or 3 (primary + 2 remotes)
+  # Usage: NUM_CLUSTERS=3 task multicluster:setup
+  NUM_CLUSTERS: '{{.NUM_CLUSTERS | default "2"}}'
+  
+  # If true, primary cluster is management-only (no workloads, only Envoy)
+  # Usage: PRIMARY_MANAGEMENT_ONLY=true task multicluster:setup
+  PRIMARY_MANAGEMENT_ONLY: '{{.PRIMARY_MANAGEMENT_ONLY | default "false"}}'
+  
+  # Use MC_NAMESPACE to avoid collision with parent Taskfile's NAMESPACE
+  MC_NAMESPACE: '{{.MC_NAMESPACE | default "test-multicluster"}}'
+  
+  # Directory for multi-cluster config files
+  MC_CONFIG_DIR: '{{.ROOT_DIR}}/multicluster'
   
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
   ECHO_APP_IMAGE: '{{.ECHO_APP_IMAGE | default "echo-app:latest"}}'
@@ -25,18 +63,23 @@ vars:
 
 tasks:
   clusters:create:
-    desc: Create all 3 minikube profiles for multi-cluster testing
+    desc: Create minikube profiles for multi-cluster testing (NUM_CLUSTERS=2 or 3)
     cmds:
       - task: cluster:create
         vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}" }
       - task: cluster:create
         vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
-      - task: cluster:create
-        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
-      - 'echo "All clusters created"'
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:cluster:create CLUSTER={{.REMOTE_CLUSTER_2}}
+        fi
+      - 'echo "All clusters created (NUM_CLUSTERS={{.NUM_CLUSTERS}})"'
       - 'echo " - Primary: {{.PRIMARY_CLUSTER}}"'
-      - 'echo " - Remote 1: {{.REMOTE_CLUSTER_1}}"'
-      - 'echo " - Remote 2: {{.REMOTE_CLUSTER_2}}"'
+      - 'echo " - Remote-1: {{.REMOTE_CLUSTER_1}}"'
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo " - Remote-2: {{.REMOTE_CLUSTER_2}}"
+        fi
 
   cluster:create:
     internal: true
@@ -44,16 +87,31 @@ tasks:
     vars:
       CLUSTER: '{{.CLUSTER}}'
     cmds:
-      - minikube start -p {{.CLUSTER}} --driver={{.CONTAINER_RUNTIME}}
-      - minikube -p {{.CLUSTER}} addons enable metrics-server
-      - echo "Cluster {{.CLUSTER}} created"
+      # Add cluster hostnames to the apiserver cert SANs
+      # This allows cross-cluster communication using hostnames + hostAliases
+      - |
+        APISERVER_NAMES="{{.PRIMARY_CLUSTER}},{{.REMOTE_CLUSTER_1}}"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          APISERVER_NAMES="$APISERVER_NAMES,{{.REMOTE_CLUSTER_2}}"
+        fi
+        minikube start -p {{.CLUSTER}} \
+          --driver={{.CONTAINER_RUNTIME}} \
+          --memory=2048 \
+          --cpus=2 \
+          --disk-size=10g \
+          --apiserver-names=$APISERVER_NAMES
+      - minikube update-context -p {{.CLUSTER}}
+      - echo "Cluster {{.CLUSTER}} created and context updated"
 
   clusters:delete:
     desc: Delete all minikube cluster profiles
     cmds:
       - minikube delete -p {{.PRIMARY_CLUSTER}} || true
       - minikube delete -p {{.REMOTE_CLUSTER_1}} || true
-      - minikube delete -p {{.REMOTE_CLUSTER_2}} || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube delete -p {{.REMOTE_CLUSTER_2}} || true
+        fi
       - echo "All clusters deleted"
 
   clusters:list:
@@ -62,33 +120,118 @@ tasks:
       - minikube profile list
 
   kubeconfig:generate:
-    desc: Generate multi-cluster kubeconfig for operator
+    desc: Generate multi-cluster kubeconfig for operator with embedded certificates and Docker network IPs
     cmds:
       - |
-        # Get minikube kubeconfig paths and merge them
-        PRIMARY_KUBECONFIG=$(minikube -p {{.PRIMARY_CLUSTER}} ssh-key 2>/dev/null | xargs dirname)/kubeconfig || echo ""
+        # Update contexts to get latest ports (minikube ports can change)
+        echo "Updating minikube contexts..."
+        minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
         
-        # Use kubectl config to merge contexts from all profiles
-        # Minikube automatically adds contexts to ~/.kube/config
-        kubectl config view --flatten --context={{.PRIMARY_CLUSTER}} --context={{.REMOTE_CLUSTER_1}} --context={{.REMOTE_CLUSTER_2}} > {{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml 2>/dev/null || \
-        cp ~/.kube/config {{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml
+        # Generate a flattened kubeconfig with embedded certificates
+        # This is required because the operator runs in a container and can't access
+        # local filesystem paths like /Users/.../.minikube/...
+        #
+        # IMPORTANT: We also need to replace 127.0.0.1 URLs with Docker network IPs
+        # because the operator pod can't reach the host's localhost
         
-        # Rename contexts to match our cluster names
-        kubectl config rename-context {{.PRIMARY_CLUSTER}} {{.PRIMARY_CLUSTER}} \
-          --kubeconfig={{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml
-        kubectl config rename-context {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_1}} \
-          --kubeconfig={{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml
-        kubectl config rename-context {{.REMOTE_CLUSTER_2}} {{.REMOTE_CLUSTER_2}} \
-          --kubeconfig={{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml
+        echo "Connecting minikube clusters to each other's Docker networks..."
+        docker network connect mirrord-remote-1 mirrord-primary 2>/dev/null || true
+        docker network connect mirrord-primary mirrord-remote-1 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          docker network connect mirrord-remote-2 mirrord-primary 2>/dev/null || true
+          docker network connect mirrord-primary mirrord-remote-2 2>/dev/null || true
+        fi
         
-        echo "Multi-cluster kubeconfig generated at multi-cluster-kubeconfig.yaml"
+        echo "Getting Docker network IPs..."
+        # Get mirrord-remote-1's IP on mirrord-primary's network (reachable from primary pods)
+        REMOTE1_IP=$(docker inspect mirrord-remote-1 --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
+        # Get mirrord-primary's IP on its own network
+        PRIMARY_IP=$(docker inspect mirrord-primary --format '{{`{{.NetworkSettings.Networks}}`}}' | sed -n 's/.*mirrord-primary[^}]*IPAddress:\([0-9.]*\).*/\1/p')
+        PRIMARY_IP=$(docker inspect mirrord-primary --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
+        
+        REMOTE2_IP=""
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          REMOTE2_IP=$(docker inspect mirrord-remote-2 --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
+        fi
+        
+        echo "  mirrord-primary IP: $PRIMARY_IP"
+        echo "  mirrord-remote-1 IP (on primary network): $REMOTE1_IP"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "  mirrord-remote-2 IP (on primary network): $REMOTE2_IP"
+        fi
+        
+        echo "Generating flattened kubeconfig..."
+        mkdir -p {{.MC_CONFIG_DIR}}
+        KUBECONFIG="" kubectl config view --flatten > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp
+        
+        # Get the port numbers from the original config
+        PRIMARY_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-primary")].cluster.server}' | sed 's/.*://')
+        REMOTE1_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-remote-1")].cluster.server}' | sed 's/.*://')
+        
+        echo "Replacing 127.0.0.1 URLs with hostnames (TLS certs include these names)..."
+        # Use hostnames instead of IPs - the certs have these names in SANs
+        # We'll use hostAliases to resolve them to Docker network IPs
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          REMOTE2_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-remote-2")].cluster.server}' | sed 's/.*://')
+          sed -e "s|https://127.0.0.1:$PRIMARY_PORT|https://{{.PRIMARY_CLUSTER}}:8443|g" \
+              -e "s|https://127.0.0.1:$REMOTE1_PORT|https://{{.REMOTE_CLUSTER_1}}:8443|g" \
+              -e "s|https://127.0.0.1:$REMOTE2_PORT|https://{{.REMOTE_CLUSTER_2}}:8443|g" \
+              {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
+        else
+          sed -e "s|https://127.0.0.1:$PRIMARY_PORT|https://{{.PRIMARY_CLUSTER}}:8443|g" \
+              -e "s|https://127.0.0.1:$REMOTE1_PORT|https://{{.REMOTE_CLUSTER_1}}:8443|g" \
+              {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
+        fi
+        
+        rm {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp
+        
+        # Save host aliases for operator deployment
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          cat > {{.MC_CONFIG_DIR}}/multi-cluster-host-aliases.yaml << EOF
+        hostAliases:
+        - ip: "$PRIMARY_IP"
+          hostnames:
+          - "{{.PRIMARY_CLUSTER}}"
+        - ip: "$REMOTE1_IP"
+          hostnames:
+          - "{{.REMOTE_CLUSTER_1}}"
+        - ip: "$REMOTE2_IP"
+          hostnames:
+          - "{{.REMOTE_CLUSTER_2}}"
+        EOF
+        else
+          cat > {{.MC_CONFIG_DIR}}/multi-cluster-host-aliases.yaml << EOF
+        hostAliases:
+        - ip: "$PRIMARY_IP"
+          hostnames:
+          - "{{.PRIMARY_CLUSTER}}"
+        - ip: "$REMOTE1_IP"
+          hostnames:
+          - "{{.REMOTE_CLUSTER_1}}"
+        EOF
+        fi
+        
+        echo "Multi-cluster kubeconfig generated at multicluster/multi-cluster-kubeconfig.yaml"
+        echo "Cluster URLs:"
+        grep "server:" {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
+        echo ""
+        echo "Host aliases (for operator pod):"
+        echo "  {{.PRIMARY_CLUSTER}} -> $PRIMARY_IP"
+        echo "  {{.REMOTE_CLUSTER_1}} -> $REMOTE1_IP"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "  {{.REMOTE_CLUSTER_2}} -> $REMOTE2_IP"
+        fi
+        echo ""
+        echo "Contexts available:"
+        kubectl --kubeconfig={{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml config get-contexts -o name
 
   kubeconfig:create:secret:
     desc: Create kubeconfig secret in primary cluster
     deps: [kubeconfig:generate]
     cmds:
       - kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-      - kubectl --context {{.PRIMARY_CLUSTER}} create secret generic mirrord-multi-cluster-kubeconfig --from-file=config={{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+      - kubectl --context {{.PRIMARY_CLUSTER}} create secret generic mirrord-multi-cluster-kubeconfig --from-file=config={{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
       - echo "Kubeconfig secret created in {{.PRIMARY_CLUSTER}}"
 
   operator:load:images:
@@ -96,21 +239,37 @@ tasks:
     cmds:
       - minikube -p {{.PRIMARY_CLUSTER}} image load {{.OPERATOR_IMAGE}}
       - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.OPERATOR_IMAGE}}
-      - minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
-      - echo "Image loaded to all clusters"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
+        fi
+      - echo "Image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
 
   operator:install:remote:
     desc: Install operator in remote clusters (without multi-cluster)
     cmds:
       - |
-        for cluster in {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}}; do
+        CLUSTERS="{{.REMOTE_CLUSTER_1}}"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          CLUSTERS="{{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}}"
+        fi
+        
+        for cluster in $CLUSTERS; do
           echo "Installing operator in $cluster..."
+          # Create namespace and license secret first
+          kubectl --context $cluster create namespace mirrord --dry-run=client -o yaml | kubectl --context $cluster apply -f -
+          kubectl --context $cluster create secret generic mirrord-operator-license-pem \
+            --from-file=license.pem={{.ROOT_DIR}}/scripts/company-license.pem \
+            -n mirrord --dry-run=client -o yaml | kubectl --context $cluster apply -f -
+          
           helm upgrade --install mirrord-operator {{.CHARTS_DIR}} \
             --kube-context $cluster \
             --namespace mirrord \
-            --create-namespace \
-            --set operator.image={{.OPERATOR_IMAGE}} \
-            --set operator.imagePullPolicy=Never \
+            -f {{.ROOT_DIR}}/operator-values.yaml \
+            --set operator.image=mirrord-operator \
+            --set operator.imageTag=custom \
+            --set extraEnv.MIRRORD_MULTI_CLUSTER_ENABLED=true \
+            --set extraEnv.MIRRORD_IS_PRIMARY_CLUSTER=false \
             --wait
           echo "Operator installed in $cluster"
         done
@@ -120,20 +279,83 @@ tasks:
     deps: [kubeconfig:create:secret]
     cmds:
       - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
         echo "Installing operator in {{.PRIMARY_CLUSTER}} with multi-cluster..."
-        helm upgrade --install mirrord-operator {{.CHARTS_DIR}} \
-          --kube-context {{.PRIMARY_CLUSTER}} \
-          --namespace mirrord \
-          --create-namespace \
-          --set operator.image={{.OPERATOR_IMAGE}} \
-          --set operator.imagePullPolicy=Never \
-          --set operator.multiCluster.enabled=true \
-          --set operator.multiCluster.kubeconfigSecret=mirrord-multi-cluster-kubeconfig \
-          --set operator.multiCluster.kubeconfigPath=/etc/kubeconfig/config \
-          --set "operator.multiCluster.clusterContexts.remote-1={{.REMOTE_CLUSTER_1}}" \
-          --set "operator.multiCluster.clusterContexts.remote-2={{.REMOTE_CLUSTER_2}}" \
-          --wait
-        echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster"
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
+        
+        # Get Docker network IPs for hostAliases
+        PRIMARY_IP=$(docker inspect {{.PRIMARY_CLUSTER}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
+        REMOTE1_IP=$(docker inspect {{.REMOTE_CLUSTER_1}} --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
+        echo "  Host aliases: {{.PRIMARY_CLUSTER}}=$PRIMARY_IP, {{.REMOTE_CLUSTER_1}}=$REMOTE1_IP"
+        
+        REMOTE2_IP=""
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          REMOTE2_IP=$(docker inspect {{.REMOTE_CLUSTER_2}} --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
+          echo "                {{.REMOTE_CLUSTER_2}}=$REMOTE2_IP"
+        fi
+        
+        # Build the MIRRORD_MULTI_CLUSTER_CONTEXTS JSON
+        # If PRIMARY_MANAGEMENT_ONLY=true, don't include primary in the workload clusters
+        if [ "$MGMT_ONLY" = "true" ]; then
+          # Management-only: primary has no workloads, only remotes
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            CONTEXTS_JSON='{"remote-1":"{{.REMOTE_CLUSTER_1}}","remote-2":"{{.REMOTE_CLUSTER_2}}"}'
+          else
+            CONTEXTS_JSON='{"remote-1":"{{.REMOTE_CLUSTER_1}}"}'
+          fi
+          # Default cluster is remote-1 (first remote with workloads)
+          DEFAULT_CLUSTER="remote-1"
+          echo "  Mode: PRIMARY_MANAGEMENT_ONLY (no workloads on primary)"
+          echo "  Workload clusters: remote-1$([ "{{.NUM_CLUSTERS}}" = "3" ] && echo ", remote-2")"
+          echo "  Default cluster: $DEFAULT_CLUSTER"
+        else
+          # Normal mode: primary has workloads too
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            CONTEXTS_JSON='{"primary":"{{.PRIMARY_CLUSTER}}","remote-1":"{{.REMOTE_CLUSTER_1}}","remote-2":"{{.REMOTE_CLUSTER_2}}"}'
+          else
+            CONTEXTS_JSON='{"primary":"{{.PRIMARY_CLUSTER}}","remote-1":"{{.REMOTE_CLUSTER_1}}"}'
+          fi
+          DEFAULT_CLUSTER="primary"
+          echo "  Mode: PRIMARY_HAS_WORKLOADS"
+          echo "  Workload clusters: primary, remote-1$([ "{{.NUM_CLUSTERS}}" = "3" ] && echo ", remote-2")"
+          echo "  Default cluster: $DEFAULT_CLUSTER"
+        fi
+        
+        # Create namespace and license secret first
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        kubectl --context {{.PRIMARY_CLUSTER}} create secret generic mirrord-operator-license-pem \
+          --from-file=license.pem={{.ROOT_DIR}}/scripts/company-license.pem \
+          -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        
+        # Build helm command with dynamic hostAliases
+        HELM_ARGS=(
+          upgrade --install mirrord-operator {{.CHARTS_DIR}}
+          --kube-context {{.PRIMARY_CLUSTER}}
+          --namespace mirrord
+          -f {{.MC_CONFIG_DIR}}/operator-values-multicluster-primary.yaml
+          --set operator.image=mirrord-operator
+          --set operator.imageTag=custom
+          --set operator.multiCluster.kubeconfigSecret=mirrord-multi-cluster-kubeconfig
+          --set operator.multiCluster.kubeconfigPath=/etc/kubeconfig/config
+          --set "operator.extraEnv.MIRRORD_MULTI_CLUSTER_CONTEXTS=$CONTEXTS_JSON"
+          --set "operator.extraEnv.MIRRORD_DEFAULT_CLUSTER=$DEFAULT_CLUSTER"
+          --set "operator.hostAliases[0].ip=$PRIMARY_IP"
+          --set "operator.hostAliases[0].hostnames[0]={{.PRIMARY_CLUSTER}}"
+          --set "operator.hostAliases[1].ip=$REMOTE1_IP"
+          --set "operator.hostAliases[1].hostnames[0]={{.REMOTE_CLUSTER_1}}"
+        )
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          HELM_ARGS+=(
+            --set "operator.hostAliases[2].ip=$REMOTE2_IP"
+            --set "operator.hostAliases[2].hostnames[0]={{.REMOTE_CLUSTER_2}}"
+          )
+        fi
+        
+        HELM_ARGS+=(--wait)
+        
+        helm "${HELM_ARGS[@]}"
+        echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster ({{.NUM_CLUSTERS}} clusters, management_only=$MGMT_ONLY)"
 
   operator:install:all:
     desc: Install operator in all clusters
@@ -148,9 +370,11 @@ tasks:
         vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}", APP_NAME: "nginx-primary", REPLICAS: "2" }
       - task: app:deploy
         vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}", APP_NAME: "nginx-remote-1", REPLICAS: "2" }
-      - task: app:deploy
-        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}", APP_NAME: "nginx-remote-2", REPLICAS: "2" }
-      - echo "Test apps deployed to all clusters"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:app:deploy CLUSTER={{.REMOTE_CLUSTER_2}} APP_NAME=nginx-remote-2 REPLICAS=2
+        fi
+      - echo "Test apps deployed to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
 
   app:deploy:
     internal: true
@@ -161,14 +385,14 @@ tasks:
       REPLICAS: '{{.REPLICAS | default "1"}}'
     cmds:
       - |
-        kubectl --context {{.CLUSTER}} create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
+        kubectl --context {{.CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
         
         cat <<EOF | kubectl --context {{.CLUSTER}} apply -f -
         apiVersion: apps/v1
         kind: Deployment
         metadata:
           name: {{.APP_NAME}}
-          namespace: {{.NAMESPACE}}
+          namespace: {{.MC_NAMESPACE}}
           labels:
             app: {{.APP_NAME}}
         spec:
@@ -194,7 +418,7 @@ tasks:
         kind: Service
         metadata:
           name: {{.APP_NAME}}
-          namespace: {{.NAMESPACE}}
+          namespace: {{.MC_NAMESPACE}}
         spec:
           selector:
             app: {{.APP_NAME}}
@@ -207,17 +431,29 @@ tasks:
   apps:delete:
     desc: Delete test applications from all clusters
     cmds:
-      - kubectl --context {{.PRIMARY_CLUSTER}} delete namespace {{.NAMESPACE}} --ignore-not-found=true
-      - kubectl --context {{.REMOTE_CLUSTER_1}} delete namespace {{.NAMESPACE}} --ignore-not-found=true
-      - kubectl --context {{.REMOTE_CLUSTER_2}} delete namespace {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete namespace {{.MC_NAMESPACE}} --ignore-not-found=true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete namespace {{.MC_NAMESPACE}} --ignore-not-found=true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete namespace {{.MC_NAMESPACE}} --ignore-not-found=true
+        fi
       - echo "Test apps deleted from all clusters"
 
   test:verify:clusters:
     desc: Verify all clusters are running
     cmds:
+      - minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+      - minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube update-context -p {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
       - kubectl --context {{.PRIMARY_CLUSTER}} cluster-info
       - kubectl --context {{.REMOTE_CLUSTER_1}} cluster-info
-      - kubectl --context {{.REMOTE_CLUSTER_2}} cluster-info
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} cluster-info
+        fi
       - echo "All clusters verified"
 
   test:verify:operator:
@@ -225,15 +461,13 @@ tasks:
     cmds:
       - kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord -l app=mirrord-operator
       - kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n mirrord -l app=mirrord-operator
-      - kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n mirrord -l app=mirrord-operator
       - echo "Operators verified"
 
   test:verify:apps:
     desc: Verify test apps are running
     cmds:
-      - kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.NAMESPACE}}
-      - kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.NAMESPACE}}
-      - kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.NAMESPACE}}
+      - kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}}
+      - kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}}
       - echo "Apps verified"
 
   test:crds:
@@ -243,12 +477,12 @@ tasks:
     cmds:
       - kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/test-session.yaml
       - echo "Test multi-cluster session created"
-      - kubectl --context {{.PRIMARY_CLUSTER}} get mirrordmulticlustersessions -n {{.NAMESPACE}}
+      - kubectl --context {{.PRIMARY_CLUSTER}} get mirrordmulticlustersessions -n {{.MC_NAMESPACE}}
 
   test:crds:delete:
     desc: Delete test CRDs
     cmds:
-      - kubectl --context {{.PRIMARY_CLUSTER}} delete mirrordmulticlustersessions --all -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete mirrordmulticlustersessions --all -n {{.MC_NAMESPACE}} --ignore-not-found=true
       - echo "Test CRDs deleted"
 
   logs:primary:
@@ -264,7 +498,6 @@ tasks:
   logs:remote2:
     desc: Show operator logs from remote cluster 2
     cmds:
-      - kubectl --context {{.REMOTE_CLUSTER_2}} logs -n mirrord -l app=mirrord-operator --tail=100 -f
 
   setup:all:clean:
     desc: Clean setup - teardown existing environment and setup from scratch
@@ -305,7 +538,7 @@ tasks:
     desc: Teardown entire multi-cluster environment
     cmds:
       - task: clusters:delete
-      - rm -f {{.ROOT_DIR}}/multi-cluster-kubeconfig.yaml
+      - rm -f {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
       - echo "Multi-cluster environment torn down"
 
   status:
@@ -317,12 +550,10 @@ tasks:
       - echo "=== Operators ==="
       - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord 2>/dev/null || echo "Primary - Not running"'
       - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n mirrord 2>/dev/null || echo "Remote 1 - Not running"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n mirrord 2>/dev/null || echo "Remote 2 - Not running"'
       - echo ""
       - echo "=== Apps ==="
-      - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.NAMESPACE}} 2>/dev/null || echo "Primary - No apps"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.NAMESPACE}} 2>/dev/null || echo "Remote 1 - No apps"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.NAMESPACE}} 2>/dev/null || echo "Remote 2 - No apps"'
+      - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null || echo "Primary - No apps"'
+      - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null || echo "Remote 1 - No apps"'
 
   shell:primary:
     desc: Switch kubectl context to primary cluster
@@ -339,8 +570,6 @@ tasks:
   shell:remote2:
     desc: Switch kubectl context to remote cluster 2
     cmds:
-      - kubectl config use-context {{.REMOTE_CLUSTER_2}}
-      - echo "Switched to {{.REMOTE_CLUSTER_2}}"
 
   echo-app:build:
     desc: Build the Go echo-app for multi-cluster testing
@@ -357,39 +586,86 @@ tasks:
     cmds:
       - minikube -p {{.PRIMARY_CLUSTER}} image load {{.ECHO_APP_IMAGE}}
       - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.ECHO_APP_IMAGE}}
-      - minikube -p {{.REMOTE_CLUSTER_2}} image load {{.ECHO_APP_IMAGE}}
-      - echo "echo-app image loaded to all clusters"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.ECHO_APP_IMAGE}}
+        fi
+      - echo "echo-app image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
 
   echo-app:load:all:
     desc: Load echo-app image to all clusters (no rebuild)
     cmds:
       - minikube -p {{.PRIMARY_CLUSTER}} image load {{.ECHO_APP_IMAGE}}
       - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.ECHO_APP_IMAGE}}
-      - minikube -p {{.REMOTE_CLUSTER_2}} image load {{.ECHO_APP_IMAGE}}
-      - echo "echo-app image loaded to all clusters"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.ECHO_APP_IMAGE}}
+        fi
+      - echo "echo-app image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
 
   test:deploy:echo-apps:
     desc: Deploy echo apps to all clusters with cluster-specific IDs
     deps: [echo-app:load]
     cmds:
-      - kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-primary
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        
+        # Deploy to primary only if not management-only
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Deploying echo-app to {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-primary
+        else
+          echo "Skipping {{.PRIMARY_CLUSTER}} (management-only mode)"
+        fi
       - kubectl --context {{.REMOTE_CLUSTER_1}} apply -k {{.K8S_DIR}}/overlays/multicluster-remote-1
-      - kubectl --context {{.REMOTE_CLUSTER_2}} apply -k {{.K8S_DIR}}/overlays/multicluster-remote-2
-      - echo "Echo apps deployed to all clusters using kustomize"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          # Create remote-2 overlay if it doesn't exist
+          if [ ! -d "{{.K8S_DIR}}/overlays/multicluster-remote-2" ]; then
+            mkdir -p {{.K8S_DIR}}/overlays/multicluster-remote-2
+            cat > {{.K8S_DIR}}/overlays/multicluster-remote-2/kustomization.yaml << 'EOF'
+        apiVersion: kustomize.config.k8s.io/v1beta1
+        kind: Kustomization
+        resources:
+          - ../../base/echo-app
+        namespace: test-multicluster
+        patches:
+          - patch: |-
+              - op: replace
+                path: /spec/template/spec/containers/0/env/0/value
+                value: "REMOTE-2"
+            target:
+              kind: Deployment
+              name: echo-app
+        EOF
+          fi
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -k {{.K8S_DIR}}/overlays/multicluster-remote-2
+        fi
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          echo "Echo apps deployed to remote clusters only (PRIMARY_MANAGEMENT_ONLY=true)"
+        else
+          echo "Echo apps deployed to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+        fi
 
   test:delete:echo-apps:
     desc: Delete echo apps from all clusters
     cmds:
       - kubectl --context {{.PRIMARY_CLUSTER}} delete -k {{.K8S_DIR}}/overlays/multicluster-primary --ignore-not-found=true
       - kubectl --context {{.REMOTE_CLUSTER_1}} delete -k {{.K8S_DIR}}/overlays/multicluster-remote-1 --ignore-not-found=true
-      - kubectl --context {{.REMOTE_CLUSTER_2}} delete -k {{.K8S_DIR}}/overlays/multicluster-remote-2 --ignore-not-found=true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete -k {{.K8S_DIR}}/overlays/multicluster-remote-2 --ignore-not-found=true
+        fi
       - echo "Echo apps deleted from all clusters"
 
   test:generate:traffic:
     desc: Generate traffic to echo-apps in all clusters
     cmds:
       - |
-        echo "Generating traffic to all clusters..."
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Generating traffic (NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY)..."
         echo "Press Ctrl+C to stop"
         echo ""
         
@@ -397,20 +673,24 @@ tasks:
         while true; do
           echo "--- Round $i ---"
           
-          # Traffic to primary
-          echo -n "PRIMARY: "
-          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+          # Traffic to primary (only if not management-only)
+          if [ "$MGMT_ONLY" != "true" ]; then
+            echo -n "PRIMARY: "
+            kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+              wget -q -O- --header="X-Source-Cluster: PRIMARY" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+          fi
           
-          # Traffic to remote-1
+          # Traffic to remote-1 (with X-Source-Cluster header)
           echo -n "REMOTE-1: "
-          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-Source-Cluster: REMOTE-1" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
           
-          # Traffic to remote-2
-          echo -n "REMOTE-2: "
-          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+          # Traffic to remote-2 (only if NUM_CLUSTERS=3)
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            echo -n "REMOTE-2: "
+            kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+              wget -q -O- --header="X-Source-Cluster: REMOTE-2" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+          fi
           
           echo ""
           i=$((i + 1))
@@ -421,20 +701,27 @@ tasks:
     desc: Generate a burst of traffic to all clusters (for quick testing)
     cmds:
       - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
         echo "Sending burst of 10 requests to each cluster..."
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
         echo ""
         
         for i in $(seq 1 10); do
-          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
+          # Primary only if not management-only
+          if [ "$MGMT_ONLY" != "true" ]; then
+            kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+              wget -q -O- "http://echo-app:8080/echo?req=$i" 2>/dev/null &
+          fi
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
             wget -q -O- "http://echo-app:8080/echo?req=$i" 2>/dev/null &
-          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- "http://echo-app:8080/echo?req=$i" 2>/dev/null &
-          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- "http://echo-app:8080/echo?req=$i" 2>/dev/null &
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+              wget -q -O- "http://echo-app:8080/echo?req=$i" 2>/dev/null &
+          fi
         done
         
         wait
-        echo "Burst complete - 30 total requests sent (10 per cluster)"
+        echo "Burst complete"
 
   test:steal:single-cluster:
     desc: Test stealing traffic from a single cluster (baseline test)
@@ -455,7 +742,7 @@ tasks:
         {{.MIRRORD_BIN}} exec \
           --context {{.PRIMARY_CLUSTER}} \
           --target deploy/echo-app \
-          --target-namespace {{.NAMESPACE}} \
+          --target-namespace {{.MC_NAMESPACE}} \
           --steal \
           -- ./echo-app
 
@@ -469,7 +756,6 @@ tasks:
         echo "Envoy should aggregate traffic from:"
         echo "  - {{.PRIMARY_CLUSTER}} (PRIMARY)"
         echo "  - {{.REMOTE_CLUSTER_1}} (REMOTE-1)"
-        echo "  - {{.REMOTE_CLUSTER_2}} (REMOTE-2)"
         echo ""
         echo "In another terminal, run:"
         echo "  task multicluster:test:generate:traffic"
@@ -481,7 +767,7 @@ tasks:
         {{.MIRRORD_BIN}} exec \
           --context {{.PRIMARY_CLUSTER}} \
           --target deploy/echo-app \
-          --target-namespace {{.NAMESPACE}} \
+          --target-namespace {{.MC_NAMESPACE}} \
           --steal \
           -- ./echo-app
 
@@ -534,7 +820,6 @@ tasks:
         
         echo ""
         echo "=== Cluster Sessions in Remote-2 ==="
-        kubectl --context {{.REMOTE_CLUSTER_2}} get mirrordclustersessions -A 2>/dev/null || echo "None"
 
   test:cleanup:sessions:
     desc: Clean up all test sessions
@@ -542,21 +827,34 @@ tasks:
       - kubectl --context {{.PRIMARY_CLUSTER}} delete mirrordmulticlustersessions --all -A --ignore-not-found=true
       - kubectl --context {{.PRIMARY_CLUSTER}} delete mirrordclustersessions --all -A --ignore-not-found=true
       - kubectl --context {{.REMOTE_CLUSTER_1}} delete mirrordclustersessions --all -A --ignore-not-found=true
-      - kubectl --context {{.REMOTE_CLUSTER_2}} delete mirrordclustersessions --all -A --ignore-not-found=true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete mirrordclustersessions --all -A --ignore-not-found=true
+        fi
       - echo "All sessions cleaned up"
 
   test:full:
     desc: Run full multi-cluster test setup
     cmds:
-      - echo "=== MULTI-CLUSTER TEST SUITE ==="
-      - echo ""
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "=== MULTI-CLUSTER TEST SUITE ==="
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
+        echo ""
       - task: test:verify:clusters
       - task: test:verify:operator
       - task: test:deploy:echo-apps
       - echo "Waiting for echo apps to be ready..."
-      - kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=60s
-      - kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=60s
-      - kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=60s
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" != "true" ]; then
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
+        fi
+      - kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
+        fi
       - echo ""
       - task: test:verify:operator-status
       - echo ""
@@ -573,37 +871,57 @@ tasks:
       - echo "3. Terminal 2 - Steal from all clusters (multi-cluster):"
       - echo "   task multicluster:test:steal:multi-cluster"
       - echo ""
-      - echo "Compare the output - multi-cluster should show traffic from all 3 clusters!"
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          echo "Mode: PRIMARY_MANAGEMENT_ONLY - traffic comes from remote clusters only"
+        elif [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Compare the output - multi-cluster should show traffic from all 3 clusters!"
+        else
+          echo "Compare the output - multi-cluster should show traffic from both clusters!"
+        fi
 
   test:e2e:
     desc: Run automated end-to-end multi-cluster test
     cmds:
       - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
         echo "=== Automated E2E Multi-Cluster Test ==="
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
         echo ""
         
         # Ensure apps are deployed
         task multicluster:test:deploy:echo-apps
         
         echo "Waiting for apps to be ready..."
-        kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=60s
-        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=60s
-        kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=60s
+        if [ "$MGMT_ONLY" != "true" ]; then
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
+        fi
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
+        fi
         
         echo ""
         echo "Verifying apps respond with correct cluster IDs..."
         
-        echo -n "PRIMARY responds: "
-        kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-          wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo -n "PRIMARY responds: "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
+        else
+          echo "PRIMARY: (management-only, no workloads)"
+        fi
         
         echo -n "REMOTE-1 responds: "
-        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
           wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
         
-        echo -n "REMOTE-2 responds: "
-        kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
-          wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo -n "REMOTE-2 responds: "
+          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
+        fi
         
         echo ""
         echo "E2E test complete. Apps are correctly deployed with cluster-specific IDs."
@@ -611,4 +929,10 @@ tasks:
         echo "Next steps:"
         echo "  1. Run: task multicluster:test:generate:traffic (in background)"
         echo "  2. Run: task multicluster:test:steal:multi-cluster"
-        echo "  3. Verify you see traffic from all 3 clusters"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          echo "  3. Verify you see traffic from remote clusters only (primary is management-only)"
+        elif [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "  3. Verify you see traffic from all 3 clusters"
+        else
+          echo "  3. Verify you see traffic from both clusters"
+        fi
