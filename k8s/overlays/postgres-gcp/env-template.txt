@@ -19,6 +19,6 @@ CLOUDSQL_USER=your-sa@your-project.iam
 # GCP project ID
 GCP_PROJECT=your-project-id
 
-# Path to service account key JSON file
-# GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
+# Path to service account key JSON file (required for IAM auth)
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/service-account-key.json
 

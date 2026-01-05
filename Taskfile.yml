@@ -15,8 +15,14 @@ includes:
   postgres:
     taskfile: ./tasks/Taskfile.postgres.yml
     dir: ./tasks
+  mongodb:
+    taskfile: ./tasks/Taskfile.mongodb.yml
+    dir: ./tasks
   redis:
     taskfile: ./tasks/Taskfile.redis.yml
+    dir: ./tasks
+  multicluster:
+    taskfile: ./tasks/Taskfile.multicluster.yml
     dir: ./tasks
 
 vars:
@@ -54,7 +60,7 @@ tasks:
   build:operator:
     desc: Build operator image
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:nocache:
@@ -169,6 +175,13 @@ tasks:
       - '{{.CONTAINER_RUNTIME}} build -t postgres-app:local .'
       - minikube -p {{.CLUSTER_NAME}} image load postgres-app:local
 
+  build:app:mongodb:
+    desc: Build MongoDB app
+    dir: "{{.ROOT_DIR}}/apps/mongodb-app"
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} build -t mongodb-app:local .'
+      - minikube -p {{.CLUSTER_NAME}} image load mongodb-app:local
+
   build:apps:
     desc: Build all consumer apps
     cmds:
@@ -176,6 +189,7 @@ tasks:
       - task: build:app:kafka
       - task: build:app:mysql
       - task: build:app:postgres
+      - task: build:app:mongodb
 
   build:
     desc: Build all images
@@ -210,10 +224,39 @@ tasks:
       - kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
       - kubectl wait --for=condition=available deployment/argocd-server -n argocd --timeout=300s
 
+  infra:loki:
+    desc: Install Loki stack (Loki + Promtail) for log aggregation
+    cmds:
+      - helm repo add grafana https://grafana.github.io/helm-charts || true
+      - helm repo update grafana
+      - kubectl create namespace loki --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        helm upgrade --install loki grafana/loki-stack \
+          --namespace loki \
+          --set loki.persistence.enabled=false \
+          --set promtail.enabled=true \
+          --set grafana.enabled=true \
+          --set grafana.adminPassword=admin \
+          --wait --timeout=300s
+      - |
+        echo ""
+        echo "=== Loki Stack Installed ==="
+        echo "To access Grafana, run: task postgres:debug:grafana"
+        echo "Login: admin / admin"
+        echo "Query logs: {namespace=\"test-mirrord\", container=\"pg-branch-init\"}"
+        echo ""
+
+  infra:loki:uninstall:
+    desc: Uninstall Loki stack
+    cmds:
+      - helm uninstall loki -n loki || true
+      - kubectl delete namespace loki --ignore-not-found=true
+
   infra:all:
     desc: Install all infrastructure
     cmds:
       - task: infra:argo:rollouts
+      - task: infra:loki
 
   infra:status:
     desc: Check infrastructure status
@@ -226,11 +269,67 @@ tasks:
         echo -n "ArgoCD: "
         kubectl get deployment argocd-server -n argocd >/dev/null 2>&1 && echo "Installed" || echo "Not installed"
       - |
+        echo -n "Loki: "
+        kubectl get deployment loki -n loki >/dev/null 2>&1 && echo "Installed" || echo "Not installed"
+      - |
+        echo -n "Grafana: "
+        kubectl get deployment loki-grafana -n loki >/dev/null 2>&1 && echo "Installed" || echo "Not installed"
+      - |
         echo -n "LocalStack: "
         kubectl get deployment localstack -n localstack >/dev/null 2>&1 && echo "Running" || echo "Not running"
       - |
         echo -n "Operator: "
         kubectl get deployment mirrord-operator -n mirrord >/dev/null 2>&1 && echo "Running" || echo "Not running"
+
+  logs:grafana:
+    desc: Open Grafana UI for log viewing (port-forward)
+    cmds:
+      - echo "Opening Grafana at http://localhost:3456"
+      - echo "Login -> admin / admin"
+      - echo "Go to Explore -> Select Loki -> Query -> {namespace=\"test-mirrord\"}"
+      - echo ""
+      - kubectl port-forward -n loki svc/loki-grafana 3456:80
+
+  logs:query:
+    desc: Query logs from Loki using logcli
+    vars:
+      QUERY: '{{.QUERY | default "{namespace=\"test-mirrord\"}"}}'
+      SINCE: '{{.SINCE | default "1h"}}'
+    cmds:
+      - |
+        echo "Querying logs: {{.QUERY}}"
+        kubectl run logcli --rm -i --restart=Never \
+          --image=grafana/logcli:latest \
+          --env="LOKI_ADDR=http://loki.loki.svc.cluster.local:3100" \
+          -- query '{{.QUERY}}' --since={{.SINCE}} --limit=500 2>/dev/null || \
+        echo "Tip: Use 'task logs:grafana' for a better UI experience"
+
+  logs:branch-pods:
+    desc: Query logs from all branch database pods
+    vars:
+      SINCE: '{{.SINCE | default "30m"}}'
+    cmds:
+      - |
+        echo "=== Branch Pod Logs (last {{.SINCE}}) ==="
+        echo "Starting Grafana port-forward in background..."
+        kubectl port-forward -n loki svc/loki-grafana 3456:80 &
+        PF_PID=$!
+        sleep 2
+        echo ""
+        echo "Open http://localhost:3456 (login -> admin/admin)"
+        echo "Query in Grafana -> {namespace=\"test-mirrord\", pod=~\"mirrord-.*branch.*\"}"
+        echo "Or for init containers -> {namespace=\"test-mirrord\", container=\"pg-branch-init\"}"
+        echo ""
+        echo "Press Ctrl+C to stop port-forward"
+        wait $PF_PID
+
+  logs:operator:
+    desc: Query operator logs from Loki
+    cmds:
+      - |
+        echo "=== Operator Logs ==="
+        echo "Query: {namespace=\"mirrord\", app=\"mirrord-operator\"}"
+        kubectl logs -n mirrord -l app=mirrord-operator --tail=100 -f
 
   operator:install:
     desc: Install operator with custom image
@@ -417,6 +516,108 @@ tasks:
       - task: test:postgres:ssl:deploy
       - task: test:postgres:ssl:verify
 
+  test:postgres:aws:
+    desc: "Deploy AWS RDS target with operator"
+    deps: [operator:install]
+    cmds:
+      - task: postgres:deploy:aws
+      - task: postgres:_reset:print:aws
+
+  test:postgres:aws:clean:
+    desc: "Clean cluster, rebuild operator, and deploy AWS RDS target"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:postgres:aws
+
+  test:postgres:aws:clean:nobuild:
+    desc: "Clean cluster and deploy AWS RDS target (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: postgres:deploy:aws
+      - task: postgres:_reset:print:aws
+
+  test:postgres:gcp:
+    desc: "Deploy GCP Cloud SQL target with operator"
+    deps: [operator:install]
+    cmds:
+      - task: postgres:deploy:gcp
+      - task: postgres:_reset:print:gcp
+
+  test:postgres:gcp:clean:
+    desc: "Clean cluster, rebuild operator, and deploy GCP Cloud SQL target"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:postgres:gcp
+
+  test:postgres:gcp:clean:nobuild:
+    desc: "Clean cluster and deploy GCP Cloud SQL target (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: postgres:deploy:gcp
+      - task: postgres:_reset:print:gcp
+
+  test:postgres:gcp:path:
+    desc: "Deploy GCP Cloud SQL (path) target with operator"
+    deps: [operator:install]
+    cmds:
+      - task: postgres:deploy:gcp:path
+      - task: postgres:_reset:print:gcp:path
+
+  test:postgres:gcp:path:clean:
+    desc: "Clean cluster, rebuild operator, and deploy GCP Cloud SQL target (file-based credentials)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:postgres:gcp:path
+
+  test:postgres:gcp:path:clean:nobuild:
+    desc: "Clean cluster and deploy GCP Cloud SQL (path) target (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: postgres:deploy:gcp:path
+      - task: postgres:_reset:print:gcp:path
+
+  test:mongodb:
+    desc: "Run MongoDB test"
+    deps: [build:app:mongodb, operator:install]
+    cmds:
+      - task: mongodb:test
+
+  test:mongodb:quick:
+    desc: "Quick MongoDB test - verify only"
+    cmds:
+      - task: mongodb:verify
+
+  test:mongodb:clean:
+    desc: "Clean cluster and run MongoDB test"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:mongodb
+      - task: operator:install
+      - task: mongodb:test
+
+  test:mongodb:clean:nobuild:
+    desc: "Clean cluster and run MongoDB test (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:mongodb
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: mongodb:test
+
   test:sqs:
     desc: "Run SQS LocalStack test"
     deps: [build:app:sqs, operator:install]
@@ -492,6 +693,131 @@ tasks:
       - task: operator:install
       - task: redis:test
 
+  test:multicluster:clean:
+    desc: "Full multicluster setup from scratch - build, create clusters, deploy apps"
+    cmds:
+      - task: multicluster:teardown:all
+      - echo "Building operator image..."
+      - task: build:operator:multicluster
+      - echo "Building echo-app..."
+      - task: multicluster:echo-app:build
+      - echo "Creating minikube profiles..."
+      - task: multicluster:clusters:create
+      - echo "Waiting for clusters to be ready..."
+      - |
+        # Wait for both clusters with retries
+        for cluster in mirrord-primary mirrord-remote-1; do
+          echo "Waiting for $cluster..."
+          for i in $(seq 1 30); do
+            minikube update-context -p $cluster &>/dev/null || true
+            if kubectl --context $cluster cluster-info &>/dev/null; then
+              echo "$cluster is ready!"
+              break
+            fi
+            echo "  Attempt $i: $cluster not ready yet, waiting..."
+            sleep 2
+          done
+        done
+      - task: multicluster:kubeconfig:generate
+      - task: multicluster:test:verify:clusters
+      - echo "Loading images to minikube clusters..."
+      - task: multicluster:operator:load:images
+      - task: multicluster:echo-app:load:all
+      - echo "Installing operators..."
+      - task: multicluster:operator:install:all
+      - echo "Waiting for operators..."
+      - sleep 10
+      - task: multicluster:test:verify:operator
+      - sleep 10
+      - echo "Deploying echo apps..."
+      - task: multicluster:test:deploy:echo-apps
+      - echo "Waiting for apps to be ready..."
+      - 'kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - 'kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - echo ""
+      - echo "============================================"
+      - echo "  SETUP COMPLETE - Ready for testing!"
+      - echo "============================================"
+      - echo ""
+      - echo "Terminal 1 - Generate traffic:"
+      - echo "  task multicluster:test:generate:traffic"
+      - echo ""
+      - echo "Terminal 2 - Steal from all clusters:"
+      - echo "  task multicluster:test:steal:multi-cluster"
+      - echo ""
+
+  build:operator:multicluster:
+    desc: Build operator image for multicluster testing (no auto-load)
+    cmds:
+      - |
+        cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
+          operator
+
+  build:operator:multicluster:nocache:
+    desc: Build operator image for multicluster testing without cache
+    cmds:
+      - |
+        cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
+          operator
+
+  test:multicluster:clean:nocache:
+    desc: "Full multicluster setup from scratch with no-cache build"
+    cmds:
+      - task: multicluster:teardown:all
+      - echo "Building operator image (no cache)..."
+      - task: build:operator:multicluster:nocache
+      - echo "Building echo-app..."
+      - task: multicluster:echo-app:build
+      - echo "Creating minikube profiles..."
+      - task: multicluster:clusters:create
+      - echo "Waiting for clusters to be ready..."
+      - |
+        # Wait for both clusters with retries
+        for cluster in mirrord-primary mirrord-remote-1; do
+          echo "Waiting for $cluster..."
+          for i in $(seq 1 30); do
+            minikube update-context -p $cluster &>/dev/null || true
+            if kubectl --context $cluster cluster-info &>/dev/null; then
+              echo "$cluster is ready!"
+              break
+            fi
+            echo "  Attempt $i: $cluster not ready yet, waiting..."
+            sleep 2
+          done
+        done
+      - task: multicluster:kubeconfig:generate
+      - task: multicluster:test:verify:clusters
+      - echo "Loading images to minikube clusters..."
+      - task: multicluster:operator:load:images
+      - task: multicluster:echo-app:load:all
+      - echo "Installing operators..."
+      - task: multicluster:operator:install:all
+      - echo "Waiting for operators..."
+      - sleep 10
+      - task: multicluster:test:verify:operator
+      - echo "Deploying echo apps..."
+      - task: multicluster:test:deploy:echo-apps
+      - echo "Waiting for apps to be ready..."
+      - 'kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - 'kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - echo ""
+      - echo "============================================"
+      - echo "  SETUP COMPLETE - Ready for testing!"
+      - echo "============================================"
+      - echo ""
+      - echo "Terminal 1 - Generate traffic:"
+      - echo "  task multicluster:test:generate:traffic"
+      - echo ""
+      - echo "Terminal 2 - Steal from all clusters:"
+      - echo "  task multicluster:test:steal:multi-cluster"
+      - echo ""
+
   test:all:clean:
     desc: Run all tests with fresh cluster
     cmds:
@@ -500,6 +826,7 @@ tasks:
       - task: test:mysql:clean:nobuild
       - task: test:mariadb:clean:nobuild
       - task: test:postgres:clean:nobuild
+      - task: test:mongodb:clean:nobuild
 
   test:all:clean:nobuild:
     desc: Run all tests (skip operator build)
@@ -509,6 +836,7 @@ tasks:
       - task: test:mysql:clean:nobuild
       - task: test:mariadb:clean:nobuild
       - task: test:postgres:clean:nobuild
+      - task: test:mongodb:clean:nobuild
 
   test:default:clean:
     desc: Delete cluster and run fresh
@@ -566,6 +894,187 @@ tasks:
     desc: Show operator logs
     cmds:
       - kubectl logs -n mirrord deployment/mirrord-operator --tail=100 -f
+
+  events:
+    desc: Show recent cluster events (pod crashes, errors, etc.)
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+      LINES: '{{.LINES | default "50"}}'
+    cmds:
+      - |
+        echo "=== Recent Cluster Events ==="
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get events -n {{.NAMESPACE}} --sort-by='.lastTimestamp' | tail -{{.LINES}}
+        else
+          kubectl get events --all-namespaces --sort-by='.lastTimestamp' | tail -{{.LINES}}
+        fi
+
+  events:watch:
+    desc: Watch cluster events in real-time
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get events -n {{.NAMESPACE}} --watch
+        else
+          kubectl get events --all-namespaces --watch
+        fi
+
+  events:warnings:
+    desc: Show only warning/error events
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+    cmds:
+      - |
+        echo "=== Warning Events ==="
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get events -n {{.NAMESPACE}} --field-selector type!=Normal --sort-by='.lastTimestamp'
+        else
+          kubectl get events --all-namespaces --field-selector type!=Normal --sort-by='.lastTimestamp'
+        fi
+
+  pods:failed:
+    desc: Show failed/error pods across all namespaces
+    cmds:
+      - |
+        echo "=== Failed/Error Pods ==="
+        kubectl get pods --all-namespaces --field-selector=status.phase=Failed 2>/dev/null || echo "No failed pods"
+        echo ""
+        echo "=== Pods with errors (ImagePull, CrashLoop, etc.) ==="
+        kubectl get pods --all-namespaces | grep -E "Error|CrashLoop|ImagePull|Pending|Unknown" || echo "No pods with errors"
+
+  pods:restarts:
+    desc: Show pods with high restart counts
+    cmds:
+      - |
+        echo "=== Pods with restarts (sorted by restart count) ==="
+        kubectl get pods --all-namespaces -o wide | head -1
+        kubectl get pods --all-namespaces --no-headers | awk '$5 > 0 {print $0}' | sort -t' ' -k5 -rn
+
+  pods:all:
+    desc: Show all pods including completed/failed
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.NAMESPACE}}" ]; then
+          kubectl get pods -n {{.NAMESPACE}} --show-labels
+        else
+          kubectl get pods --all-namespaces --show-labels
+        fi
+
+  describe:pod:
+    desc: Describe a pod (shows events and state history)
+    vars:
+      POD: '{{.POD}}'
+      NAMESPACE: '{{.NAMESPACE | default "default"}}'
+    preconditions:
+      - sh: test -n "{{.POD}}"
+        msg: "POD is required (e.g., task describe:pod POD=my-pod NAMESPACE=test-mirrord)"
+    cmds:
+      - kubectl describe pod {{.POD}} -n {{.NAMESPACE}}
+
+  logs:previous:
+    desc: Show logs from previous container instance (after crash)
+    vars:
+      POD: '{{.POD}}'
+      NAMESPACE: '{{.NAMESPACE | default "default"}}'
+    preconditions:
+      - sh: test -n "{{.POD}}"
+        msg: "POD is required (e.g., task logs:previous POD=my-pod NAMESPACE=test-mirrord)"
+    cmds:
+      - kubectl logs {{.POD}} -n {{.NAMESPACE}} --previous --tail=100
+
+  logs:crashed:
+    desc: Auto-find crashed/restarted pods and show their previous logs
+    vars:
+      COUNT: '{{.COUNT | default "2"}}'
+      LINES: '{{.LINES | default "100"}}'
+    cmds:
+      - |
+        echo "=== Finding last {{.COUNT}} crashed/restarted pods ==="
+        echo ""
+        
+        # Get pods with restarts > 0 or in error state, sorted by restart time
+        PODS=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | \
+          awk '($5 > 0) || ($4 ~ /Error|CrashLoop|OOMKilled/) {print $1, $2, $5}' | \
+          head -{{.COUNT}})
+        
+        if [ -z "$PODS" ]; then
+          echo "No crashed or restarted pods found."
+          echo ""
+          echo "Looking for pods with any issues..."
+          kubectl get pods --all-namespaces | grep -v "Running\|Completed\|NAMESPACE" | head -{{.COUNT}}
+          exit 0
+        fi
+        
+        echo "$PODS" | while read ns pod restarts; do
+          echo "=============================================="
+          echo "POD: $pod"
+          echo "NAMESPACE: $ns"
+          echo "RESTARTS: $restarts"
+          echo "=============================================="
+          echo ""
+          
+          # Try to get previous logs
+          if kubectl logs "$pod" -n "$ns" --previous --tail={{.LINES}} 2>/dev/null; then
+            echo ""
+          else
+            echo "(No previous logs available - trying current logs)"
+            kubectl logs "$pod" -n "$ns" --tail={{.LINES}} 2>/dev/null || echo "(No logs available)"
+            echo ""
+          fi
+          echo ""
+        done
+
+  logs:recent:
+    desc: Show logs from most recently active pods (by events)
+    vars:
+      COUNT: '{{.COUNT | default "2"}}'
+      LINES: '{{.LINES | default "100"}}'
+    cmds:
+      - |
+        echo "=== Pods with recent warning events ==="
+        echo ""
+        
+        # Get pods from recent warning events
+        PODS=$(kubectl get events --all-namespaces --field-selector type!=Normal \
+          --sort-by='.lastTimestamp' -o jsonpath='{range .items[*]}{.involvedObject.namespace}{" "}{.involvedObject.name}{"\n"}{end}' 2>/dev/null | \
+          grep -v "^$" | tail -{{.COUNT}} | tac)
+        
+        if [ -z "$PODS" ]; then
+          echo "No recent warning events found."
+          exit 0
+        fi
+        
+        echo "$PODS" | while read ns pod; do
+          if [ -n "$pod" ] && kubectl get pod "$pod" -n "$ns" >/dev/null 2>&1; then
+            echo "=============================================="
+            echo "POD: $pod"
+            echo "NAMESPACE: $ns"
+            echo "=============================================="
+            kubectl logs "$pod" -n "$ns" --previous --tail={{.LINES}} 2>/dev/null || \
+              kubectl logs "$pod" -n "$ns" --tail={{.LINES}} 2>/dev/null || \
+              echo "(No logs available)"
+            echo ""
+          fi
+        done
+
+  status:
+    desc: Quick cluster health overview
+    cmds:
+      - |
+        echo "=== Cluster Status ==="
+        echo ""
+        echo "--- Nodes ---"
+        kubectl get nodes
+        echo ""
+        echo "--- Problem Pods ---"
+        kubectl get pods --all-namespaces | grep -v "Running\|Completed" | grep -v "^NAMESPACE" || echo "All pods healthy!"
+        echo ""
+        echo "--- Recent Warning Events ---"
+        kubectl get events --all-namespaces --field-selector type!=Normal --sort-by='.lastTimestamp' | tail -10 || echo "No warnings"
 
   dev:
     desc: Quick dev cycle - rebuild and test

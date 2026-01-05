@@ -26,10 +26,18 @@
         },
         "iam_auth": {
           "type": "aws_rds",
-          "region": { "type": "env", "variable": "AWS_REGION" }
+          "region": {
+            "type": "env",
+            "variable": "AWS_REGION"
+          }
         },
         "copy": {
-          "mode": "schema"
+          "mode": "schema",
+          "tables": {
+            "users": {
+              "filter": "age > 1"
+            }
+          }
         }
       }
     ]

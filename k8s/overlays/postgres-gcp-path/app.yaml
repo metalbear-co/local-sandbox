@@ -1,0 +1,52 @@
+# Test scenario: Database branching with GCP Cloud SQL using IAM authentication
+# This test uses credentials_path (file path) instead of credentials_json (inline JSON)
+# mirrord reads the path, finds the volume mount, and reads content from the Secret
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-mirrord
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-cloudsql-target-path
+  namespace: test-mirrord
+  labels:
+    app: pg-cloudsql-target-path
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        # DATABASE_URL format: postgres://user:placeholder@host:port/database
+        # sslmode=require is needed for GCP Cloud SQL IAM authentication
+        - name: DATABASE_URL
+          value: "postgres://${CLOUDSQL_USER}:placeholder@${CLOUDSQL_HOST}:${CLOUDSQL_PORT}/${CLOUDSQL_DATABASE}?sslmode=require"
+        # GCP credentials - mounted as a file (mirrord reads from Secret automatically)
+        - name: GOOGLE_APPLICATION_CREDENTIALS_PATH
+          value: "/var/secrets/gcp/credentials.json"
+        - name: GOOGLE_CLOUD_PROJECT
+          value: "${GCP_PROJECT}"
+      ports:
+        - containerPort: 80
+      volumeMounts:
+        - name: gcp-creds
+          mountPath: /var/secrets/gcp
+          readOnly: true
+  volumes:
+    - name: gcp-creds
+      secret:
+        secretName: gcp-credentials-json
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-cloudsql-service-path
+  namespace: test-mirrord
+spec:
+  selector:
+    app: pg-cloudsql-target-path
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP

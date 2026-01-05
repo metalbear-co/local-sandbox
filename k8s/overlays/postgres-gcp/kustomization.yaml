@@ -8,11 +8,13 @@ kind: Kustomization
 #   - CLOUDSQL_DATABASE: Database name
 #   - CLOUDSQL_USER: IAM database user (e.g., user@project.iam)
 #   - GCP_PROJECT: GCP project ID
+#   - GOOGLE_APPLICATION_CREDENTIALS: Path to service account JSON file
 #
 # For IAM auth, the password in DATABASE_URL is ignored - the init container
-# generates a temporary token using GCP credentials.
+# generates a temporary token using GCP credentials from the target pod.
 #
-# The operator-patch.yaml is applied separately via kubectl patch command.
+# The secret 'gcp-credentials-json' is created by the deploy task in the target
+# namespace. GCP credentials are resolved from the target pod's environment.
 
 namespace: test-mirrord
 

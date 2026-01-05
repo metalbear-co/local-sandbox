@@ -4,6 +4,7 @@ operator:
   kafkaSplitting: true
   mysqlBranching: true
   pgBranching: true
+  mongodbBranching: true
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true 
   jsonLog: true

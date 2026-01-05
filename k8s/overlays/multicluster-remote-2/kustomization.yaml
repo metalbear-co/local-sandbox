@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../multicluster
+
+patches:
+  - target:
+      kind: Deployment
+      name: echo-app
+    patch: |-
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: echo-app
+      spec:
+        template:
+          spec:
+            containers:
+            - name: echo
+              env:
+              - name: CLUSTER_ID
+                value: "REMOTE-2"

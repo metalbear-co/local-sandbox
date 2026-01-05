@@ -3,7 +3,8 @@ version: "3"
 vars:
   ROOT_DIR:
     sh: cd .. && pwd
-  NAMESPACE: 'redis-test'
+  # Use unique variable to avoid collision with other Taskfiles
+  REDIS_NAMESPACE: 'redis-test'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   APP_DIR: "{{.ROOT_DIR}}/apps/redis-app"
 
@@ -47,7 +48,7 @@ tasks:
       - |
         cd {{.APP_DIR}} && {{.MIRRORD_BIN}} exec \
           -t deploy/redis-main \
-          -n {{.NAMESPACE}} \
+          -n {{.REDIS_NAMESPACE}} \
           -f mirrord-local.json \
           -- ./redis-app
 
@@ -57,15 +58,15 @@ tasks:
       - |
         cd {{.APP_DIR}} && {{.MIRRORD_BIN}} exec \
           -t deploy/redis-app \
-          -n {{.NAMESPACE}} \
+          -n {{.REDIS_NAMESPACE}} \
           -- ./redis-app
 
   seed:
     desc: "Seed test data into cluster Redis"
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -n {{.NAMESPACE}} $POD -- redis-cli MSET \
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.REDIS_NAMESPACE}} $POD -- redis-cli MSET \
           greeting "Hello from cluster!" \
           counter "42" \
           app_version "1.0.0" \
@@ -77,7 +78,7 @@ tasks:
     cmds:
       - echo "Deploying Redis server..."
       - kubectl apply -k {{.ROOT_DIR}}/k8s/redis
-      - kubectl delete deployment redis-app -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete deployment redis-app -n {{.REDIS_NAMESPACE}} --ignore-not-found=true
       - task: _wait:redis
       - task: build
       - task: seed
@@ -86,14 +87,14 @@ tasks:
     desc: "Query source (cluster) Redis keys"
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
         echo ""
         echo "=== SOURCE REDIS (cluster) ==="
-        kubectl exec -n {{.NAMESPACE}} $POD -- redis-cli KEYS '*'
+        kubectl exec -n {{.REDIS_NAMESPACE}} $POD -- redis-cli KEYS '*'
         echo ""
         echo "=== VALUES ==="
-        for key in $(kubectl exec -n {{.NAMESPACE}} $POD -- redis-cli KEYS '*' 2>/dev/null); do
-          val=$(kubectl exec -n {{.NAMESPACE}} $POD -- redis-cli GET "$key" 2>/dev/null)
+        for key in $(kubectl exec -n {{.REDIS_NAMESPACE}} $POD -- redis-cli KEYS '*' 2>/dev/null); do
+          val=$(kubectl exec -n {{.REDIS_NAMESPACE}} $POD -- redis-cli GET "$key" 2>/dev/null)
           echo "  $key = $val"
         done
 
@@ -114,45 +115,45 @@ tasks:
   logs:
     desc: "Show Redis app logs"
     cmds:
-      - kubectl logs -n {{.NAMESPACE}} -l app=redis-app --tail=100 -f
+      - kubectl logs -n {{.REDIS_NAMESPACE}} -l app=redis-app --tail=100 -f
 
   logs:redis:
     desc: "Show Redis server logs"
     cmds:
-      - kubectl logs -n {{.NAMESPACE}} -l app=redis-main --tail=100 -f
+      - kubectl logs -n {{.REDIS_NAMESPACE}} -l app=redis-main --tail=100 -f
 
   shell:
     desc: "Shell into Redis app pod"
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=redis-app -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- sh
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-app -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n {{.REDIS_NAMESPACE}} "$POD" -- sh
 
   shell:redis:
     desc: "Redis CLI to cluster Redis"
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -it -n {{.NAMESPACE}} $POD -- redis-cli
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it -n {{.REDIS_NAMESPACE}} $POD -- redis-cli
 
   status:
     desc: "Show Redis test environment status"
     cmds:
       - echo "=== Redis Server ==="
-      - kubectl get pods -n {{.NAMESPACE}} -l app=redis-main 2>/dev/null || echo "Not deployed"
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l app=redis-main 2>/dev/null || echo "Not deployed"
       - echo ""
       - echo "=== Redis App ==="
-      - kubectl get pods -n {{.NAMESPACE}} -l app=redis-app 2>/dev/null || echo "Not deployed"
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l app=redis-app 2>/dev/null || echo "Not deployed"
 
   describe:
     desc: "Describe Redis app pod"
     cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=redis-app
+      - kubectl describe pod -n {{.REDIS_NAMESPACE}} -l app=redis-app
 
   describe:redis:
     desc: "Describe Redis server pod"
     cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=redis-main
+      - kubectl describe pod -n {{.REDIS_NAMESPACE}} -l app=redis-main
 
   clean:
     desc: "Clean Redis test resources"
@@ -164,10 +165,10 @@ tasks:
     internal: true
     cmds:
       - echo "Waiting for Redis..."
-      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.NAMESPACE}} --timeout=120s || true
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.REDIS_NAMESPACE}} --timeout=120s || true
 
   _wait:app:
     internal: true
     cmds:
       - echo "Waiting for Redis app..."
-      - kubectl wait --for=condition=ready pod -l app=redis-app -n {{.NAMESPACE}} --timeout=120s || true
+      - kubectl wait --for=condition=ready pod -l app=redis-app -n {{.REDIS_NAMESPACE}} --timeout=120s || true

@@ -1,0 +1,36 @@
+apiVersion: operator.metalbear.co/v1alpha
+kind: MirrordMultiClusterSession
+metadata:
+  name: test-session
+  namespace: test-multicluster
+spec:
+  owner:
+    userId: "test-user"
+    username: "testuser"
+    hostname: "localhost"
+    k8sUsername: "test@example.com"
+  namespace: test-multicluster
+  targetAlias: "echo-app"
+  clusterTargets:
+    primary:
+      target:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: echo-app
+        container: echo
+      namespace: test-multicluster
+    remote-1:
+      target:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: echo-app
+        container: echo
+      namespace: test-multicluster
+    remote-2:
+      target:
+        apiVersion: apps/v1
+        kind: Deployment
+        name: echo-app
+        container: echo
+      namespace: test-multicluster
+  primaryCluster: "mirrord-primary"

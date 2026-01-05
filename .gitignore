@@ -21,3 +21,6 @@ bin/
 *.log
 *.task
 .task/
+
+# Multi-cluster testing
+multi-cluster-kubeconfig.yaml

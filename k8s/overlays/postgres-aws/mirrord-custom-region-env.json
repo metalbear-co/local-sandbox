@@ -26,9 +26,18 @@
         },
         "iam_auth": {
           "type": "aws_rds",
-          "region": { "type": "env", "variable": "MY_CUSTOM_AWS_REGION" },
-          "access_key_id": { "type": "env", "variable": "MY_ACCESS_KEY" },
-          "secret_access_key": { "type": "env", "variable": "MY_SECRET_KEY" }
+          "region": {
+            "type": "env",
+            "variable": "MY_CUSTOM_AWS_REGION"
+          },
+          "access_key_id": {
+            "type": "env",
+            "variable": "MY_ACCESS_KEY"
+          },
+          "secret_access_key": {
+            "type": "env",
+            "variable": "MY_SECRET_KEY"
+          }
         },
         "copy": {
           "mode": "schema"

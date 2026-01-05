@@ -20,13 +20,17 @@ spec:
       env:
         # DATABASE_URL format: postgres://user:placeholder@host:port/database
         # The password is a placeholder - IAM auth generates the real token
+        # sslmode=require is needed for GCP Cloud SQL IAM authentication
         - name: DATABASE_URL
           value: "postgres://${CLOUDSQL_USER}:placeholder@${CLOUDSQL_HOST}:${CLOUDSQL_PORT}/${CLOUDSQL_DATABASE}?sslmode=require"
-        # GCP credentials for the init container
+        # GCP credentials - loaded from secret as inline JSON (no file mounting needed)
+        - name: GOOGLE_APPLICATION_CREDENTIALS_JSON
+          valueFrom:
+            secretKeyRef:
+              name: gcp-credentials-json
+              key: credentials.json
         - name: GOOGLE_CLOUD_PROJECT
           value: "${GCP_PROJECT}"
-        # Note: GOOGLE_APPLICATION_CREDENTIALS is typically a file path
-        # In GKE with Workload Identity, credentials are automatic
       ports:
         - containerPort: 80
 ---

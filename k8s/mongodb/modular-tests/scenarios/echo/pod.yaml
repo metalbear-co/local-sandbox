@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mongo-echo
+  namespace: test-mirrord
+  labels:
+    app: mongo-echo
+spec:
+  containers:
+  - name: app
+    image: mongo:7.0
+    command: ["sleep", "infinity"]
+    env:
+    - name: DATABASE_URL
+      value: "mongodb://admin:password@mongodb-test.test-mirrord.svc.cluster.local:27017/source_db?authSource=admin"
+    ports:
+    - containerPort: 8080
