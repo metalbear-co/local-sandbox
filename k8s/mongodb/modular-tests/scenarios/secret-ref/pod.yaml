@@ -1,0 +1,31 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mongo-server-secret-ref
+  namespace: test-mirrord
+  labels:
+    app: mongodb-app
+    scenario: secret-ref
+spec:
+  containers:
+  - name: app
+    image: mongo:7.0
+    command: ["sleep", "infinity"]
+    envFrom:
+    - secretRef:
+        name: mongodb-credentials
+    ports:
+    - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-server-secret-ref
+  namespace: test-mirrord
+spec:
+  selector:
+    app: mongodb-app
+    scenario: secret-ref
+  ports:
+  - port: 8080
+    targetPort: 8080

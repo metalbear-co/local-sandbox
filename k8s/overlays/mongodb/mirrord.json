@@ -1,0 +1,44 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "mongo-server-env-val"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "mongo-dev-branch",
+        "type": "mongodb",
+        "version": "7.0",
+        "name": "source_db",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "copy": {
+          "mode": "all",
+          "collections": {
+            "users": {
+              "filter": "{\"age\": {\"$gte\": 24}}"
+            },
+            "orders": {
+              "filter": "{\"amount\": {\"$gte\": 50}}"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

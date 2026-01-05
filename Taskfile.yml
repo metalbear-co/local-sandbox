@@ -15,6 +15,9 @@ includes:
   postgres:
     taskfile: ./tasks/Taskfile.postgres.yml
     dir: ./tasks
+  mongodb:
+    taskfile: ./tasks/Taskfile.mongodb.yml
+    dir: ./tasks
   redis:
     taskfile: ./tasks/Taskfile.redis.yml
     dir: ./tasks
@@ -172,6 +175,13 @@ tasks:
       - '{{.CONTAINER_RUNTIME}} build -t postgres-app:local .'
       - minikube -p {{.CLUSTER_NAME}} image load postgres-app:local
 
+  build:app:mongodb:
+    desc: Build MongoDB app
+    dir: "{{.ROOT_DIR}}/apps/mongodb-app"
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} build -t mongodb-app:local .'
+      - minikube -p {{.CLUSTER_NAME}} image load mongodb-app:local
+
   build:apps:
     desc: Build all consumer apps
     cmds:
@@ -179,6 +189,7 @@ tasks:
       - task: build:app:kafka
       - task: build:app:mysql
       - task: build:app:postgres
+      - task: build:app:mongodb
 
   build:
     desc: Build all images
@@ -577,6 +588,36 @@ tasks:
       - task: postgres:deploy:gcp:path
       - task: postgres:_reset:print:gcp:path
 
+  test:mongodb:
+    desc: "Run MongoDB test"
+    deps: [build:app:mongodb, operator:install]
+    cmds:
+      - task: mongodb:test
+
+  test:mongodb:quick:
+    desc: "Quick MongoDB test - verify only"
+    cmds:
+      - task: mongodb:verify
+
+  test:mongodb:clean:
+    desc: "Clean cluster and run MongoDB test"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:mongodb
+      - task: operator:install
+      - task: mongodb:test
+
+  test:mongodb:clean:nobuild:
+    desc: "Clean cluster and run MongoDB test (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:mongodb
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: mongodb:test
+
   test:sqs:
     desc: "Run SQS LocalStack test"
     deps: [build:app:sqs, operator:install]
@@ -785,6 +826,7 @@ tasks:
       - task: test:mysql:clean:nobuild
       - task: test:mariadb:clean:nobuild
       - task: test:postgres:clean:nobuild
+      - task: test:mongodb:clean:nobuild
 
   test:all:clean:nobuild:
     desc: Run all tests (skip operator build)
@@ -794,6 +836,7 @@ tasks:
       - task: test:mysql:clean:nobuild
       - task: test:mariadb:clean:nobuild
       - task: test:postgres:clean:nobuild
+      - task: test:mongodb:clean:nobuild
 
   test:default:clean:
     desc: Delete cluster and run fresh

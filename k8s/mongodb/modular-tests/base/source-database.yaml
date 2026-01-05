@@ -1,0 +1,89 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mongodb-test
+  namespace: test-mirrord
+  labels:
+    app: mongodb-test
+spec:
+  containers:
+  - name: mongodb
+    image: mongo:7.0
+    env:
+    - name: MONGO_INITDB_ROOT_USERNAME
+      value: admin
+    - name: MONGO_INITDB_ROOT_PASSWORD
+      value: password
+    - name: MONGO_INITDB_DATABASE
+      value: source_db
+    ports:
+    - containerPort: 27017
+    volumeMounts:
+    - name: init-script
+      mountPath: /docker-entrypoint-initdb.d
+  volumes:
+  - name: init-script
+    configMap:
+      name: mongodb-init-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongodb-init-script
+  namespace: test-mirrord
+data:
+  init.js: |
+    // Switch to source_db
+    db = db.getSiblingDB('source_db');
+
+    // Create collections
+    db.createCollection('users');
+    db.createCollection('orders');
+    db.createCollection('products');
+
+    // Create indexes
+    db.users.createIndex({ email: 1 }, { unique: true });
+    db.users.createIndex({ age: 1 });
+    db.orders.createIndex({ user_id: 1 });
+    db.orders.createIndex({ status: 1 });
+    db.products.createIndex({ name: 1 });
+
+    // Insert users
+    db.users.insertMany([
+      { id: 1, name: 'Alice', email: 'alice@example.com', age: 25 },
+      { id: 2, name: 'Bob', email: 'bob@example.com', age: 30 },
+      { id: 3, name: 'Charlie', email: 'charlie@example.com', age: 17 },
+      { id: 4, name: 'Diana', email: 'diana@example.com', age: 22 },
+      { id: 5, name: 'Eve', email: 'eve@example.com', age: 16 }
+    ]);
+
+    // Insert orders
+    db.orders.insertMany([
+      { id: 1, user_id: 1, amount: 100.00, status: 'completed' },
+      { id: 2, user_id: 2, amount: 150.50, status: 'pending' },
+      { id: 3, user_id: 1, amount: 75.25, status: 'completed' },
+      { id: 4, user_id: 3, amount: 25.00, status: 'completed' },
+      { id: 5, user_id: 4, amount: 200.00, status: 'completed' }
+    ]);
+
+    // Insert products
+    db.products.insertMany([
+      { id: 1, name: 'Laptop', price: 999.99 },
+      { id: 2, name: 'Mouse', price: 29.99 },
+      { id: 3, name: 'Keyboard', price: 79.99 },
+      { id: 4, name: 'Monitor', price: 299.99 }
+    ]);
+
+    print('MongoDB initialized with test data');
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-test
+  namespace: test-mirrord
+spec:
+  selector:
+    app: mongodb-test
+  ports:
+  - port: 27017
+    targetPort: 27017

@@ -1,0 +1,447 @@
+version: '3'
+
+# =============================================================================
+# MongoDB Database Branching Tasks
+# =============================================================================
+#
+# QUICK START:
+#   task mongodb:deploy              # Deploy MongoDB source + app pods
+#   task mongodb:run:local           # Run mirrord with MongoDB branching
+#   task mongodb:show:branch POD=<name>  # Show data in a branch pod
+#   task mongodb:shell:source        # Shell into source database
+#
+# NOTE: Branch databases are created DYNAMICALLY by mirrord during a session.
+#       They are ephemeral and get deleted when no session is using them.
+#       To see branch data, you must run mirrord first and then inspect the pod.
+#
+# AFTER CONNECTING TO SHELL (mongosh):
+#   show collections        - List all collections
+#   db.users.find()         - Show all users
+#   db.orders.find()        - Show all orders
+#   db.users.countDocuments() - Count users
+#   exit                    - Quit
+#
+# QUICK DATA INSPECTION (while mirrord session is running):
+#   task mongodb:show:branch POD=<branch-pod-name>  # Show all branch data
+#   task mongodb:branches                           # List branch CRDs
+#
+# DEBUGGING:
+#   task mongodb:debug:branch-pod    # Watch init container logs in real-time
+#   task mongodb:logs:branch         # Show branch pod logs
+#
+# =============================================================================
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MODULAR_TESTS_DIR: '{{.ROOT_DIR}}/k8s/mongodb/modular-tests'
+  MONGODB_DIR: '{{.ROOT_DIR}}/k8s/mongodb'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+
+tasks:
+  deploy:
+    desc: "Deploy MongoDB test environment"
+    cmds:
+      - task: deploy:all
+
+  deploy:base:
+    desc: "Deploy only source database"
+    cmds:
+      - echo "Deploying MongoDB source database..."
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.MONGODB_DIR}}
+      - task: _wait:source
+
+  deploy:all:
+    desc: "Deploy source database and all test scenarios"
+    cmds:
+      - task: deploy:base
+      - task: _wait:source
+      - task: deploy:scenarios
+      - task: _wait:branches
+      - task: _wait:app
+
+  deploy:scenarios:
+    desc: "Deploy all test scenarios (requires base)"
+    cmds:
+      - echo "Deploying test scenarios..."
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/env-val
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/secret-ref
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/echo
+
+  deploy:scenario:
+    desc: "Deploy a specific scenario (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/{{.SCENARIO}}
+
+  test:
+    desc: "Full MongoDB test (deploy + verify)"
+    cmds:
+      - task: deploy:all
+      - task: verify
+
+  test:quick:
+    desc: "Quick test - verify only (no deploy)"
+    cmds:
+      - task: verify
+
+  verify:
+    desc: "Verify all MongoDB branch data"
+    cmds:
+      - task: verify:all
+
+  verify:all:
+    desc: "Full verification of source and all branches"
+    cmds:
+      - echo ""
+      - task: verify:source
+
+  verify:source:
+    desc: "Verify source database"
+    cmds:
+      - echo "=== Source Database (mongodb-test) ==="
+      - |
+        kubectl exec -n {{.NAMESPACE}} mongodb-test -- mongosh "mongodb://admin:password@localhost:27017/source_db?authSource=admin" --quiet --eval \
+        "print('users:', db.users.countDocuments(), 'orders:', db.orders.countDocuments(), 'products:', db.products.countDocuments())"
+
+  verify:scenario:
+    desc: "Verify specific scenario (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO}}'
+      MODE: '{{.MODE | default ""}}'
+      EXPECTED_USERS: '{{.EXPECTED_USERS | default "?"}}'
+      EXPECTED_ORDERS: '{{.EXPECTED_ORDERS | default "?"}}'
+      EXPECTED_PRODUCTS: '{{.EXPECTED_PRODUCTS | default "?"}}'
+    cmds:
+      - |
+        echo "=== Branch [{{.SCENARIO}}] {{if .MODE}}({{.MODE}}){{end}} ==="
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch not found"
+          exit 1
+        fi
+        echo "Pod -> $POD"
+        kubectl exec -n {{.NAMESPACE}} $POD -- mongosh "mongodb://localhost:27017/branch_db" --quiet --eval \
+        "print('users:', db.users.countDocuments(), 'orders:', db.orders.countDocuments(), 'products:', db.products.countDocuments())" 2>/dev/null
+        echo "Expected -> users={{.EXPECTED_USERS}}, orders={{.EXPECTED_ORDERS}}, products={{.EXPECTED_PRODUCTS}}"
+
+  run:local:
+    desc: "Run MongoDB app locally with mirrord"
+    dir: '{{.ROOT_DIR}}/apps/mongodb-app'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mongodb/mirrord.json")}}'
+    preconditions:
+      - sh: test -f {{.MIRRORD_CONFIG}}
+        msg: "Config file not found at {{.MIRRORD_CONFIG}}"
+    cmds:
+      - echo "Building MongoDB app..."
+      - go build -o /tmp/mongodb-app main.go
+      - echo "Running with mirrord - config {{.MIRRORD_CONFIG}}"
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/mongodb-app'
+
+  query:source:
+    desc: "Query source database (QUERY='db.users.find()')"
+    vars:
+      QUERY: '{{.QUERY | default "db.users.find()"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} mongodb-test -- mongosh "mongodb://admin:password@localhost:27017/source_db?authSource=admin" --quiet --eval "{{.QUERY}}"
+
+  query:branch:
+    desc: "Query branch database (SCENARIO=env-val QUERY='db.users.find()')"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+      QUERY: '{{.QUERY | default "db.users.find()"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch '{{.SCENARIO}}' not found"
+          exit 1
+        fi
+        kubectl exec -n {{.NAMESPACE}} $POD -- mongosh "mongodb://localhost:27017/branch_db" --quiet --eval "{{.QUERY}}"
+
+  logs:
+    desc: "Show MongoDB app logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=mongodb-app --tail=50 -f
+
+  logs:source:
+    desc: "Show source database logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} mongodb-test --tail=100 -f
+
+  logs:branch:
+    desc: "Show branch pod logs (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl logs -n {{.NAMESPACE}} $POD --tail=100 -f
+
+  logs:init:
+    desc: "Show init container logs (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch '{{.SCENARIO}}' not found"
+          exit 1
+        fi
+        echo "=== Init Container Logs (mongo-branch-init) ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c mongo-branch-init 2>/dev/null || echo "Init container logs not available"
+
+  shell:
+    desc: "Shell into source database"
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} mongodb-test -- mongosh "mongodb://admin:password@localhost:27017/source_db?authSource=admin"
+
+  shell:source:
+    desc: "Shell into source database"
+    cmds:
+      - task: shell
+
+  shell:branch:
+    desc: "Shell into branch database (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch '{{.SCENARIO}}' not found"
+          exit 1
+        fi
+        kubectl exec -it -n {{.NAMESPACE}} $POD -- mongosh "mongodb://localhost:27017/branch_db"
+
+  status:
+    desc: "Show MongoDB test environment status"
+    cmds:
+      - echo "=== Source Database ==="
+      - kubectl get pod mongodb-test -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Branch Databases ==="
+      - kubectl get mongodbbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode 2>/dev/null || echo "No branches"
+      - echo ""
+      - echo "=== Branch Pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --no-headers 2>/dev/null || echo "No branch pods"
+
+  branches:
+    desc: "List all MongoDB branch databases"
+    cmds:
+      - kubectl get mongodbbranchdatabase -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode,AGE:.metadata.creationTimestamp
+
+  describe:
+    desc: "Describe branch pod (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl describe pod -n {{.NAMESPACE}} $POD
+
+  clean:
+    desc: "Clean all MongoDB test resources"
+    cmds:
+      - kubectl delete namespace {{.NAMESPACE}} --ignore-not-found=true
+      - |
+        echo "Waiting for namespace deletion..."
+        while kubectl get namespace {{.NAMESPACE}} 2>/dev/null; do
+          sleep 2
+        done
+
+  clean:branches:
+    desc: "Clean only branch databases (keep source)"
+    cmds:
+      - kubectl delete mongodbbranchdatabase --all -n {{.NAMESPACE}} --ignore-not-found=true
+
+  collections:branch:
+    desc: "List all collections in the branch database"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found"
+          exit 1
+        fi
+        echo "=== Collections in branch database ==="
+        kubectl exec -n {{.NAMESPACE}} $POD -- mongosh "mongodb://localhost:27017/branch_db" --quiet --eval 'show collections'
+
+  data:branch:
+    desc: "Show all data from a collection in branch (COLL=users)"
+    vars:
+      COLL: '{{.COLL | default "users"}}'
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found"
+          exit 1
+        fi
+        echo "=== Data in {{.COLL}} ==="
+        kubectl exec -n {{.NAMESPACE}} $POD -- mongosh "mongodb://localhost:27017/branch_db" --quiet --eval 'db.{{.COLL}}.find().pretty()'
+
+  indexes:branch:
+    desc: "Show indexes of a collection in branch (COLL=users)"
+    vars:
+      COLL: '{{.COLL | default "users"}}'
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found"
+          exit 1
+        fi
+        echo "=== Indexes for {{.COLL}} ==="
+        kubectl exec -n {{.NAMESPACE}} $POD -- mongosh "mongodb://localhost:27017/branch_db" --quiet --eval 'db.{{.COLL}}.getIndexes()'
+
+  show:branch:
+    desc: "Show all data from a branch database (POD=mirrord-mongodb-branch-db-pod-xxxxx or SCENARIO=env-val)"
+    vars:
+      POD: '{{.POD | default ""}}'
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+      DB: '{{.DB | default "branch_db"}}'
+    cmds:
+      - |
+        # Get pod name - either from POD var directly or by SCENARIO label
+        if [ -n "{{.POD}}" ]; then
+          POD_NAME="{{.POD}}"
+        else
+          POD_NAME=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mongo-test-branch-{{.SCENARIO}} --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        fi
+        
+        if [ -z "$POD_NAME" ]; then
+          echo "No branch pod found"
+          exit 1
+        fi
+        
+        # Get the MongoDB root password from the pod's environment
+        PASSWORD=$(kubectl get pod -n {{.NAMESPACE}} "$POD_NAME" -o jsonpath='{.spec.containers[0].env[?(@.name=="MONGO_INITDB_ROOT_PASSWORD")].value}')
+        
+        echo "========================================"
+        echo "Branch Database: $POD_NAME"
+        echo "========================================"
+        echo ""
+        
+        kubectl exec -n {{.NAMESPACE}} "$POD_NAME" -- mongosh "mongodb://root:$PASSWORD@localhost:27017/{{.DB}}?authSource=admin" --quiet --eval "
+        print('=== All Databases ===');
+        db.adminCommand('listDatabases').databases.forEach(d => print('  - ' + d.name));
+        print('');
+        print('=== Collections in {{.DB}} ===');
+        var colls = db.getCollectionNames();
+        colls.forEach(c => print('  - ' + c + ': ' + db.getCollection(c).countDocuments() + ' documents'));
+        print('');
+        colls.forEach(function(coll) {
+          print('=== ' + coll.toUpperCase() + ' ===');
+          db.getCollection(coll).find().limit(20).forEach(doc => printjson(doc));
+          print('');
+        });
+        "
+
+  show:branch:pod:
+    desc: "Show all data from a specific branch pod (POD=mirrord-mongodb-branch-db-pod-xxxxx)"
+    cmds:
+      - task: show:branch
+        vars:
+          POD: '{{.POD}}'
+
+  debug:branch-pod:
+    desc: "Debug failing branch pods - watches and captures logs from ephemeral pods"
+    vars:
+      NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+    cmds:
+      - |
+        echo "=== Watching for branch pods in {{.NAMESPACE}} ==="
+        echo "Waiting for a pod with label 'db-owner-name' to appear..."
+        echo "Run your mirrord command in another terminal."
+        echo ""
+        
+        # Loop until we find a pod
+        while true; do
+          POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -n "$POD" ]; then
+            echo "========================================"
+            echo "FOUND POD: $POD"
+            echo "========================================"
+            
+            # Immediately save pod spec
+            echo ""
+            echo "=== Pod Spec (init container args) ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.spec.initContainers[1].args}' 2>/dev/null | jq . 2>/dev/null || \
+              kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.spec.initContainers[1].args}'
+            
+            echo ""
+            echo "=== Init container env vars ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.spec.initContainers[1].env[*].name}'
+            
+            echo ""
+            echo ""
+            echo "=== Waiting for init container to run... ==="
+            
+            # Poll for init container logs
+            for i in $(seq 1 30); do
+              LOGS=$(kubectl logs -n {{.NAMESPACE}} "$POD" -c mongo-branch-init 2>&1)
+              if [ -n "$LOGS" ] && [[ ! "$LOGS" =~ "waiting to start" ]] && [[ ! "$LOGS" =~ "PodInitializing" ]]; then
+                echo ""
+                echo "=== mongo-branch-init LOGS ==="
+                echo "$LOGS"
+                break
+              fi
+              sleep 0.3
+            done
+            
+            echo ""
+            echo "=== Pod Status ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "(deleted)"
+            
+            echo ""
+            echo "=== Init Container Termination Status ==="
+            kubectl get pod -n {{.NAMESPACE}} "$POD" -o jsonpath='{.status.initContainerStatuses[1].state}' 2>/dev/null | jq . 2>/dev/null || echo "(not available)"
+            
+            break
+          fi
+          sleep 0.1
+        done
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for MongoDB source database..."
+      - kubectl wait --for=condition=ready pod -l app=mongodb-test -n {{.NAMESPACE}} --timeout=120s
+
+  _wait:branches:
+    internal: true
+    desc: "Branches are created dynamically by mirrord, no need to wait"
+    cmds:
+      - echo "Note - Branches will be created dynamically when mirrord runs"
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source database (mongodb-test)..."
+      - kubectl wait --for=condition=ready pod mongodb-test -n {{.NAMESPACE}} --timeout=120s
+      - |
+        # Wait for MongoDB to actually accept connections
+        echo "Waiting for MongoDB to be ready..."
+        for i in $(seq 1 30); do
+          if kubectl exec -n {{.NAMESPACE}} mongodb-test -- mongosh --quiet --eval "db.adminCommand('ping')" 2>/dev/null | grep -q ok; then
+            echo "MongoDB source database ready"
+            break
+          fi
+          sleep 2
+        done
+
+  _wait:app:
+    internal: true
+    cmds:
+      - echo "Waiting for app pods..."
+      - kubectl wait --for=condition=ready pod -l app=mongodb-app -n {{.NAMESPACE}} --timeout=120s || true

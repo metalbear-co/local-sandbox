@@ -1,0 +1,19 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MongodbBranchDatabase
+metadata:
+  name: mongo-test-branch-env-val
+  namespace: test-mirrord
+spec:
+  id: env-val
+  ttlSecs: 3600
+  mongodbVersion: "7.0"
+  target:
+    pod: mongo-server-env-val
+    container: app
+  connectionSource:
+    url:
+      env:
+        container: app
+        variable: DATABASE_URL
+  copy:
+    mode: all

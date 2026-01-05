@@ -1,0 +1,24 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: MongodbBranchDatabase
+metadata:
+  name: mongo-test-branch-secret-ref
+  namespace: test-mirrord
+spec:
+  id: secret-ref
+  ttlSecs: 3600
+  mongodbVersion: "7.0"
+  target:
+    pod: mongo-server-secret-ref
+    container: app
+  connectionSource:
+    url:
+      envFrom:
+        container: app
+        variable: DATABASE_URL
+  copy:
+    mode: all
+    collections:
+      users:
+        filter: '{"age": {"$gte": 18}}'
+      orders:
+        filter: '{"amount": {"$gte": 50}}'
