@@ -522,6 +522,23 @@ tasks:
       - sleep 2
       - task: setup:all
 
+  setup:all:with-databases:clean:
+    desc: Complete setup with PostgreSQL and MySQL databases
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-databases
+      - echo ""
+      - echo "Databases also deployed! Use 'task multicluster:databases:status' to check"
+      
+  setup:all:with-databases:
+    desc: Complete setup with PostgreSQL and MySQL databases
+    cmds:
+      - task: setup:all
+      - task: databases:deploy
+      - echo ""
+      - echo "Databases also deployed! Use 'task multicluster:databases:status' to check"
+
   setup:all:
     desc: Complete multi-cluster setup from scratch
     cmds:
@@ -544,11 +561,6 @@ tasks:
       - echo ""
       - echo "To test multi-cluster sessions:"
       - echo "  task multicluster:test:crds"
-      - echo ""
-      - echo "To view logs:"
-      - echo "  task multicluster:logs:primary   # Primary cluster logs"
-      - echo "  task multicluster:logs:remote1   # Remote 1 cluster logs"
-      - echo "  task multicluster:logs:remote2   # Remote 2 cluster logs"
 
   teardown:all:
     desc: Teardown entire multi-cluster environment
@@ -560,16 +572,43 @@ tasks:
   status:
     desc: Show status of multi-cluster environment
     cmds:
-      - echo "=== Clusters ==="
-      - kind get clusters
-      - echo ""
-      - echo "=== Operators ==="
-      - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord 2>/dev/null || echo "Primary - Not running"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n mirrord 2>/dev/null || echo "Remote 1 - Not running"'
-      - echo ""
-      - echo "=== Apps ==="
-      - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null || echo "Primary - No apps"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null || echo "Remote 1 - No apps"'
+      - |
+        echo "=== Clusters ==="
+        minikube profile list 2>/dev/null | grep -E "mirrord-primary|mirrord-remote" || echo "No mirrord clusters found"
+        echo ""
+        
+        echo "=== Operators ==="
+        echo "Primary:"
+        kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord -l app=mirrord-operator --no-headers 2>/dev/null || echo "  Not running"
+        echo "Remote-1:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n mirrord -l app=mirrord-operator --no-headers 2>/dev/null || echo "  Not running"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n mirrord -l app=mirrord-operator --no-headers 2>/dev/null || echo "  Not running"
+        fi
+        echo ""
+        
+        echo "=== Apps ({{.MC_NAMESPACE}}) ==="
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Primary:"
+          kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} --no-headers 2>/dev/null || echo "  No apps"
+        else
+          echo "Primary: (management-only, no workloads)"
+        fi
+        echo "Remote-1:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} --no-headers 2>/dev/null || echo "  No apps"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.MC_NAMESPACE}} --no-headers 2>/dev/null || echo "  No apps"
+        fi
+        echo ""
+        
+        echo "=== Sessions ==="
+        echo "MultiClusterSessions:"
+        kubectl --context {{.PRIMARY_CLUSTER}} get mirrordmulticlustersessions -A --no-headers 2>/dev/null || echo "  None"
+        echo "ClusterSessions (remote-1):"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersessions -A --no-headers 2>/dev/null || echo "  None"
 
   shell:primary:
     desc: Switch kubectl context to primary cluster
@@ -783,7 +822,6 @@ tasks:
         
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
-          --context {{.PRIMARY_CLUSTER}} \
           --target deploy/echo-app \
           --target-namespace {{.MC_NAMESPACE}} \
           --steal \
@@ -805,7 +843,6 @@ tasks:
         
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
-          --context {{.PRIMARY_CLUSTER}} \
           -f mirrord-local.json \
           -- ./echo-app
 
@@ -1028,3 +1065,257 @@ tasks:
         else
           echo "  3. Verify you see traffic from both clusters"
         fi
+
+  # =============================================================================
+  # Database Deployments for Multi-Cluster Testing
+  # =============================================================================
+
+  postgres:deploy:
+    desc: Deploy PostgreSQL to ALL clusters (to verify routing uses correct default cluster)
+    cmds:
+      - |
+        echo "Deploying PostgreSQL to ALL clusters..."
+        echo "(This verifies routing correctly uses default cluster even when DB exists in primary)"
+        
+        # Always deploy to primary (for testing routing logic)
+        echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+        
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+        fi
+        
+        echo "PostgreSQL deployed to ALL clusters"
+
+  postgres:delete:
+    desc: Delete PostgreSQL from all clusters
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete -k {{.K8S_DIR}}/overlays/multicluster-postgres --ignore-not-found=true || true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete -k {{.K8S_DIR}}/overlays/multicluster-postgres --ignore-not-found=true || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete -k {{.K8S_DIR}}/overlays/multicluster-postgres --ignore-not-found=true || true
+        fi
+      - echo "PostgreSQL deleted from all clusters"
+
+  postgres:wait:
+    desc: Wait for PostgreSQL to be ready in all clusters
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Waiting for PostgreSQL to be ready..."
+        
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Waiting on {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=ready pod/postgres-test -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+        
+        echo "Waiting on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=ready pod/postgres-test -n {{.MC_NAMESPACE}} --timeout=120s || true
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Waiting on {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=ready pod/postgres-test -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+        
+        echo "PostgreSQL is ready"
+
+  mysql:deploy:
+    desc: Deploy MySQL to ALL clusters (to verify routing uses correct default cluster)
+    cmds:
+      - |
+        echo "Deploying MySQL to ALL clusters..."
+        echo "(This verifies routing correctly uses default cluster even when DB exists in primary)"
+        
+        # Always deploy to primary (for testing routing logic)
+        echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-mysql
+        
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -k {{.K8S_DIR}}/overlays/multicluster-mysql
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -k {{.K8S_DIR}}/overlays/multicluster-mysql
+        fi
+        
+        echo "MySQL deployed to ALL clusters"
+
+  mysql:delete:
+    desc: Delete MySQL from all clusters
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete -k {{.K8S_DIR}}/overlays/multicluster-mysql --ignore-not-found=true || true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete -k {{.K8S_DIR}}/overlays/multicluster-mysql --ignore-not-found=true || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete -k {{.K8S_DIR}}/overlays/multicluster-mysql --ignore-not-found=true || true
+        fi
+      - echo "MySQL deleted from all clusters"
+
+  mysql:wait:
+    desc: Wait for MySQL to be ready in all clusters
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Waiting for MySQL to be ready..."
+        
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Waiting on {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/mysql -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+        
+        echo "Waiting on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/mysql -n {{.MC_NAMESPACE}} --timeout=120s || true
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Waiting on {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/mysql -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+        
+        echo "MySQL is ready"
+
+  databases:deploy:
+    desc: Deploy both PostgreSQL and MySQL to all clusters
+    cmds:
+      - task: postgres:deploy
+      - task: mysql:deploy
+      - task: postgres:wait
+      - task: mysql:wait
+      - echo "All databases deployed and ready"
+
+  databases:delete:
+    desc: Delete both PostgreSQL and MySQL from all clusters
+    cmds:
+      - task: postgres:delete
+      - task: mysql:delete
+      - echo "All databases deleted"
+
+  databases:status:
+    desc: Show database status in all clusters
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "=== Database Status ==="
+        echo ""
+        
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "--- {{.PRIMARY_CLUSTER}} ---"
+          kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} -l 'app in (postgres-test, mysql)' 2>/dev/null || echo "No databases"
+        else
+          echo "--- {{.PRIMARY_CLUSTER}} (management-only) ---"
+          echo "No workloads deployed"
+        fi
+        
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} -l 'app in (postgres-test, mysql)' 2>/dev/null || echo "No databases"
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.MC_NAMESPACE}} -l 'app in (postgres-test, mysql)' 2>/dev/null || echo "No databases"
+        fi
+
+  # =============================================================================
+  # Run Database Apps with mirrord (Multi-Cluster)
+  # =============================================================================
+
+  postgres:run:
+    desc: Run postgres-app locally with mirrord (multi-cluster mode)
+    cmds:
+      - |
+        echo "=== PostgreSQL App (Multi-Cluster) ==="
+        echo "Target: postgres-test in {{.MC_NAMESPACE}}"
+        echo "Note: Connects to primary operator, routes stateful ops to default cluster"
+        echo ""
+        
+        cd {{.APPS_DIR}}/postgres-app
+        echo "Building postgres-app..."
+        go build -o /tmp/postgres-app main.go
+        
+        echo "Running with mirrord..."
+        # No --context needed - uses current kubectl context (should be primary)
+        # Primary envoy routes stateful operations to the default cluster
+        {{.MIRRORD_BIN}} exec -f {{.K8S_DIR}}/overlays/multicluster-postgres/mirrord.json -- /tmp/postgres-app
+
+  mysql:run:
+    desc: Run mysql-app locally with mirrord (multi-cluster mode)
+    cmds:
+      - |
+        echo "=== MySQL App (Multi-Cluster) ==="
+        echo "Target: deploy/mysql in {{.MC_NAMESPACE}}"
+        echo "Note: Connects to primary operator, routes stateful ops to default cluster"
+        echo ""
+        
+        cd {{.APPS_DIR}}/mysql-app
+        echo "Building mysql-app..."
+        go build -o /tmp/mysql-app main.go
+        
+        echo "Running with mirrord..."
+        # No --context needed - uses current kubectl context (should be primary)
+        # Primary envoy routes stateful operations to the default cluster
+        {{.MIRRORD_BIN}} exec -f {{.K8S_DIR}}/overlays/multicluster-mysql/mirrord.json -- /tmp/mysql-app
+
+  postgres:shell:source:
+    desc: Connect to PostgreSQL source database (psql shell)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        echo "Connecting to PostgreSQL on $CLUSTER..."
+        kubectl --context $CLUSTER exec -it -n {{.MC_NAMESPACE}} postgres-test -- psql -U postgres -d source_db
+
+  postgres:query:
+    desc: Run a query on PostgreSQL (QUERY="SELECT * FROM users")
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        kubectl --context $CLUSTER exec -n {{.MC_NAMESPACE}} postgres-test -- psql -U postgres -d source_db -c "{{.QUERY}}"
+
+  mysql:shell:source:
+    desc: Connect to MySQL source database (mysql shell)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        echo "Connecting to MySQL on $CLUSTER..."
+        kubectl --context $CLUSTER exec -it -n {{.MC_NAMESPACE}} deploy/mysql -- mysql -u myuser -pmypassword mydatabase
+
+  mysql:query:
+    desc: Run a query on MySQL (QUERY="SELECT * FROM users")
+    vars:
+      QUERY: '{{.QUERY | default "SHOW TABLES;"}}'
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        kubectl --context $CLUSTER exec -n {{.MC_NAMESPACE}} deploy/mysql -- mysql -u myuser -pmypassword mydatabase -e "{{.QUERY}}"
