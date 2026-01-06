@@ -5,7 +5,10 @@
   },
   "feature": {
     "network": {
-      "incoming": "steal",
+      "mode": "steal",
+      "http_filter": {
+        "header_filter": "X-My-Header: filtered-data"
+      },
       "outgoing": true
     },
     "fs": "local",

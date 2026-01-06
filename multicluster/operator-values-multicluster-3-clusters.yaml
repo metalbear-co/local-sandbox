@@ -1,0 +1,28 @@
+# Operator values for PRIMARY cluster - 3 CLUSTERS (primary + 2 remotes)
+operator:
+  image: mirrord-operator
+  sqsSplitting: true
+  kafkaSplitting: true
+  mysqlBranching: true
+  pgBranching: true
+  awsRoleArn: arn:aws:iam::000000000000:role/dummy
+  metrics: true 
+  jsonLog: true
+  logLevel: "debug"
+  multiCluster:
+    enabled: true
+    remoteSessionTimeoutSecs: 60
+  extraEnv:
+    MIRRORD_MULTI_CLUSTER_ENABLED: "true"
+    MIRRORD_IS_PRIMARY_CLUSTER: "true"
+    MIRRORD_PRIMARY_CLUSTER: "primary"
+    # When PRIMARY_MANAGEMENT_ONLY=true, default cluster must be a remote cluster
+    # (primary has no agent, so stateful ops go to remote-1)
+    MIRRORD_DEFAULT_CLUSTER: "remote-1"
+    MIRRORD_MULTI_CLUSTER_CONTEXTS: '{"primary":"mirrord-primary","remote-1":"mirrord-remote-1","remote-2":"mirrord-remote-2"}'
+    PRIMARY_MANAGEMENT_ONLY: "true"
+license:
+  pemRef: "mirrord-operator-license-pem"
+createNamespace: false
+image:
+  pullPolicy: Never

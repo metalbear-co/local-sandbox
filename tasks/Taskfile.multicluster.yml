@@ -82,7 +82,6 @@ tasks:
         fi
 
   cluster:create:
-    internal: true
     desc: Create a single minikube cluster profile
     vars:
       CLUSTER: '{{.CLUSTER}}'
@@ -101,6 +100,15 @@ tasks:
           --disk-size=10g \
           --apiserver-names=$APISERVER_NAMES
       - minikube update-context -p {{.CLUSTER}}
+      - |
+        # Fix "too many open files" errors in kube-proxy by increasing inotify limits
+        # See: https://github.com/kubeflow/manifests/issues/2087
+        echo "Configuring inotify limits for {{.CLUSTER}}..."
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_instances=1280" || true
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_watches=655360" || true
+        # Make changes persistent across reboots
+        minikube ssh -p {{.CLUSTER}} -- "echo 'fs.inotify.max_user_instances=1280' | sudo tee -a /etc/sysctl.conf" || true
+        minikube ssh -p {{.CLUSTER}} -- "echo 'fs.inotify.max_user_watches=655360' | sudo tee -a /etc/sysctl.conf" || true
       - echo "Cluster {{.CLUSTER}} created and context updated"
 
   clusters:delete:
@@ -118,6 +126,36 @@ tasks:
     desc: List all minikube profiles
     cmds:
       - minikube profile list
+
+  clusters:fix:inotify:
+    desc: Fix inotify limits on all clusters (fixes "too many open files" in kube-proxy)
+    cmds:
+      - |
+        echo "Fixing inotify limits on all clusters..."
+        echo "This addresses 'too many open files' errors in kube-proxy"
+        echo "See: https://github.com/kubeflow/manifests/issues/2087"
+        echo ""
+      - task: cluster:fix:inotify
+        vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}" }
+      - task: cluster:fix:inotify
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:cluster:fix:inotify CLUSTER={{.REMOTE_CLUSTER_2}}
+        fi
+      - echo "Inotify limits updated on all clusters"
+
+  cluster:fix:inotify:
+    desc: Fix inotify limits on a single cluster
+    vars:
+      CLUSTER: '{{.CLUSTER}}'
+    cmds:
+      - |
+        echo "Configuring inotify limits for {{.CLUSTER}}..."
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_instances=1280" || echo "Failed to set max_user_instances"
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_watches=655360" || echo "Failed to set max_user_watches"
+        echo "  fs.inotify.max_user_instances=1280"
+        echo "  fs.inotify.max_user_watches=655360"
 
   kubeconfig:generate:
     desc: Generate multi-cluster kubeconfig for operator with embedded certificates and Docker network IPs
@@ -279,9 +317,8 @@ tasks:
     deps: [kubeconfig:create:secret]
     cmds:
       - |
-        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
         echo "Installing operator in {{.PRIMARY_CLUSTER}} with multi-cluster..."
-        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}"
         
         # Get Docker network IPs for hostAliases
         PRIMARY_IP=$(docker inspect {{.PRIMARY_CLUSTER}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
@@ -294,32 +331,13 @@ tasks:
           echo "                {{.REMOTE_CLUSTER_2}}=$REMOTE2_IP"
         fi
         
-        # Build the MIRRORD_MULTI_CLUSTER_CONTEXTS JSON
-        # If PRIMARY_MANAGEMENT_ONLY=true, don't include primary in the workload clusters
-        if [ "$MGMT_ONLY" = "true" ]; then
-          # Management-only: primary has no workloads, only remotes
-          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-            CONTEXTS_JSON='{"remote-1":"{{.REMOTE_CLUSTER_1}}","remote-2":"{{.REMOTE_CLUSTER_2}}"}'
-          else
-            CONTEXTS_JSON='{"remote-1":"{{.REMOTE_CLUSTER_1}}"}'
-          fi
-          # Default cluster is remote-1 (first remote with workloads)
-          DEFAULT_CLUSTER="remote-1"
-          echo "  Mode: PRIMARY_MANAGEMENT_ONLY (no workloads on primary)"
-          echo "  Workload clusters: remote-1$([ "{{.NUM_CLUSTERS}}" = "3" ] && echo ", remote-2")"
-          echo "  Default cluster: $DEFAULT_CLUSTER"
+        # Select values file based on NUM_CLUSTERS
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          VALUES_FILE="{{.MC_CONFIG_DIR}}/operator-values-multicluster-3-clusters.yaml"
         else
-          # Normal mode: primary has workloads too
-          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-            CONTEXTS_JSON='{"primary":"{{.PRIMARY_CLUSTER}}","remote-1":"{{.REMOTE_CLUSTER_1}}","remote-2":"{{.REMOTE_CLUSTER_2}}"}'
-          else
-            CONTEXTS_JSON='{"primary":"{{.PRIMARY_CLUSTER}}","remote-1":"{{.REMOTE_CLUSTER_1}}"}'
-          fi
-          DEFAULT_CLUSTER="primary"
-          echo "  Mode: PRIMARY_HAS_WORKLOADS"
-          echo "  Workload clusters: primary, remote-1$([ "{{.NUM_CLUSTERS}}" = "3" ] && echo ", remote-2")"
-          echo "  Default cluster: $DEFAULT_CLUSTER"
+          VALUES_FILE="{{.MC_CONFIG_DIR}}/operator-values-multicluster-2-clusters.yaml"
         fi
+        echo "  Using values file: $VALUES_FILE"
         
         # Create namespace and license secret first
         kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
@@ -332,30 +350,28 @@ tasks:
           upgrade --install mirrord-operator {{.CHARTS_DIR}}
           --kube-context {{.PRIMARY_CLUSTER}}
           --namespace mirrord
-          -f {{.MC_CONFIG_DIR}}/operator-values-multicluster-primary.yaml
+          -f "$VALUES_FILE"
           --set operator.image=mirrord-operator
           --set operator.imageTag=custom
           --set operator.multiCluster.kubeconfigSecret=mirrord-multi-cluster-kubeconfig
           --set operator.multiCluster.kubeconfigPath=/etc/kubeconfig/config
-          --set "operator.extraEnv.MIRRORD_MULTI_CLUSTER_CONTEXTS=$CONTEXTS_JSON"
-          --set "operator.extraEnv.MIRRORD_DEFAULT_CLUSTER=$DEFAULT_CLUSTER"
           --set "operator.hostAliases[0].ip=$PRIMARY_IP"
           --set "operator.hostAliases[0].hostnames[0]={{.PRIMARY_CLUSTER}}"
           --set "operator.hostAliases[1].ip=$REMOTE1_IP"
           --set "operator.hostAliases[1].hostnames[0]={{.REMOTE_CLUSTER_1}}"
         )
-        
+
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           HELM_ARGS+=(
             --set "operator.hostAliases[2].ip=$REMOTE2_IP"
             --set "operator.hostAliases[2].hostnames[0]={{.REMOTE_CLUSTER_2}}"
           )
         fi
-        
+
         HELM_ARGS+=(--wait)
-        
+
         helm "${HELM_ARGS[@]}"
-        echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster ({{.NUM_CLUSTERS}} clusters, management_only=$MGMT_ONLY)"
+        echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster ({{.NUM_CLUSTERS}} clusters)"
 
   operator:install:all:
     desc: Install operator in all clusters
@@ -661,11 +677,12 @@ tasks:
       - echo "Echo apps deleted from all clusters"
 
   test:generate:traffic:
-    desc: Generate traffic to echo-apps in all clusters
+    desc: Generate traffic to echo-apps in all clusters (NO filter header)
     cmds:
       - |
         MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
-        echo "Generating traffic (NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY)..."
+        echo "Generating traffic (NUM_CLUSTERS={{.NUM_CLUSTERS}})..."
+        echo "NO filter header - this traffic should NOT be stolen with http_filter"
         echo "Press Ctrl+C to stop"
         echo ""
         
@@ -677,19 +694,19 @@ tasks:
           if [ "$MGMT_ONLY" != "true" ]; then
             echo -n "PRIMARY: "
             kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
-              wget -q -O- --header="X-Source-Cluster: PRIMARY" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+              wget -q -O- http://echo-app:8080/echo?from=primary 2>/dev/null | head -1 || echo "failed"
           fi
           
-          # Traffic to remote-1 (with X-Source-Cluster header)
+          # Traffic to remote-1
           echo -n "REMOTE-1: "
           kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- --header="X-Source-Cluster: REMOTE-1" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+            wget -q -O- http://echo-app:8080/echo?from=remote-1 2>/dev/null | head -1 || echo "failed"
           
           # Traffic to remote-2 (only if NUM_CLUSTERS=3)
           if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
             echo -n "REMOTE-2: "
             kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
-              wget -q -O- --header="X-Source-Cluster: REMOTE-2" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+              wget -q -O- http://echo-app:8080/echo?from=remote-2 2>/dev/null | head -1 || echo "failed"
           fi
           
           echo ""
@@ -705,7 +722,7 @@ tasks:
         echo "Sending burst of 10 requests to each cluster..."
         echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
         echo ""
-        
+
         for i in $(seq 1 10); do
           # Primary only if not management-only
           if [ "$MGMT_ONLY" != "true" ]; then
@@ -756,6 +773,7 @@ tasks:
         echo "Envoy should aggregate traffic from:"
         echo "  - {{.PRIMARY_CLUSTER}} (PRIMARY)"
         echo "  - {{.REMOTE_CLUSTER_1}} (REMOTE-1)"
+        echo "  - {{.REMOTE_CLUSTER_2}} (REMOTE-2)"
         echo ""
         echo "In another terminal, run:"
         echo "  task multicluster:test:generate:traffic"
@@ -771,11 +789,18 @@ tasks:
           --steal \
           -- ./echo-app
 
-  test:steal:with-config:
-    desc: Test with mirrord config file
+  test:steal:multi-cluster:with-config:
+    desc: Test with mirrord config file (includes HTTP filter)
     cmds:
       - |
         echo "=== Multi-Cluster Traffic Steal with Config ==="
+        echo ""
+        echo "Using config: mirrord-local.json"
+        echo "HTTP Filter: X-My-Header: filtered-data"
+        echo ""
+        echo "To test filtering, use:"
+        echo "  task multicluster:test:generate:traffic:filtered   # SHOULD be stolen"
+        echo "  task multicluster:test:generate:traffic            # Should NOT be stolen"
         echo ""
         
         cd {{.APPS_DIR}}/echo-app
@@ -783,6 +808,73 @@ tasks:
           --context {{.PRIMARY_CLUSTER}} \
           -f mirrord-local.json \
           -- ./echo-app
+
+  test:generate:traffic:filtered:
+    desc: Generate traffic with X-My-Header header (for filter testing)
+    cmds:
+      - |
+        echo "Generating FILTERED traffic (with X-My-Header: filtered-data)..."
+        echo "This traffic SHOULD be stolen when using http_filter"
+        echo "Press Ctrl+C to stop"
+        echo ""
+        
+        i=1
+        while true; do
+          echo "--- Round $i (FILTERED) ---"
+          
+          # Traffic to primary with filter header
+          echo -n "PRIMARY (filtered): "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-My-Header: filtered-data" --header="X-Source-Cluster: PRIMARY" \
+            http://echo-app:8080/echo?from=filtered 2>/dev/null | head -1 || echo "failed"
+          
+          # Traffic to remote-1 with filter header
+          echo -n "REMOTE-1 (filtered): "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-My-Header: filtered-data" --header="X-Source-Cluster: REMOTE-1" \
+            http://echo-app:8080/echo?from=filtered 2>/dev/null | head -1 || echo "failed"
+          
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            echo -n "REMOTE-2 (filtered): "
+            kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+              wget -q -O- --header="X-My-Header: filtered-data" --header="X-Source-Cluster: REMOTE-2" \
+              http://echo-app:8080/echo?from=filtered 2>/dev/null | head -1 || echo "failed"
+          fi
+          
+          echo ""
+          i=$((i + 1))
+          sleep 2
+        done
+
+  test:generate:traffic:mixed:
+    desc: Generate mixed traffic (some filtered, some not) for filter testing
+    cmds:
+      - |
+        echo "Generating MIXED traffic..."
+        echo "  - With X-My-Header: filtered-data -> SHOULD be stolen"
+        echo "  - Without header -> Should NOT be stolen"
+        echo "Press Ctrl+C to stop"
+        echo ""
+        
+        i=1
+        while true; do
+          echo "--- Round $i ---"
+          
+          # Filtered traffic (should be stolen)
+          echo -n "FILTERED (primary): "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-My-Header: filtered-data" \
+            http://echo-app:8080/echo?type=filtered 2>/dev/null | head -1 || echo "failed"
+          
+          # Non-filtered traffic (should NOT be stolen)
+          echo -n "NON-FILTERED (primary): "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- http://echo-app:8080/echo?type=non-filtered 2>/dev/null | head -1 || echo "failed"
+          
+          echo ""
+          i=$((i + 1))
+          sleep 2
+        done
 
   test:verify:operator-status:
     desc: Verify operator multi-cluster configuration
