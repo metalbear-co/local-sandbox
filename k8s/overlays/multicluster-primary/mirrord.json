@@ -5,13 +5,10 @@
   },
   "feature": {
     "network": {
-      "mode": "steal",
+      "mode": "mirror",
       "http_filter": {
         "header_filter": "X-My-Header: filtered-data"
-      },
-      "outgoing": true
-    },
-    "fs": "local",
-    "env": true
+      }
+    }
   }
 }

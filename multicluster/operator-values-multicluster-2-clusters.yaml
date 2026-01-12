@@ -16,11 +16,10 @@ operator:
     MIRRORD_MULTI_CLUSTER_ENABLED: "true"
     MIRRORD_IS_PRIMARY_CLUSTER: "true"
     MIRRORD_PRIMARY_CLUSTER: "primary"
-    # When PRIMARY_MANAGEMENT_ONLY=true, default cluster must be a remote cluster
-    # (primary has no agent, so stateful ops go to remote-1)
-    MIRRORD_DEFAULT_CLUSTER: "remote-1"
+    # When PRIMARY_MANAGEMENT_ONLY=true, default cluster must be non management cluster
+    MIRRORD_DEFAULT_CLUSTER: "primary"
     MIRRORD_MULTI_CLUSTER_CONTEXTS: '{"primary":"mirrord-primary","remote-1":"mirrord-remote-1"}'
-    PRIMARY_MANAGEMENT_ONLY: "true"
+    PRIMARY_MANAGEMENT_ONLY: "false"
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false

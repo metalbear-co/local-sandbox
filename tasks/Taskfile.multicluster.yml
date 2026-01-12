@@ -273,8 +273,16 @@ tasks:
       - echo "Kubeconfig secret created in {{.PRIMARY_CLUSTER}}"
 
   operator:load:images:
-    desc: Load operator image to all clusters
+    desc: Load operator image to all clusters (removes old image first)
     cmds:
+      # Remove old images first to ensure new image is loaded
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+        fi
+      # Load new images
       - minikube -p {{.PRIMARY_CLUSTER}} image load {{.OPERATOR_IMAGE}}
       - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.OPERATOR_IMAGE}}
       - |
@@ -282,6 +290,125 @@ tasks:
           minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
         fi
       - echo "Image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+
+  operator:rebuild:
+    desc: Build, load, and restart operators in all clusters (quick update)
+    cmds:
+      - echo "Building operator image..."
+      - |
+        cd {{.ROOT_DIR}}/../operator/.. && docker build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
+          operator
+      - echo "Removing old images from clusters (required for minikube to load new image)..."
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+        fi
+      - echo "Loading image to all clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} image load {{.OPERATOR_IMAGE}}
+      - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.OPERATOR_IMAGE}}
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
+        fi
+      - echo "Restarting operators..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo ""
+      - echo "=== VERIFICATION ==="
+      - echo "Image age in clusters (should show 'seconds ago' or 'About a minute ago'):"
+      - echo "Primary:"
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - echo "Remote-1:"
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+        fi
+      - echo ""
+      - echo "All operators updated and ready!"
+
+  operator:upgrade:
+    desc: Helm upgrade operators in all clusters (applies values changes only, no rebuild)
+    cmds:
+      - echo "Upgrading operators via helm (values only, no rebuild)..."
+      - task: operator:install:remote
+      - task: operator:install:primary
+      - echo "Restarting operator pods to pick up new values..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo "All operators upgraded with new values!"
+
+  operator:rebuild:upgrade:
+    desc: Build, load, and helm upgrade operators in all clusters (applies chart AND code changes)
+    cmds:
+      - echo "Building operator image..."
+      - |
+        cd {{.ROOT_DIR}}/../operator/.. && docker build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
+          operator
+      - echo "Loading image to all clusters..."
+      - task: operator:load:images
+      - echo "Upgrading operators via helm..."
+      - task: operator:install:remote
+      - task: operator:install:primary
+      - echo "Restarting operator pods to pick up new image..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo ""
+      - echo "=== VERIFICATION ==="
+      - echo "Image age in clusters (should show 'seconds ago' or 'About a minute ago'):"
+      - echo "Primary:"
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - echo "Remote-1:"
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+        fi
+      - echo ""
+      - echo "All operators upgraded and restarted!"
 
   operator:install:remote:
     desc: Install operator in remote clusters (without multi-cluster)
@@ -557,6 +684,9 @@ tasks:
       - sleep 5
       - task: test:verify:apps
       - echo ""
+      - echo "Setting kubectl context to primary cluster ({{.PRIMARY_CLUSTER}})..."
+      - kubectl config use-context {{.PRIMARY_CLUSTER}}
+      - echo ""
       - echo "Multi-cluster environment setup complete!"
       - echo ""
       - echo "To test multi-cluster sessions:"
@@ -823,6 +953,7 @@ tasks:
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
           --target deploy/echo-app \
+          --context {{.PRIMARY_CLUSTER}} \
           --target-namespace {{.MC_NAMESPACE}} \
           --steal \
           -- ./echo-app
@@ -843,6 +974,7 @@ tasks:
         
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
           -f mirrord-local.json \
           -- ./echo-app
 
@@ -1244,9 +1376,11 @@ tasks:
         go build -o /tmp/postgres-app main.go
         
         echo "Running with mirrord..."
-        # No --context needed - uses current kubectl context (should be primary)
-        # Primary envoy routes stateful operations to the default cluster
-        {{.MIRRORD_BIN}} exec -f {{.K8S_DIR}}/overlays/multicluster-postgres/mirrord.json -- /tmp/postgres-app
+        # Primary operator routes stateful operations (db branches) to the default cluster
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-postgres/mirrord.json \
+          -- /tmp/postgres-app
 
   mysql:run:
     desc: Run mysql-app locally with mirrord (multi-cluster mode)
@@ -1262,9 +1396,11 @@ tasks:
         go build -o /tmp/mysql-app main.go
         
         echo "Running with mirrord..."
-        # No --context needed - uses current kubectl context (should be primary)
-        # Primary envoy routes stateful operations to the default cluster
-        {{.MIRRORD_BIN}} exec -f {{.K8S_DIR}}/overlays/multicluster-mysql/mirrord.json -- /tmp/mysql-app
+        # Primary operator routes stateful operations (db branches) to the default cluster
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-mysql/mirrord.json \
+          -- /tmp/mysql-app
 
   postgres:shell:source:
     desc: Connect to PostgreSQL source database (psql shell)

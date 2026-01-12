@@ -14,6 +14,7 @@ metadata:
   labels:
     app: pg-cloudsql-target-path
 spec:
+  serviceAccountName: pg-cloudsql-sa
   containers:
     - name: echo
       image: ealen/echo-server:latest

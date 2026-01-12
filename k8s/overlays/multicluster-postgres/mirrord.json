@@ -4,12 +4,6 @@
     "namespace": "test-multicluster"
   },
   "feature": {
-    "env": true,
-    "fs": "local",
-    "network": {
-      "incoming": "off",
-      "outgoing": true
-    },
     "db_branches": [
       {
         "id": "pg-multicluster-branch",

@@ -9,6 +9,10 @@ operator:
   metrics: true 
   jsonLog: true
   logLevel: "debug"
+  # Increased resource limits for multi-cluster operations
+  limits:
+    memory: 512Mi
+    cpu: 500m
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false
