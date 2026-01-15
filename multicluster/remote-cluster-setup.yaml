@@ -1,0 +1,71 @@
+# Remote Cluster Setup for Multi-Cluster Mode
+#
+# Apply this to REMOTE clusters to allow the PRIMARY cluster to access them.
+#
+# Usage:
+#   kubectl apply -f remote-cluster-setup.yaml -n mirrord
+#
+# After applying, get the credentials for the primary cluster:
+#   kubectl create token mirrord-primary-access -n mirrord
+#   kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
+#   kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}'
+
+---
+# ServiceAccount used by the PRIMARY operator to access this cluster
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mirrord-primary-access
+  namespace: mirrord
+  labels:
+    app.kubernetes.io/name: mirrord-operator
+    app.kubernetes.io/component: multi-cluster
+    mirrord.metalbear.co/remote-access: "true"
+
+---
+# ClusterRole with permissions needed for multi-cluster operations
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mirrord-primary-access
+  labels:
+    app.kubernetes.io/name: mirrord-operator
+    app.kubernetes.io/component: multi-cluster
+rules:
+  # Session CRD management
+  - apiGroups: ["operator.metalbear.co"]
+    resources: ["mirrordclustersessions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["operator.metalbear.co"]
+    resources: ["mirrordclustersessions/status"]
+    verbs: ["get", "update", "patch"]
+  # Token refresh (TokenRequest API)
+  - apiGroups: [""]
+    resources: ["serviceaccounts/token"]
+    verbs: ["create"]
+  # Read pods for session targeting
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Read deployments/statefulsets for targeting
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
+    verbs: ["get", "list", "watch"]
+
+---
+# Bind the ClusterRole to the ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: mirrord-primary-access
+  labels:
+    app.kubernetes.io/name: mirrord-operator
+    app.kubernetes.io/component: multi-cluster
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: mirrord-primary-access
+subjects:
+  - kind: ServiceAccount
+    name: mirrord-primary-access
+    namespace: mirrord

@@ -2,31 +2,33 @@
 # Sets up a simulated multi-cluster environment using minikube
 # for testing mirrord operator's multi-cluster features
 #
-# Usage:
-#   task multicluster:setup                              # 2 clusters, primary has workloads
-#   NUM_CLUSTERS=3 task multicluster:setup               # 3 clusters, primary has workloads
-#   PRIMARY_MANAGEMENT_ONLY=true task multicluster:setup # 2 clusters, primary is management-only
+# ## Cluster Discovery
+#
+# Clusters are discovered from Kubernetes Secrets with label:
+#   mirrord.metalbear.co/remote-cluster=true
+#
+# Tokens are auto-refreshed using TokenRequest API every 45 minutes.
+#
+# ## Usage
+#
+#   task multicluster:setup:all                # 2 clusters (primary + 1 remote)
+#   NUM_CLUSTERS=3 task multicluster:setup:all # 3 clusters (primary + 2 remotes)
 #
 #   task multicluster:test:generate:traffic    # Generate traffic
 #   task multicluster:test:steal:multi-cluster # Steal from all clusters
 #
-# Variables:
-#   NUM_CLUSTERS=2|3           - Number of clusters (default: 2)
-#   PRIMARY_MANAGEMENT_ONLY    - If "true", primary only runs Envoy, no workloads (default: false)
-#   PRIMARY_CLUSTER            - Name of primary cluster (default: mirrord-primary)
-#   REMOTE_CLUSTER_1           - Name of first remote cluster (default: mirrord-remote-1)
-#   REMOTE_CLUSTER_2           - Name of second remote cluster (default: mirrord-remote-2)
+# ## Variables
 #
-# Modes:
-#   PRIMARY_MANAGEMENT_ONLY=false (default):
-#     - Primary cluster runs Envoy AND has workloads (echo-app)
-#     - Traffic comes from primary + remote clusters
-#     - default_cluster = primary
+#   NUM_CLUSTERS=2|3        - Number of clusters (default: 2)
+#   PRIMARY_CLUSTER         - Name of primary cluster (default: mirrord-primary)
+#   REMOTE_CLUSTER_1        - Name of first remote cluster (default: mirrord-remote-1)
+#   REMOTE_CLUSTER_2        - Name of second remote cluster (default: mirrord-remote-2)
 #
-#   PRIMARY_MANAGEMENT_ONLY=true:
-#     - Primary cluster ONLY runs Envoy (no workloads)
-#     - Traffic comes from remote clusters only
-#     - default_cluster = remote-1 (first remote cluster)
+# ## Architecture
+#
+#   Primary cluster: Runs Envoy (multi-cluster orchestrator), management-only
+#   Remote clusters: Run standard operators with workloads
+#   Default cluster: remote-1 (handles stateful operations like db branches)
 
 version: "3"
 
@@ -157,23 +159,45 @@ tasks:
         echo "  fs.inotify.max_user_instances=1280"
         echo "  fs.inotify.max_user_watches=655360"
 
-  kubeconfig:generate:
-    desc: Generate multi-cluster kubeconfig for operator with embedded certificates and Docker network IPs
+  # =============================================================================
+  # Secret-Based Cluster Discovery Setup
+  # =============================================================================
+
+  remote:setup:
+    desc: Setup remote cluster access (ServiceAccount + RBAC) on all remote clusters
     cmds:
       - |
-        # Update contexts to get latest ports (minikube ports can change)
-        echo "Updating minikube contexts..."
-        minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
-        minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
+        echo "Setting up remote cluster access..."
+        echo "This creates ServiceAccount + RBAC on remote clusters for primary operator access"
+        echo ""
+      - task: remote:setup:cluster
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:remote:setup:cluster CLUSTER={{.REMOTE_CLUSTER_2}}
+        fi
+      - echo "Remote cluster access setup complete"
+
+  remote:setup:cluster:
+    desc: Setup a single remote cluster for primary access
+    vars:
+      CLUSTER: '{{.CLUSTER}}'
+    cmds:
+      - |
+        echo "Setting up {{.CLUSTER}}..."
+        kubectl --context {{.CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
+        kubectl --context {{.CLUSTER}} apply -f {{.MC_CONFIG_DIR}}/remote-cluster-setup.yaml
+        echo "  ✓ ServiceAccount and RBAC created in {{.CLUSTER}}"
+
+  secrets:create:
+    desc: Create cluster credential Secrets on the primary cluster
+    cmds:
+      - |
+        echo "Creating cluster credential Secrets on primary cluster..."
+        echo ""
         
-        # Generate a flattened kubeconfig with embedded certificates
-        # This is required because the operator runs in a container and can't access
-        # local filesystem paths like /Users/.../.minikube/...
-        #
-        # IMPORTANT: We also need to replace 127.0.0.1 URLs with Docker network IPs
-        # because the operator pod can't reach the host's localhost
-        
-        echo "Connecting minikube clusters to each other's Docker networks..."
+        # Connect Docker networks so primary can reach remote clusters
+        echo "Connecting Docker networks..."
         docker network connect mirrord-remote-1 mirrord-primary 2>/dev/null || true
         docker network connect mirrord-primary mirrord-remote-1 2>/dev/null || true
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
@@ -181,96 +205,128 @@ tasks:
           docker network connect mirrord-primary mirrord-remote-2 2>/dev/null || true
         fi
         
-        echo "Getting Docker network IPs..."
-        # Get mirrord-remote-1's IP on mirrord-primary's network (reachable from primary pods)
-        REMOTE1_IP=$(docker inspect mirrord-remote-1 --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
-        # Get mirrord-primary's IP on its own network
-        PRIMARY_IP=$(docker inspect mirrord-primary --format '{{`{{.NetworkSettings.Networks}}`}}' | sed -n 's/.*mirrord-primary[^}]*IPAddress:\([0-9.]*\).*/\1/p')
-        PRIMARY_IP=$(docker inspect mirrord-primary --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
-        
-        REMOTE2_IP=""
+        # Update kubectl contexts - Docker network changes can break port mappings
+        echo "Updating kubectl contexts..."
+        minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          REMOTE2_IP=$(docker inspect mirrord-remote-2 --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
+          minikube update-context -p {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
         fi
         
-        echo "  mirrord-primary IP: $PRIMARY_IP"
-        echo "  mirrord-remote-1 IP (on primary network): $REMOTE1_IP"
+        # Create namespace
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+      - task: secrets:create:cluster
+        vars: 
+          CLUSTER: "{{.REMOTE_CLUSTER_1}}"
+          CLUSTER_NAME: "remote-1"
+          IS_DEFAULT: "true"
+      - |
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          echo "  mirrord-remote-2 IP (on primary network): $REMOTE2_IP"
+          task multicluster:secrets:create:cluster CLUSTER={{.REMOTE_CLUSTER_2}} CLUSTER_NAME=remote-2 IS_DEFAULT=false
         fi
-        
-        echo "Generating flattened kubeconfig..."
-        mkdir -p {{.MC_CONFIG_DIR}}
-        KUBECONFIG="" kubectl config view --flatten > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp
-        
-        # Get the port numbers from the original config
-        PRIMARY_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-primary")].cluster.server}' | sed 's/.*://')
-        REMOTE1_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-remote-1")].cluster.server}' | sed 's/.*://')
-        
-        echo "Replacing 127.0.0.1 URLs with hostnames (TLS certs include these names)..."
-        # Use hostnames instead of IPs - the certs have these names in SANs
-        # We'll use hostAliases to resolve them to Docker network IPs
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          REMOTE2_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-remote-2")].cluster.server}' | sed 's/.*://')
-          sed -e "s|https://127.0.0.1:$PRIMARY_PORT|https://{{.PRIMARY_CLUSTER}}:8443|g" \
-              -e "s|https://127.0.0.1:$REMOTE1_PORT|https://{{.REMOTE_CLUSTER_1}}:8443|g" \
-              -e "s|https://127.0.0.1:$REMOTE2_PORT|https://{{.REMOTE_CLUSTER_2}}:8443|g" \
-              {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
-        else
-          sed -e "s|https://127.0.0.1:$PRIMARY_PORT|https://{{.PRIMARY_CLUSTER}}:8443|g" \
-              -e "s|https://127.0.0.1:$REMOTE1_PORT|https://{{.REMOTE_CLUSTER_1}}:8443|g" \
-              {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
-        fi
-        
-        rm {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp
-        
-        # Save host aliases for operator deployment
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          cat > {{.MC_CONFIG_DIR}}/multi-cluster-host-aliases.yaml << EOF
-        hostAliases:
-        - ip: "$PRIMARY_IP"
-          hostnames:
-          - "{{.PRIMARY_CLUSTER}}"
-        - ip: "$REMOTE1_IP"
-          hostnames:
-          - "{{.REMOTE_CLUSTER_1}}"
-        - ip: "$REMOTE2_IP"
-          hostnames:
-          - "{{.REMOTE_CLUSTER_2}}"
-        EOF
-        else
-          cat > {{.MC_CONFIG_DIR}}/multi-cluster-host-aliases.yaml << EOF
-        hostAliases:
-        - ip: "$PRIMARY_IP"
-          hostnames:
-          - "{{.PRIMARY_CLUSTER}}"
-        - ip: "$REMOTE1_IP"
-          hostnames:
-          - "{{.REMOTE_CLUSTER_1}}"
-        EOF
-        fi
-        
-        echo "Multi-cluster kubeconfig generated at multicluster/multi-cluster-kubeconfig.yaml"
-        echo "Cluster URLs:"
-        grep "server:" {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
-        echo ""
-        echo "Host aliases (for operator pod):"
-        echo "  {{.PRIMARY_CLUSTER}} -> $PRIMARY_IP"
-        echo "  {{.REMOTE_CLUSTER_1}} -> $REMOTE1_IP"
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          echo "  {{.REMOTE_CLUSTER_2}} -> $REMOTE2_IP"
-        fi
-        echo ""
-        echo "Contexts available:"
-        kubectl --kubeconfig={{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml config get-contexts -o name
+      - echo ""
+      - echo "Cluster credential Secrets created. Verify with:"
+      - echo "  kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l mirrord.metalbear.co/remote-cluster=true"
 
-  kubeconfig:create:secret:
-    desc: Create kubeconfig secret in primary cluster
-    deps: [kubeconfig:generate]
+  secrets:create:cluster:
+    desc: Create a cluster credential Secret for a single remote cluster
+    vars:
+      CLUSTER: '{{.CLUSTER}}'           # minikube context (e.g., mirrord-remote-1)
+      CLUSTER_NAME: '{{.CLUSTER_NAME}}' # logical name (e.g., remote-1)
+      IS_DEFAULT: '{{.IS_DEFAULT | default "false"}}'
     cmds:
-      - kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-      - kubectl --context {{.PRIMARY_CLUSTER}} create secret generic mirrord-multi-cluster-kubeconfig --from-file=config={{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-      - echo "Kubeconfig secret created in {{.PRIMARY_CLUSTER}}"
+      - |
+        echo "Creating credential Secret for {{.CLUSTER_NAME}} (from {{.CLUSTER}})..."
+        
+        # Get the remote cluster's API server IP (on the primary's network)
+        REMOTE_IP=$(docker inspect {{.CLUSTER}} --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
+        SERVER="https://${REMOTE_IP}:8443"
+        echo "  Server: $SERVER"
+        
+        # Get CA certificate from the remote cluster's kubeconfig
+        # The kubeconfig stores it as base64-encoded. We pass this to stringData as-is.
+        # K8s will base64-encode it when storing, and decode when reading.
+        # The operator code will get the original base64-encoded value, which is what
+        # the kubeconfig builder expects for certificate_authority_data.
+        CA_DATA=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.CLUSTER}}")].cluster.certificate-authority-data}' 2>/dev/null)
+        
+        # If certificate-authority-data is empty, try reading from certificate-authority file
+        if [ -z "$CA_DATA" ]; then
+          CA_FILE=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.CLUSTER}}")].cluster.certificate-authority}' 2>/dev/null)
+          if [ -n "$CA_FILE" ] && [ -f "$CA_FILE" ]; then
+            CA_DATA=$(base64 < "$CA_FILE" | tr -d '\n')
+          fi
+        fi
+        
+        if [ -z "$CA_DATA" ]; then
+          echo "  ERROR: Failed to get CA certificate for {{.CLUSTER}}"
+          echo "  Debug: Run 'kubectl config view --raw' to check cluster config"
+          exit 1
+        fi
+        echo "  CA Data: (${#CA_DATA} bytes, base64 encoded)"
+        
+        # Get a token for the mirrord-primary-access ServiceAccount
+        TOKEN=$(kubectl --context {{.CLUSTER}} create token mirrord-primary-access -n mirrord --duration=1h 2>/dev/null || echo "")
+        if [ -z "$TOKEN" ]; then
+          echo "  ERROR: Failed to get token. Make sure remote:setup was run first."
+          echo "  Debug: Run 'kubectl --context {{.CLUSTER}} get sa -n mirrord' to check ServiceAccount"
+          exit 1
+        fi
+        echo "  Token: (${#TOKEN} chars)"
+        
+        # Create the Secret on the primary cluster
+        # caData is already base64-encoded from kubeconfig. We use stringData so that:
+        # 1. K8s base64-encodes it when storing
+        # 2. When the operator reads it, K8s decodes it, giving back the original base64 string
+        # 3. The kubeconfig builder expects base64-encoded CA data
+        cat <<EOF | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: mirrord-cluster-{{.CLUSTER_NAME}}
+          namespace: mirrord
+          labels:
+            app.kubernetes.io/name: mirrord-operator
+            app.kubernetes.io/component: multi-cluster
+            mirrord.metalbear.co/remote-cluster: "true"
+        type: Opaque
+        stringData:
+          name: "{{.CLUSTER_NAME}}"
+          server: "$SERVER"
+          caData: "$CA_DATA"
+          bearerToken: "$TOKEN"
+          isDefault: "{{.IS_DEFAULT}}"
+        EOF
+        
+        echo "  ✓ Secret mirrord-cluster-{{.CLUSTER_NAME}} created"
+
+  secrets:delete:
+    desc: Delete all cluster credential Secrets from primary cluster
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete secrets -n mirrord -l mirrord.metalbear.co/remote-cluster=true --ignore-not-found=true
+      - echo "Cluster credential Secrets deleted"
+
+  secrets:list:
+    desc: List all cluster credential Secrets
+    cmds:
+      - |
+        echo "=== Cluster Credential Secrets ==="
+        kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l mirrord.metalbear.co/remote-cluster=true
+        echo ""
+        echo "Details:"
+        for secret in $(kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l mirrord.metalbear.co/remote-cluster=true -o name 2>/dev/null); do
+          NAME=$(kubectl --context {{.PRIMARY_CLUSTER}} get $secret -n mirrord -o jsonpath='{.data.name}' | base64 -d)
+          SERVER=$(kubectl --context {{.PRIMARY_CLUSTER}} get $secret -n mirrord -o jsonpath='{.data.server}' | base64 -d)
+          IS_DEFAULT=$(kubectl --context {{.PRIMARY_CLUSTER}} get $secret -n mirrord -o jsonpath='{.data.isDefault}' | base64 -d)
+          echo "  $NAME: $SERVER (isDefault: $IS_DEFAULT)"
+        done
+
+  secrets:refresh:
+    desc: Refresh tokens in cluster credential Secrets (run before they expire)
+    cmds:
+      - echo "Refreshing tokens in cluster credential Secrets..."
+      - task: secrets:create
+      - echo "Tokens refreshed"
 
   operator:load:images:
     desc: Load operator image to all clusters (removes old image first)
@@ -411,7 +467,7 @@ tasks:
       - echo "All operators upgraded and restarted!"
 
   operator:install:remote:
-    desc: Install operator in remote clusters (without multi-cluster)
+    desc: Install operator in remote clusters (standard operator, not primary)
     cmds:
       - |
         CLUSTERS="{{.REMOTE_CLUSTER_1}}"
@@ -433,19 +489,20 @@ tasks:
             -f {{.ROOT_DIR}}/operator-values.yaml \
             --set operator.image=mirrord-operator \
             --set operator.imageTag=custom \
-            --set extraEnv.MIRRORD_MULTI_CLUSTER_ENABLED=true \
-            --set extraEnv.MIRRORD_IS_PRIMARY_CLUSTER=false \
             --wait
           echo "Operator installed in $cluster"
         done
 
   operator:install:primary:
-    desc: Install operator in primary cluster with multi-cluster enabled
-    deps: [kubeconfig:create:secret]
+    desc: Install operator in primary cluster with multi-cluster enabled (Secret-based discovery)
     cmds:
+      # Run setup sequentially (deps run in parallel which breaks secrets:create)
+      - task: remote:setup
+      - task: secrets:create
       - |
         echo "Installing operator in {{.PRIMARY_CLUSTER}} with multi-cluster..."
         echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}"
+        echo "  Discovery: Secret-based"
         
         # Get Docker network IPs for hostAliases
         PRIMARY_IP=$(docker inspect {{.PRIMARY_CLUSTER}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
@@ -473,6 +530,7 @@ tasks:
           -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
         
         # Build helm command with dynamic hostAliases
+        # No kubeconfig needed - clusters discovered from Secrets
         HELM_ARGS=(
           upgrade --install mirrord-operator {{.CHARTS_DIR}}
           --kube-context {{.PRIMARY_CLUSTER}}
@@ -480,8 +538,6 @@ tasks:
           -f "$VALUES_FILE"
           --set operator.image=mirrord-operator
           --set operator.imageTag=custom
-          --set operator.multiCluster.kubeconfigSecret=mirrord-multi-cluster-kubeconfig
-          --set operator.multiCluster.kubeconfigPath=/etc/kubeconfig/config
           --set "operator.hostAliases[0].ip=$PRIMARY_IP"
           --set "operator.hostAliases[0].hostnames[0]={{.PRIMARY_CLUSTER}}"
           --set "operator.hostAliases[1].ip=$REMOTE1_IP"
@@ -498,7 +554,11 @@ tasks:
         HELM_ARGS+=(--wait)
 
         helm "${HELM_ARGS[@]}"
+        echo ""
         echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster ({{.NUM_CLUSTERS}} clusters)"
+        echo ""
+        echo "Cluster credential Secrets:"
+        kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l mirrord.metalbear.co/remote-cluster=true --no-headers
 
   operator:install:all:
     desc: Install operator in all clusters
@@ -667,10 +727,14 @@ tasks:
       - echo "Databases also deployed! Use 'task multicluster:databases:status' to check"
 
   setup:all:
-    desc: Complete multi-cluster setup from scratch
+    desc: Complete multi-cluster setup from scratch (Secret-based discovery)
     cmds:
+      - |
+        echo "=== Multi-Cluster Setup ==="
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}"
+        echo "  Discovery: Secret-based"
+        echo ""
       - task: clusters:create
-      - task: kubeconfig:generate
       - echo "Waiting for clusters to be ready..."
       - sleep 5
       - task: test:verify:clusters
@@ -687,16 +751,21 @@ tasks:
       - echo "Setting kubectl context to primary cluster ({{.PRIMARY_CLUSTER}})..."
       - kubectl config use-context {{.PRIMARY_CLUSTER}}
       - echo ""
-      - echo "Multi-cluster environment setup complete!"
+      - echo "=== Multi-Cluster Setup Complete ==="
+      - echo ""
+      - echo "Cluster Credential Secrets:"
+      - kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l mirrord.metalbear.co/remote-cluster=true --no-headers
       - echo ""
       - echo "To test multi-cluster sessions:"
       - echo "  task multicluster:test:crds"
+      - echo ""
+      - echo "To refresh tokens (if they expire):"
+      - echo "  task multicluster:secrets:refresh"
 
   teardown:all:
     desc: Teardown entire multi-cluster environment
     cmds:
       - task: clusters:delete
-      - rm -f {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
       - echo "Multi-cluster environment torn down"
 
   status:

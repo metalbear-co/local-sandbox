@@ -1,4 +1,8 @@
 # Operator values for PRIMARY cluster - 3 CLUSTERS (primary + 2 remotes)
+#
+# Cluster discovery: Secret-based
+# Clusters are discovered from Secrets with label mirrord.metalbear.co/remote-cluster=true
+#
 operator:
   image: mirrord-operator
   sqsSplitting: true
@@ -11,16 +15,14 @@ operator:
   logLevel: "debug"
   multiCluster:
     enabled: true
-    remoteSessionTimeoutSecs: 60
-  extraEnv:
-    MIRRORD_MULTI_CLUSTER_ENABLED: "true"
-    MIRRORD_IS_PRIMARY_CLUSTER: "true"
-    MIRRORD_PRIMARY_CLUSTER: "primary"
-    # When PRIMARY_MANAGEMENT_ONLY=true, default cluster must be a remote cluster
-    # (primary has no agent, so stateful ops go to remote-1)
-    MIRRORD_DEFAULT_CLUSTER: "remote-1"
-    MIRRORD_MULTI_CLUSTER_CONTEXTS: '{"primary":"mirrord-primary","remote-1":"mirrord-remote-1","remote-2":"mirrord-remote-2"}'
-    PRIMARY_MANAGEMENT_ONLY: "true"
+    primaryCluster: "primary"
+    defaultCluster: "remote-1"  # Default cluster for stateful ops
+    primaryIsManagementOnly: true  # Primary only runs Envoy
+    remoteSessionTimeoutSecs: 300
+    tokenRefreshIntervalSecs: 2700  # 45 minutes
+    sessionTtlSecs: 60
+    # Cluster credentials are created separately via task multicluster:secrets:create
+    # Not in values.yaml because tokens are generated dynamically
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false

@@ -60,7 +60,7 @@ tasks:
   build:operator:
     desc: Build operator image
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false -f operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:nocache:
@@ -68,7 +68,7 @@ tasks:
     cmds:
       - echo "Clearing sccache and target cache mounts..."
       - docker builder prune --filter type=exec.cachemount --force || true
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:gcs:
@@ -86,7 +86,7 @@ tasks:
         msg: "GCS_BUCKET required"
     cmds:
       - |
-        cd {{.OPERATOR_DIR}}/.. && docker build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
+        cd {{.OPERATOR_DIR}}/.. && docker build --provenance=false -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
           --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
           --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
@@ -113,7 +113,7 @@ tasks:
         msg: "Custom issuer file not found"
     cmds:
       - |
-        cd {{.OPERATOR_DIR}}/.. && docker build -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
+        cd {{.OPERATOR_DIR}}/.. && docker build --provenance=false -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
           --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.CUSTOM_ISSUER_FILE}})" \
           --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
@@ -337,6 +337,8 @@ tasks:
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
       - task: license:create:secret
+      # Force pod restart to pick up the new image
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator
 
   operator:install:nocache:
@@ -345,6 +347,8 @@ tasks:
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
       - task: license:create:secret
+      # Force pod restart to pick up the new image
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator
 
   operator:install:nobuild:
@@ -354,6 +358,8 @@ tasks:
       - task: operator:image:load
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
       - task: license:create:secret
+      # Force pod restart to pick up the new image
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator
 
   operator:install:new:license:
@@ -395,6 +401,8 @@ tasks:
     desc: Update helm chart only
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      # Force pod restart to pick up any changes
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator
 
   test:mysql:
