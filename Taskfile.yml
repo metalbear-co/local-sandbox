@@ -726,7 +726,6 @@ tasks:
             sleep 2
           done
         done
-      - task: multicluster:kubeconfig:generate
       - task: multicluster:test:verify:clusters
       - echo "Loading images to minikube clusters..."
       - task: multicluster:operator:load:images
@@ -799,7 +798,6 @@ tasks:
             sleep 2
           done
         done
-      - task: multicluster:kubeconfig:generate
       - task: multicluster:test:verify:clusters
       - echo "Loading images to minikube clusters..."
       - task: multicluster:operator:load:images

@@ -1,0 +1,63 @@
+# Grafana Helm Values (2026)
+# Chart: grafana/grafana
+# Docs: https://grafana.com/docs/grafana/latest/
+#
+# Modern Grafana setup for log exploration
+
+# Admin credentials
+adminUser: admin
+adminPassword: admin
+
+# Service - ClusterIP (use port-forward)
+service:
+  type: ClusterIP
+
+# Resources
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Datasources - Loki for logs (direct connection, no gateway)
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: Loki
+        type: loki
+        access: proxy
+        url: http://loki:3100
+        isDefault: true
+        jsonData:
+          maxLines: 5000
+
+# Grafana configuration
+grafana.ini:
+  analytics:
+    check_for_updates: false
+    check_for_plugin_updates: false
+  log:
+    mode: console
+    level: warn
+  # Enable explore
+  explore:
+    enabled: true
+  # Disable unnecessary features
+  alerting:
+    enabled: false
+  unified_alerting:
+    enabled: false
+
+# Disable persistence for dev
+persistence:
+  enabled: false
+
+# Disable sidecar (we don't need dynamic dashboard loading)
+sidecar:
+  dashboards:
+    enabled: false
+  datasources:
+    enabled: false

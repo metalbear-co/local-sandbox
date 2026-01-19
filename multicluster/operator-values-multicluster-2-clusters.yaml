@@ -16,8 +16,8 @@ operator:
   multiCluster:
     enabled: true
     primaryCluster: "primary"
-    defaultCluster: "remote-1"  # Default cluster for stateful ops
-    primaryIsManagementOnly: true  # Primary only runs Envoy
+    defaultCluster: "primary"  # Default cluster for stateful ops
+    primaryIsManagementOnly: false  # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700  # 45 minutes
     sessionTtlSecs: 60

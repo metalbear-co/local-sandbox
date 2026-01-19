@@ -6,7 +6,7 @@
   "feature": {
     "network": {
       "incoming": {
-        "mode": "mirror",
+        "mode": "steal",
         "http_filter": {
           "header_filter": "X-My-Header: filtered-data$"
         }

@@ -32,11 +32,11 @@ metadata:
     app.kubernetes.io/name: mirrord-operator
     app.kubernetes.io/component: multi-cluster
 rules:
-  # Session CRD management
-  - apiGroups: ["operator.metalbear.co"]
+  # Session CRD management (MirrordClusterSession uses mirrord.metalbear.co API group)
+  - apiGroups: ["mirrord.metalbear.co"]
     resources: ["mirrordclustersessions"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-  - apiGroups: ["operator.metalbear.co"]
+  - apiGroups: ["mirrord.metalbear.co"]
     resources: ["mirrordclustersessions/status"]
     verbs: ["get", "update", "patch"]
   # Token refresh (TokenRequest API)
@@ -51,6 +51,13 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets", "replicasets", "daemonsets"]
     verbs: ["get", "list", "watch"]
+  # Operator API resources for multi-cluster agent communication
+  - apiGroups: ["operator.metalbear.co"]
+    resources: ["targets", "copytargets", "targets/port-locks"]
+    verbs: ["get", "list", "proxy"]
+  - apiGroups: ["operator.metalbear.co"]
+    resources: ["copytargets"]
+    verbs: ["create"]
 
 ---
 # Bind the ClusterRole to the ServiceAccount
