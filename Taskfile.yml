@@ -865,13 +865,13 @@ tasks:
     cmds:
       - |
         echo "Starting mirrord with copy_target..."
-        {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/sqs-localstack/copy-target-config.json -- sleep 10
+        {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/overlays/sqs-localstack/copy-target-config.json -- sleep 10
 
   test:copy:target:run:long:
     desc: Create a long-running copy-target pod (10 minutes)
     cmds:
       - |
-        {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/sqs-localstack/copy-target-config.json -- sleep 600
+        {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/overlays/sqs-localstack/copy-target-config.json -- sleep 600
 
   test:tls:certs:
     desc: Test TLS certificate configuration
