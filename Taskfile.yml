@@ -252,11 +252,33 @@ tasks:
       - helm uninstall loki -n loki || true
       - kubectl delete namespace loki --ignore-not-found=true
 
+  infra:tempo:
+    desc: Install Tempo
+    cmds:
+      - helm repo add grafana https://grafana.github.io/helm-charts || true
+      - helm repo update grafana
+      - kubectl create namespace loki --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        helm upgrade --install tempo grafana/tempo -f k8s/tempo/tempo-values.yaml \
+          --namespace loki \
+          --wait --timeout=300s
+      - |
+        echo ""
+        echo "=== Tempo Installed ==="
+        echo ""
+
+  infra:tempo:uninstall:
+    desc: Uninstall Tempo
+    cmds:
+      - helm uninstall tempo -n loki || true
+      - kubectl delete namespace tempo --ignore-not-found=true
+
   infra:all:
     desc: Install all infrastructure
     cmds:
       - task: infra:argo:rollouts
       - task: infra:loki
+      - task: infra:tempo
 
   infra:status:
     desc: Check infrastructure status
@@ -271,6 +293,9 @@ tasks:
       - |
         echo -n "Loki: "
         kubectl get deployment loki -n loki >/dev/null 2>&1 && echo "Installed" || echo "Not installed"
+      - |
+        echo -n "Tempo: "
+        kubectl get deployment tempo -n tempo >/dev/null 2>&1 && echo "Installed" || echo "Not installed"
       - |
         echo -n "Grafana: "
         kubectl get deployment loki-grafana -n loki >/dev/null 2>&1 && echo "Installed" || echo "Not installed"
