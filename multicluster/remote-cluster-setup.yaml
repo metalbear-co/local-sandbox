@@ -58,6 +58,10 @@ rules:
   - apiGroups: ["operator.metalbear.co"]
     resources: ["copytargets"]
     verbs: ["create"]
+  # MirrordOperator CRD for health checks (primary checks remote operator status)
+  - apiGroups: ["operator.metalbear.co"]
+    resources: ["mirrordoperators"]
+    verbs: ["get"]
 
 ---
 # Bind the ClusterRole to the ServiceAccount

@@ -13,11 +13,19 @@ operator:
   metrics: true 
   jsonLog: true
   logLevel: "debug,operator_envoy=debug,operator_controller=debug"
+  # Enable hostNetwork for local multi-cluster testing (allows pod to reach Docker network IPs)
+  hostNetwork: true
+  # AWS credentials for LocalStack (SQS splitting tests)
+  extraEnv:
+    AWS_ENDPOINT_URL: "http://localstack.localstack.svc.cluster.local:4566"
+    AWS_ACCESS_KEY_ID: "test"
+    AWS_SECRET_ACCESS_KEY: "test"
+    AWS_REGION: "us-east-1"
   multiCluster:
     enabled: true
     primaryCluster: "primary"
-    defaultCluster: "primary"  # Default cluster for stateful ops
-    primaryIsManagementOnly: false  # Primary only runs Envoy
+    defaultCluster: "remote-1"  # Default cluster for stateful ops (must be a workload cluster)
+    primaryIsManagementOnly: true  # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700  # 45 minutes
     sessionTtlSecs: 60

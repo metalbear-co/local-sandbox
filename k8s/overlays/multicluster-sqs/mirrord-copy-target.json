@@ -1,0 +1,23 @@
+{
+  "target": {
+    "path": "deployment/sqs-consumer",
+    "namespace": "test-multicluster"
+  },
+  "operator": true,
+  "feature": {
+    "copy_target": {
+      "enabled": true,
+      "scale_down": false
+    },
+    "split_queues": {
+      "test-queue": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "tenant": "^Avi\\."
+        }
+      }
+    },
+    "env": true,
+    "fs": "local"
+  }
+}
