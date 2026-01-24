@@ -9,7 +9,7 @@
       "test-queue": {
         "queue_type": "SQS",
         "message_filter": {
-          "tenant": "^Avi\\."
+          "type": "^premium$"
         }
       }
     },

@@ -59,9 +59,12 @@ vars:
   MC_CONFIG_DIR: '{{.ROOT_DIR}}/multicluster'
   
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
+  AGENT_IMAGE: '{{.AGENT_IMAGE | default "mirrord-agent:custom"}}'
   ECHO_APP_IMAGE: '{{.ECHO_APP_IMAGE | default "echo-app:latest"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  # Path to local mirrord repo for building custom agent
+  MIRRORD_REPO: '{{.MIRRORD_REPO | default (printf "%s/../mirrord" .ROOT_DIR)}}'
 
 tasks:
   clusters:create:
@@ -593,6 +596,7 @@ tasks:
             -f {{.ROOT_DIR}}/operator-values.yaml \
             --set operator.image=mirrord-operator \
             --set operator.imageTag=custom \
+            --set agent.image={{.AGENT_IMAGE}} \
             --wait
           echo "Operator installed in $cluster"
         done
@@ -642,6 +646,7 @@ tasks:
           -f "$VALUES_FILE"
           --set operator.image=mirrord-operator
           --set operator.imageTag=custom
+          --set agent.image={{.AGENT_IMAGE}}
           --set "operator.hostAliases[0].ip=$PRIMARY_IP"
           --set "operator.hostAliases[0].hostnames[0]={{.PRIMARY_CLUSTER}}"
           --set "operator.hostAliases[1].ip=$REMOTE1_IP"
@@ -669,6 +674,68 @@ tasks:
     cmds:
       - task: operator:install:remote
       - task: operator:install:primary
+
+  agent:build:
+    desc: Build custom mirrord-agent image from local mirrord repo
+    cmds:
+      - |
+        echo "=== Building custom mirrord-agent image ==="
+        echo "Source: {{.MIRRORD_REPO}}"
+        echo "Image: {{.AGENT_IMAGE}}"
+        echo ""
+        
+        if [ ! -d "{{.MIRRORD_REPO}}/mirrord/agent" ]; then
+          echo "ERROR: mirrord repo not found at {{.MIRRORD_REPO}}"
+          echo "Set MIRRORD_REPO to point to your local mirrord checkout"
+          exit 1
+        fi
+        
+        cd {{.MIRRORD_REPO}}
+        docker build -t {{.AGENT_IMAGE}} -f mirrord/agent/Dockerfile .
+      - echo "Agent image built {{.AGENT_IMAGE}}"
+
+  agent:load:
+    desc: Load custom agent image to all clusters
+    cmds:
+      - echo "Removing old agent images from clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+        fi
+      - echo "Loading agent image to all clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} image load {{.AGENT_IMAGE}}
+      - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.AGENT_IMAGE}}
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.AGENT_IMAGE}}
+        fi
+      - echo "Agent image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+
+  agent:rebuild:
+    desc: Build and load custom agent image to all clusters
+    cmds:
+      - task: agent:build
+      - task: agent:load
+      - echo ""
+      - echo "=== Agent image updated ==="
+      - echo "Now restart operators to use new agent:"
+      - echo "  task multicluster:operator:upgrade"
+
+  rebuild:all:
+    desc: Rebuild and reload both operator and agent (use after protocol changes)
+    cmds:
+      - |
+        echo "=== Rebuilding Operator and Agent ==="
+        echo "This is required after protocol changes (e.g., adding hostname field)"
+        echo ""
+      - task: agent:build
+      - task: operator:rebuild
+      - task: agent:load
+      - echo ""
+      - echo "=== All components updated ==="
+      - echo "Both operator and agent now use the latest code"
 
   apps:deploy:
     desc: Deploy test applications to all clusters
@@ -856,6 +923,31 @@ tasks:
       - echo ""
       - echo "SQS setup complete! Use 'task multicluster:sqs:status' to check"
 
+  setup:all:with-sqs:single:clean:
+    desc: Clean setup with single shared SQS (matches production - all clusters share one SQS)
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-sqs:single
+      - echo ""
+      - echo "=== Single SQS Setup Complete ==="
+      - echo ""
+      - echo "All clusters share one LocalStack on the default cluster."
+      - echo "This matches production where all clusters share AWS SQS."
+      - echo ""
+      - echo "To test SQS splitting:"
+      - 'echo "  Terminal 1: task multicluster:sqs:send:messages:single"'
+      - 'echo "  Terminal 2: task multicluster:test:sqs:split:multi-cluster"'
+
+  setup:all:with-sqs:single:
+    desc: Complete setup with single shared SQS (matches production)
+    cmds:
+      - task: setup:all
+      - task: sqs:setup:single
+      - echo ""
+      - echo "Single-SQS setup complete! All clusters share one LocalStack."
+      - echo "Use 'task multicluster:sqs:status' to check"
+
   setup:all:with-copy-target:clean:
     desc: Clean setup with echo-apps for copy_target tests
     cmds:
@@ -935,10 +1027,28 @@ tasks:
       - echo ""
       - echo "Operator updated!"
 
+  update:agent:
+    desc: Rebuild and reload agent in all clusters - no clean
+    cmds:
+      - echo "Rebuilding and reloading agent..."
+      - task: agent:rebuild
+      - task: operator:upgrade
+      - echo ""
+      - echo "Agent updated and operators restarted to use new agent!"
+
+  update:protocol:
+    desc: Rebuild both operator and agent (required after protocol changes)
+    cmds:
+      - echo "Rebuilding operator and agent after protocol changes..."
+      - task: rebuild:all
+      - echo ""
+      - echo "Protocol update complete!"
+
   update:all:
-    desc: Refresh all resources (operator, databases, SQS, echo-apps) - no clean
+    desc: Refresh all resources (operator, agent, databases, SQS, echo-apps) - no clean
     cmds:
       - echo "Refreshing all resources..."
+      - task: agent:rebuild
       - task: operator:rebuild
       - task: databases:deploy
       - task: sqs:setup
@@ -958,6 +1068,8 @@ tasks:
       - echo "Waiting for clusters to be ready..."
       - sleep 5
       - task: test:verify:clusters
+      - task: agent:build
+      - task: agent:load
       - task: operator:load:images
       - task: operator:install:all
       - echo "Waiting for operators to be ready..."
@@ -2071,6 +2183,504 @@ tasks:
       - task: sqs:deploy:queue-registry
       - echo ""
       - echo "SQS setup complete. Run 'task multicluster:sqs:send:messages' to send test messages."
+
+  sqs:setup:single:
+    desc: SQS setup with single LocalStack on default cluster (matches production)
+    cmds:
+      - task: sqs:deploy:localstack:single
+      - task: sqs:wait:localstack:single
+      - task: sqs:create:queue:single
+      - task: sqs:deploy:consumer:single
+      - task: sqs:deploy:queue-registry
+      - echo ""
+      - echo "Single-SQS setup complete!"
+      - echo "All clusters now share one LocalStack on {{.REMOTE_CLUSTER_1}}"
+      - echo ""
+      - 'echo "To test: task multicluster:sqs:send:messages:single"'
+
+  sqs:deploy:localstack:single:
+    desc: Deploy LocalStack only to default cluster with NodePort (shared SQS)
+    cmds:
+      - |
+        echo "Deploying LocalStack to default cluster only ({{.REMOTE_CLUSTER_1}})..."
+        echo "This matches production where all clusters share one AWS SQS"
+        echo ""
+        
+        # Connect all minikube clusters to the same Docker network
+        # This allows cross-cluster communication via NodePort
+        echo "Connecting Docker networks for cross-cluster access..."
+        docker network connect {{.REMOTE_CLUSTER_1}} {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          docker network connect {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+        
+        # Deploy only to remote-1 (default cluster)
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        
+        # Create ConfigMap for init scripts
+        kubectl --context {{.REMOTE_CLUSTER_1}} create configmap localstack-init \
+          --from-file=init.sh={{.K8S_DIR}}/overlays/multicluster-sqs/init.sh \
+          -n localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        
+        # Deploy with NodePort service
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/localstack-single.yaml -n localstack
+        
+        echo ""
+        echo "LocalStack deployed to {{.REMOTE_CLUSTER_1}} with NodePort 31566"
+
+  sqs:wait:localstack:single:
+    desc: Wait for single LocalStack to be ready
+    cmds:
+      - |
+        echo "Waiting for LocalStack on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/localstack -n localstack --timeout=120s
+        echo "LocalStack is ready"
+
+  sqs:create:queue:single:
+    desc: Create test queue on single LocalStack
+    cmds:
+      - |
+        echo "Creating test queue on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs create-queue --queue-name test-queue 2>/dev/null || echo "Queue may already exist"
+        
+        echo "Queues:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues
+
+  sqs:deploy:consumer:single:
+    desc: Deploy SQS consumer to all clusters, all pointing to single LocalStack
+    cmds:
+      - |
+        echo "Building SQS consumer..."
+        cd {{.APPS_DIR}}/sqs-consumer
+        docker build -t sqs-consumer:latest . 2>/dev/null || echo "Build may have failed, continuing..."
+        
+        # Get the minikube IP of the default cluster (where LocalStack runs)
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        echo ""
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo ""
+        
+        echo "Loading image to clusters..."
+        minikube -p {{.REMOTE_CLUSTER_1}} image load sqs-consumer:latest 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load sqs-consumer:latest 2>/dev/null || true
+        fi
+        
+        # Deploy to remote-1 (default cluster)
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-1"
+        EOF
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-2"
+        EOF
+        fi
+        
+        echo ""
+        echo "SQS consumers deployed - all pointing to $LOCALSTACK_URL"
+
+  sqs:send:messages:single:
+    desc: Send test messages to single shared LocalStack from ALL clusters
+    cmds:
+      - |
+        # Get the LocalStack URL that all clusters use
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        QUEUE_URL="${LOCALSTACK_URL}/000000000000/test-queue"
+        
+        echo "Sending test messages to shared LocalStack..."
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo "Queue URL: $QUEUE_URL"
+        echo ""
+        echo "Messages will be sent FROM each cluster's consumer pod"
+        echo "This verifies each cluster can reach the shared SQS"
+        echo "Press Ctrl+C to stop"
+        echo ""
+        
+        i=1
+        while true; do
+          echo "--- Round $i ---"
+          
+          # Send from cluster 1's consumer pod (proves cluster 1 can reach shared SQS)
+          echo -n "From REMOTE-1 consumer: "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/sqs-consumer -- \
+            sh -c "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws sqs send-message \
+              --endpoint-url $LOCALSTACK_URL \
+              --queue-url $QUEUE_URL \
+              --message-body '{\"msg\": \"test-$i\", \"cluster\": \"remote-1\", \"time\": \"$(date -Iseconds)\"}' \
+              --message-attributes '{\"tenant\":{\"DataType\":\"String\",\"StringValue\":\"Avi.test\"}}' \
+              --region us-east-1 2>/dev/null | jq -r '.MessageId'" || echo "failed"
+          
+          # Send from cluster 2's consumer pod (proves cluster 2 can reach shared SQS)
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            echo -n "From REMOTE-2 consumer: "
+            kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/sqs-consumer -- \
+              sh -c "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws sqs send-message \
+                --endpoint-url $LOCALSTACK_URL \
+                --queue-url $QUEUE_URL \
+                --message-body '{\"msg\": \"test-$i\", \"cluster\": \"remote-2\", \"time\": \"$(date -Iseconds)\"}' \
+                --message-attributes '{\"tenant\":{\"DataType\":\"String\",\"StringValue\":\"Avi.test\"}}' \
+                --region us-east-1 2>/dev/null | jq -r '.MessageId'" || echo "failed"
+          fi
+          
+          echo ""
+          i=$((i + 1))
+          sleep 3
+        done
+
+  sqs:deploy:producer:single:
+    desc: Deploy SQS producer to all clusters (sends to shared LocalStack)
+    cmds:
+      - |
+        echo "Building SQS producer..."
+        cd {{.APPS_DIR}}/sqs-producer
+        docker build -t sqs-producer:latest . 2>/dev/null || { echo "Build failed"; exit 1; }
+        
+        # Get the LocalStack URL
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo ""
+        
+        echo "Loading image to clusters..."
+        minikube -p {{.REMOTE_CLUSTER_1}} image load sqs-producer:latest 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load sqs-producer:latest 2>/dev/null || true
+        fi
+        
+        # Deploy to remote-1
+        echo "Deploying producer to {{.REMOTE_CLUSTER_1}}..."
+        cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-producer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-producer
+          template:
+            metadata:
+              labels:
+                app: sqs-producer
+            spec:
+              containers:
+              - name: sqs-producer
+                image: sqs-producer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-1"
+                - name: SEND_INTERVAL
+                  value: "5"
+        EOF
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying producer to {{.REMOTE_CLUSTER_2}}..."
+          cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-producer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-producer
+          template:
+            metadata:
+              labels:
+                app: sqs-producer
+            spec:
+              containers:
+              - name: sqs-producer
+                image: sqs-producer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-2"
+                - name: SEND_INTERVAL
+                  value: "5"
+        EOF
+        fi
+        
+        echo ""
+        echo "Producers deployed! They will send messages every 5 seconds."
+        echo "Check logs: task multicluster:sqs:logs:producer"
+
+  sqs:logs:producer:
+    desc: Show SQS producer logs from all clusters
+    cmds:
+      - |
+        echo "=== Producer Logs ==="
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} deploy/sqs-producer --tail=10 2>/dev/null || echo "No producer in remote-1"
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} deploy/sqs-producer --tail=10 2>/dev/null || echo "No producer in remote-2"
+        fi
+
+  sqs:delete:producer:
+    desc: Delete SQS producer from all clusters
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete deploy/sqs-producer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete deploy/sqs-producer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+        fi
+      - echo "Producers deleted"
+
+  # ============================================================================
+  # LOCAL PRODUCER TESTING
+  # ============================================================================
+  
+  sqs:send:
+    desc: "Send messages: task sqs:send FILTERED=5 UNFILTERED=5"
+    vars:
+      FILTERED: '{{.FILTERED | default "5"}}'
+      UNFILTERED: '{{.UNFILTERED | default "5"}}'
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        
+        cd apps/sqs-producer && \
+          QUEUE_NAME=test-queue \
+          SQS_ENDPOINT=$LOCALSTACK_URL \
+          go run main.go {{.FILTERED}} {{.UNFILTERED}}
+
+  sqs:run:producer:local:
+    desc: Run SQS producer continuously (sends random messages)
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        
+        echo "Sending continuous random messages..."
+        echo "Queue: test-queue"
+        echo "Endpoint: $LOCALSTACK_URL"
+        echo ""
+        
+        cd apps/sqs-producer && \
+          QUEUE_NAME=test-queue \
+          SQS_ENDPOINT=$LOCALSTACK_URL \
+          SEND_INTERVAL=${SEND_INTERVAL:-2} \
+          go run main.go 0 0  # Will fall back to continuous mode if we add it back
+
+  sqs:logs:consumer:
+    desc: Show SQS consumer logs from all clusters (follow mode)
+    cmds:
+      - |
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           SQS CONSUMER LOGS (all clusters)                     ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Use Ctrl+C to stop watching logs"
+        echo ""
+        
+        # Show recent logs and follow
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=50 &
+        PID1=$!
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=50 &
+          PID2=$!
+        fi
+        
+        # Wait for Ctrl+C
+        trap "kill $PID1 2>/dev/null; kill $PID2 2>/dev/null; exit 0" INT
+        wait
+
+  sqs:logs:consumer:cluster1:
+    desc: Show SQS consumer logs from cluster 1 only
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=100
+
+  sqs:logs:consumer:cluster2:
+    desc: Show SQS consumer logs from cluster 2 only
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=100
+
+  sqs:test:full:
+    desc: "Complete SQS test: Setup + run local producer (use in separate terminal)"
+    cmds:
+      - |
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           COMPLETE SQS SPLITTING TEST                          ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "This test requires TWO terminals:"
+        echo ""
+        echo "Terminal 1 (this one): Run the producer"
+        echo "Terminal 2: Watch consumer logs with:"
+        echo "  task multicluster:sqs:logs:consumer"
+        echo ""
+        echo "Or test with mirrord:"
+        echo "  1. Run local producer (this terminal)"
+        echo "  2. Run your local app with mirrord and SQS filter"
+        echo ""
+        echo "Press Enter to start the producer, or Ctrl+C to cancel..."
+        read
+        
+        task multicluster:sqs:run:producer:local
+
+  sqs:queue:stats:
+    desc: Show queue statistics (message counts)
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           SQS QUEUE STATISTICS                                 ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        
+        echo "Queues:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues --output json | jq -r '.QueueUrls[]?' 2>/dev/null || echo "  (none found)"
+        
+        echo ""
+        echo "test-queue stats:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs get-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --output json 2>/dev/null | jq -r '.Attributes' || echo "  (queue not found)"
+
+  sqs:queue:purge:
+    desc: Purge all messages from test-queue
+    cmds:
+      - |
+        echo "Purging test-queue..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs purge-queue \
+            --queue-url http://localhost:4566/000000000000/test-queue 2>/dev/null || echo "Queue not found or already empty"
+        echo "Done!"
+
+  sqs:verify:connectivity:
+    desc: Verify all clusters can reach the shared LocalStack
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        
+        echo "=== Verifying Shared LocalStack Connectivity ==="
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo ""
+        
+        echo "--- Testing from {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/sqs-consumer -- \
+          sh -c "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws sqs list-queues \
+            --endpoint-url $LOCALSTACK_URL --region us-east-1 2>&1" && echo "✓ REMOTE-1 can reach LocalStack" || echo "✗ REMOTE-1 FAILED"
+        echo ""
+        
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "--- Testing from {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/sqs-consumer -- \
+            sh -c "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws sqs list-queues \
+              --endpoint-url $LOCALSTACK_URL --region us-east-1 2>&1" && echo "✓ REMOTE-2 can reach LocalStack" || echo "✗ REMOTE-2 FAILED"
+          echo ""
+        fi
+        
+        echo "--- Queue contents ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs get-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attribute-names ApproximateNumberOfMessages 2>/dev/null || echo "Could not get queue attributes"
 
   sqs:deploy:queue-registry:
     desc: Deploy MirrordWorkloadQueueRegistry to clusters (respects PRIMARY_MANAGEMENT_ONLY)
