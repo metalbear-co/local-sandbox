@@ -207,3 +207,254 @@ tasks:
         envsubst < {{.ROOT_DIR}}/k8s/overlays/sqs-aws/operator-patch.yaml | \
           kubectl patch deployment mirrord-operator -n mirrord --patch-file /dev/stdin --type=strategic || true
       - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s || true
+
+  # =============================================================================
+  # SQS Split Testing Tasks (for investigating stale filter issues)
+  # =============================================================================
+
+  test:split:
+    desc: "Test SQS splitting - start local consumer, send filtered messages"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
+    cmds:
+      - echo "=== SQS Split Test (bearkube) ==="
+      - echo ""
+      - echo "This starts a local consumer with SQS filter and tests message routing"
+      - echo ""
+      - |
+        # Build the consumer
+        cd {{.ROOT_DIR}}/apps/sqs-consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+        
+        export AWS_ACCESS_KEY_ID=test
+        export AWS_SECRET_ACCESS_KEY=test
+        export AWS_REGION=eu-north-1
+        export QUEUE_NAME=test-queue
+        
+        echo "Running local SQS consumer with mirrord..."
+        {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer
+
+  test:split:send:
+    desc: "Send filtered and unfiltered messages: task sqs:test:split:send FILTERED=5 UNFILTERED=2"
+    vars:
+      FILTERED: '{{.FILTERED | default "3"}}'
+      UNFILTERED: '{{.UNFILTERED | default "2"}}'
+      QUEUE_URL: 'http://localhost:4566/000000000000/test-queue'
+    cmds:
+      - |
+        echo "=== Sending messages for SQS Split Test ==="
+        echo "Sending {{.FILTERED}} filtered (tenant=Avi.Test) + {{.UNFILTERED}} unfiltered (tenant=Basic) messages..."
+        echo ""
+        
+        # Send filtered messages (tenant=Avi.* - will be split to local app)
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url {{.QUEUE_URL}} \
+              --message-body "{\"order\": \"ORD-F$i\", \"amount\": \"$((RANDOM % 1000)).99\", \"type\": \"premium\"}" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' \
+              2>/dev/null | jq -r '"FILTERED: " + .MessageId' || echo "FILTERED: failed"
+        done
+        
+        # Send unfiltered messages (tenant=Basic - stays in original queue)
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url {{.QUEUE_URL}} \
+              --message-body "{\"order\": \"ORD-U$i\", \"amount\": \"$((RANDOM % 100)).99\", \"type\": \"basic\"}" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Basic"}}' \
+              2>/dev/null | jq -r '"UNFILTERED: " + .MessageId' || echo "UNFILTERED: failed"
+        done
+        
+        echo ""
+        echo "Done! Sent {{.FILTERED}} filtered + {{.UNFILTERED}} unfiltered = $(({{.FILTERED}} + {{.UNFILTERED}})) total"
+
+  test:split:status:
+    desc: "Show SQS session and queue status"
+    cmds:
+      - echo "=== MirrordClusterSession ==="
+      - kubectl get mirrordclustersession -n mirrord 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== MirrordSqsSession ==="
+      - kubectl get mirrordsqssession -n mirrord 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== Queue Status ==="
+      - |
+        echo "Main queue (test-queue):"
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs get-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attribute-names ApproximateNumberOfMessages \
+            --output json 2>/dev/null | jq -r '.Attributes.ApproximateNumberOfMessages + " messages"' || echo "  (error)"
+      - |
+        echo ""
+        echo "Temp queues (mirrord-*):"
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues --output json 2>&1 | jq -r '.QueueUrls[]' | grep mirrord | while read queue; do
+            count=$(kubectl exec -n localstack deploy/localstack -- \
+              awslocal sqs get-queue-attributes --queue-url "$queue" \
+                --attribute-names ApproximateNumberOfMessages --output json 2>/dev/null | jq -r '.Attributes.ApproximateNumberOfMessages')
+            echo "  $(basename $queue): $count messages"
+          done || echo "  (none)"
+
+  test:split:cleanup:
+    desc: "Clean up all SQS sessions and temp queues"
+    cmds:
+      - echo "=== Cleaning up sessions ==="
+      - kubectl delete mirrordclustersession --all -n mirrord 2>/dev/null || echo "(none to delete)"
+      - echo ""
+      - echo "=== Purging main queue ==="
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs purge-queue --queue-url http://localhost:4566/000000000000/test-queue 2>/dev/null || echo "(already empty)"
+      - echo ""
+      - echo "=== Deleting temp queues ==="
+      - |
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues --output json 2>&1 | jq -r '.QueueUrls[]' | grep mirrord | while read queue; do
+            echo "Deleting: $(basename $queue)"
+            kubectl exec -n localstack deploy/localstack -- awslocal sqs delete-queue --queue-url "$queue" 2>/dev/null || true
+          done || echo "(none)"
+      - echo ""
+      - echo "Cleanup complete!"
+
+  test:reconnect:
+    desc: "Test fast disconnect/reconnect SQS behavior (runs full test script)"
+    cmds:
+      - |
+        echo "=== SQS Fast Reconnect Test ==="
+        echo ""
+        echo "This test verifies what happens when:"
+        echo "1. Session 1 starts with SQS filter"
+        echo "2. Session 1 disconnects"
+        echo "3. Session 2 immediately starts with same filter"
+        echo "4. Messages are sent - which session receives them?"
+        echo ""
+        
+        # Clean up first
+        kubectl delete mirrordclustersession --all -n mirrord 2>/dev/null || true
+        kubectl exec -n localstack deploy/localstack -- awslocal sqs purge-queue --queue-url http://localhost:4566/000000000000/test-queue 2>/dev/null || true
+        
+        # Build consumer
+        cd {{.ROOT_DIR}}/apps/sqs-consumer
+        go build -o /tmp/sqs-consumer main.go
+        
+        export AWS_ACCESS_KEY_ID=test
+        export AWS_SECRET_ACCESS_KEY=test
+        export AWS_REGION=eu-north-1
+        export QUEUE_NAME=test-queue
+        
+        MIRRORD_CONFIG="{{.ROOT_DIR}}/k8s/overlays/sqs-localstack/mirrord.json"
+        SESSION1_LOG="/tmp/sqs-session1.log"
+        SESSION2_LOG="/tmp/sqs-session2.log"
+        
+        echo "=== Step 1: Start Session 1 ==="
+        {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/sqs-consumer > $SESSION1_LOG 2>&1 &
+        SESSION1_PID=$!
+        echo "Session 1 PID: $SESSION1_PID"
+        sleep 10
+        
+        if ! kill -0 $SESSION1_PID 2>/dev/null; then
+          echo "ERROR: Session 1 died"
+          cat $SESSION1_LOG
+          exit 1
+        fi
+        
+        echo "=== Step 2: Send message to Session 1 ==="
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs send-message \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --message-body '{"msg": "session1-test"}' \
+            --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' 2>/dev/null | jq -r '.MessageId'
+        sleep 3
+        echo "Session 1 log tail:"
+        tail -5 $SESSION1_LOG
+        
+        echo ""
+        echo "=== Step 3: Kill Session 1 ==="
+        kill $SESSION1_PID 2>/dev/null || true
+        wait $SESSION1_PID 2>/dev/null || true
+        echo "Session 1 terminated"
+        
+        echo ""
+        echo "=== Step 4: Immediately start Session 2 ==="
+        {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/sqs-consumer > $SESSION2_LOG 2>&1 &
+        SESSION2_PID=$!
+        echo "Session 2 PID: $SESSION2_PID"
+        sleep 10
+        
+        if ! kill -0 $SESSION2_PID 2>/dev/null; then
+          echo "ERROR: Session 2 died"
+          cat $SESSION2_LOG
+          exit 1
+        fi
+        
+        echo ""
+        echo "=== Step 5: Send 3 messages ==="
+        for i in 1 2 3; do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url http://localhost:4566/000000000000/test-queue \
+              --message-body "{\"msg\": \"after-reconnect-$i\"}" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' 2>/dev/null | jq -r "\"Message $i: \" + .MessageId"
+          sleep 1
+        done
+        
+        echo "Waiting 10s for processing..."
+        sleep 10
+        
+        echo ""
+        echo "=== Results ==="
+        echo ""
+        echo "--- Session 1 Log ---"
+        cat $SESSION1_LOG
+        echo ""
+        echo "--- Session 2 Log ---"
+        cat $SESSION2_LOG
+        echo ""
+        
+        SESSION1_COUNT=$(grep -c "\[MSG #" $SESSION1_LOG 2>/dev/null || echo "0")
+        SESSION2_COUNT=$(grep -c "\[MSG #" $SESSION2_LOG 2>/dev/null || echo "0")
+        
+        echo "=== Summary ==="
+        echo "Session 1 received: $SESSION1_COUNT messages (expected: 1)"
+        echo "Session 2 received: $SESSION2_COUNT messages (expected: 3)"
+        echo ""
+        
+        if [ "$SESSION2_COUNT" -lt 3 ]; then
+          echo "WARNING: Session 2 missed messages! This indicates stale filter issue."
+        else
+          echo "SUCCESS: Session 2 received all messages."
+        fi
+        
+        echo ""
+        echo "=== Stale Sessions ==="
+        kubectl get mirrordclustersession -n mirrord 2>/dev/null || echo "(none)"
+        
+        kill $SESSION2_PID 2>/dev/null || true
+        echo ""
+        echo "Test complete!"
+
+  queue:list:
+    desc: "List all SQS queues in LocalStack"
+    cmds:
+      - echo "=== All SQS Queues ==="
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs list-queues --output json 2>&1 | jq -r '.QueueUrls[]' || echo "(none)"
+
+  queue:purge:
+    desc: "Purge the main test-queue"
+    cmds:
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs purge-queue --queue-url http://localhost:4566/000000000000/test-queue
+      - echo "Queue purged"
+
+  queue:receive:
+    desc: "Receive and show messages from test-queue (for debugging)"
+    vars:
+      MAX_MESSAGES: '{{.MAX_MESSAGES | default "10"}}'
+    cmds:
+      - |
+        echo "=== Receiving up to {{.MAX_MESSAGES}} messages ==="
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs receive-message \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --max-number-of-messages {{.MAX_MESSAGES}} \
+            --message-attribute-names All \
+            --output json 2>&1 | jq '.'

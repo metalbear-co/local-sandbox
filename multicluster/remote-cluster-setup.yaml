@@ -62,6 +62,10 @@ rules:
   - apiGroups: ["operator.metalbear.co"]
     resources: ["mirrordoperators"]
     verbs: ["get"]
+  # Queue registry sync from primary cluster
+  - apiGroups: ["queues.mirrord.metalbear.co"]
+    resources: ["mirrordworkloadqueueregistries"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
 ---
 # Bind the ClusterRole to the ServiceAccount

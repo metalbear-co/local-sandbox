@@ -1,0 +1,21 @@
+{
+    "feature": {
+        "db_branches": [
+            {
+                "type": "redis",
+                "location": "local",
+                "connection": {
+                    "host": {
+                        "type": "env",
+                        "variable": "REDIS_ADDR"
+                    }
+                },
+                "local": {
+                    "port": 6380,
+                    "runtime": "container",
+                    "container_runtime": "docker"
+                }
+            }
+        ]
+    }
+}

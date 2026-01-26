@@ -1111,6 +1111,14 @@ tasks:
     cmds:
       - redis-cli -p {{.REDIS_PORT}}
 
+  redis:local:cli:second:
+    desc: "Open redis-cli to local Redis"
+    vars:
+      REDIS_PORT: '{{.REDIS_PORT | default "6380"}}'
+    interactive: true
+    cmds:
+      - redis-cli -p {{.REDIS_PORT}}
+
   redis:local:test:
     desc: "Test local Redis connection"
     vars:

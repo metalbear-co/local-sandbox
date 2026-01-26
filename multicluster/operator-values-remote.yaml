@@ -1,0 +1,28 @@
+# Operator values for REMOTE clusters (remote-1, remote-2)
+#
+# Remote clusters run standard operators - NOT multi-cluster enabled.
+# Only the PRIMARY cluster has multiCluster.enabled: true
+#
+operator:
+  image: mirrord-operator
+  sqsSplitting: true
+  kafkaSplitting: true
+  mysqlBranching: true
+  pgBranching: true
+  awsRoleArn: arn:aws:iam::000000000000:role/dummy
+  metrics: true 
+  jsonLog: true
+  logLevel: "debug"
+  # Enable hostNetwork for local/CI multi-cluster testing (allows pod to reach Docker network IPs)
+  hostNetwork: true
+  # AWS credentials for LocalStack - use NodePort URL (set via --set in task)
+  extraEnv:
+    AWS_ACCESS_KEY_ID: "test"
+    AWS_SECRET_ACCESS_KEY: "test"
+    AWS_REGION: "us-east-1"
+  # multiCluster is NOT enabled on remote clusters - they're just regular operators
+license:
+  pemRef: "mirrord-operator-license-pem"
+createNamespace: false
+image:
+  pullPolicy: Never
