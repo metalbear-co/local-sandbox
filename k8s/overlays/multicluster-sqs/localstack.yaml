@@ -27,9 +27,21 @@ spec:
           value: "test"
         - name: AWS_REGION
           value: "us-east-1"
+        # Reduce memory usage
+        - name: LOCALSTACK_SERVICES
+          value: "sqs"
+        - name: EAGER_SERVICE_LOADING
+          value: "0"
         ports:
         - containerPort: 4566
           name: edge
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
         volumeMounts:
         - name: init-scripts
           mountPath: /etc/localstack/init/ready.d

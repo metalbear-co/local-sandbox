@@ -15,10 +15,9 @@
     },
     "db_branches": [
       {
-        "id": "pg-dev-branch",
+        "id": "pg-dev-branch2224444",
         "type": "pg",
         "version": "17",
-        "name": "source_db",
         "ttl_secs": 600,
         "creation_timeout_secs": 90,
         "connection": {

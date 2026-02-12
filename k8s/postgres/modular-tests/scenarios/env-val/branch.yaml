@@ -7,6 +7,7 @@ spec:
   id: env-val
   ttlSecs: 3600
   postgresVersion: "17"
+  databaseName: "bear_custom_db"
   target:
     pod: pg-server-env-val
     container: app
@@ -17,4 +18,3 @@ spec:
         variable: DATABASE_URL
   copy:
     mode: all
-

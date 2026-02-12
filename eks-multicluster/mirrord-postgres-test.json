@@ -1,0 +1,30 @@
+{
+  "operator": true,
+  "target": {
+    "path": "deployment/postgres-app",
+    "namespace": "test-multicluster"
+  },
+  "feature": {
+    "network": {
+      "incoming": "steal",
+      "outgoing": true
+    },
+    "fs": "local",
+    "db_branches": [
+      {
+        "id": "pg-eks-branch",
+        "type": "pg",
+        "version": "17",
+        "name": "source_db",
+        "ttl_secs": 300,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        }
+      }
+    ]
+  }
+}

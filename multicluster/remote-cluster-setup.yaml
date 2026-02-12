@@ -6,7 +6,7 @@
 #   kubectl apply -f remote-cluster-setup.yaml -n mirrord
 #
 # After applying, get the credentials for the primary cluster:
-#   kubectl create token mirrord-primary-access -n mirrord
+#   kubectl create token mirrord-operator-envoy -n mirrord
 #   kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}'
 #   kubectl config view --minify --raw -o jsonpath='{.clusters[0].cluster.certificate-authority-data}'
 
@@ -15,31 +15,22 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: mirrord-primary-access
+  name: mirrord-operator-envoy
   namespace: mirrord
-  labels:
-    app.kubernetes.io/name: mirrord-operator
-    app.kubernetes.io/component: multi-cluster
-    mirrord.metalbear.co/remote-access: "true"
-
 ---
-# ClusterRole with permissions needed for multi-cluster operations
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: mirrord-primary-access
-  labels:
-    app.kubernetes.io/name: mirrord-operator
-    app.kubernetes.io/component: multi-cluster
+  name: mirrord-operator-envoy
 rules:
-  # Session CRD management (MirrordClusterSession uses mirrord.metalbear.co API group)
+  # Session CRD management
   - apiGroups: ["mirrord.metalbear.co"]
     resources: ["mirrordclustersessions"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: ["mirrord.metalbear.co"]
     resources: ["mirrordclustersessions/status"]
     verbs: ["get", "update", "patch"]
-  # Token refresh (TokenRequest API)
+  # Token refresh
   - apiGroups: [""]
     resources: ["serviceaccounts/token"]
     verbs: ["create"]
@@ -58,7 +49,7 @@ rules:
   - apiGroups: ["operator.metalbear.co"]
     resources: ["copytargets"]
     verbs: ["create"]
-  # MirrordOperator CRD for health checks (primary checks remote operator status)
+  # MirrordOperator CRD for health checks
   - apiGroups: ["operator.metalbear.co"]
     resources: ["mirrordoperators"]
     verbs: ["get"]
@@ -66,21 +57,22 @@ rules:
   - apiGroups: ["queues.mirrord.metalbear.co"]
     resources: ["mirrordworkloadqueueregistries"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Database branching CRDs
+  - apiGroups: ["dbs.mirrord.metalbear.co"]
+    resources:
+      ["pgbranchdatabases", "mysqlbranchdatabases", "mongodbbranchdatabases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
 ---
-# Bind the ClusterRole to the ServiceAccount
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: mirrord-primary-access
-  labels:
-    app.kubernetes.io/name: mirrord-operator
-    app.kubernetes.io/component: multi-cluster
+  name: mirrord-operator-envoy
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: mirrord-primary-access
+  name: mirrord-operator-envoy
 subjects:
   - kind: ServiceAccount
-    name: mirrord-primary-access
+    name: mirrord-operator-envoy
     namespace: mirrord

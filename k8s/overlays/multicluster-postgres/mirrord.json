@@ -10,7 +10,7 @@
         "type": "pg",
         "version": "17",
         "name": "source_db",
-        "ttl_secs": 600,
+        "ttl_secs": 10,
         "creation_timeout_secs": 90,
         "connection": {
           "url": {

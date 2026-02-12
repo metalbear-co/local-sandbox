@@ -1,0 +1,16 @@
+{
+  "target": {
+    "path": "deploy/echo-app",
+    "namespace": "test-multicluster"
+  },
+  "feature": {
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "http_filter": {
+          "header_filter": "X-My-Header: filtered-data$"
+        }
+      }
+    }
+  }
+}

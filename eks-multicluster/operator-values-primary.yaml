@@ -1,0 +1,58 @@
+# Operator values for PRIMARY/MANAGEMENT cluster (multi-cluster-dev1)
+#
+# Multi-cluster enabled - orchestrates remote clusters
+# This cluster runs only the Envoy orchestrator, no workloads
+#
+# Remote clusters:
+#   multi-cluster-dev2: bearer token auth (Secret-based)
+#   multi-cluster-dev3: EKS IAM auth (no Secret needed)
+#
+# ## Prerequisites
+# - For dev2: Secret `mirrord-cluster-multi-cluster-dev2` must exist
+#   with key `bearerToken` (auto-refreshed by operator)
+# - For dev3: operator pod needs AWS credentials (IRSA) and
+#   EKS Access Entry on dev3 pointing to the operator's IAM role
+#
+operator:
+  # Enable all features
+  sqsSplitting: true
+  kafkaSplitting: true
+  mysqlBranching: true
+  pgBranching: true
+  mongodbBranching: true
+  metrics: true
+  jsonLog: true
+  logLevel: "info"
+
+  # AWS region for SQS
+  extraEnv:
+    AWS_REGION: "eu-north-1"
+
+  # Multi-cluster configuration
+  multiCluster:
+    enabled: true
+    clusterName: "primary"
+    defaultCluster: "multi-cluster-dev2"
+    managementOnly: true
+    remoteSessionTimeoutSecs: 300
+    sessionTtlSecs: 60
+    clusters:
+      multi-cluster-dev2:
+        authType: bearerToken
+        isDefault: true
+      multi-cluster-dev3:
+        authType: eks
+        region: eu-north-1
+        isDefault: false
+
+sa:
+  roleArn: "arn:aws:iam::526936346962:role/mirrord-operator-role"
+
+license:
+  key: "cE-r8nmXETkuHviGdsZq4Vp9sa5MnSrCHQQebqwHfDU"
+  # pemRef: "mirrord-operator-license-pem"
+
+createNamespace: false
+
+image:
+  pullPolicy: Always

@@ -24,6 +24,9 @@ includes:
   multicluster:
     taskfile: ./tasks/Taskfile.multicluster.yml
     dir: ./tasks
+  eks:
+    taskfile: ./tasks/Taskfile.eks.yml
+    dir: ./tasks
 
 vars:
   ROOT_DIR:
@@ -145,41 +148,41 @@ tasks:
           --build-arg GCS_PATH_PREFIX={{.MIRRORD_AGENT_GCS_PREFIX}} \
           .
       - task: mirrord:agent:image:load
-        vars: {AGENT_IMAGE: '{{.AGENT_IMAGE}}'}
+        vars: { AGENT_IMAGE: "{{.AGENT_IMAGE}}" }
 
   build:app:sqs:
     desc: Build SQS consumer app
     dir: "{{.ROOT_DIR}}/apps/sqs-consumer"
     cmds:
-      - '{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local .'
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local ."
       - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
 
   build:app:kafka:
     desc: Build Kafka consumer app
     dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
     cmds:
-      - '{{.CONTAINER_RUNTIME}} build -t kafka-consumer:local .'
+      - "{{.CONTAINER_RUNTIME}} build -t kafka-consumer:local ."
       - minikube -p {{.CLUSTER_NAME}} image load kafka-consumer:local
 
   build:app:mysql:
     desc: Build MySQL app
     dir: "{{.ROOT_DIR}}/apps/mysql-app"
     cmds:
-      - '{{.CONTAINER_RUNTIME}} build -t mysql-app:local .'
+      - "{{.CONTAINER_RUNTIME}} build -t mysql-app:local ."
       - minikube -p {{.CLUSTER_NAME}} image load mysql-app:local
 
   build:app:postgres:
     desc: Build PostgreSQL app
     dir: "{{.ROOT_DIR}}/apps/postgres-app"
     cmds:
-      - '{{.CONTAINER_RUNTIME}} build -t postgres-app:local .'
+      - "{{.CONTAINER_RUNTIME}} build -t postgres-app:local ."
       - minikube -p {{.CLUSTER_NAME}} image load postgres-app:local
 
   build:app:mongodb:
     desc: Build MongoDB app
     dir: "{{.ROOT_DIR}}/apps/mongodb-app"
     cmds:
-      - '{{.CONTAINER_RUNTIME}} build -t mongodb-app:local .'
+      - "{{.CONTAINER_RUNTIME}} build -t mongodb-app:local ."
       - minikube -p {{.CLUSTER_NAME}} image load mongodb-app:local
 
   build:apps:
@@ -323,14 +326,6 @@ tasks:
         echo "Press Ctrl+C to stop port-forward"
         wait $PF_PID
 
-  logs:operator:
-    desc: Query operator logs from Loki
-    cmds:
-      - |
-        echo "=== Operator Logs ==="
-        echo "Query: {namespace=\"mirrord\", app=\"mirrord-operator\"}"
-        kubectl logs -n mirrord -l app=mirrord-operator --tail=100 -f
-
   operator:install:
     desc: Install operator with custom image
     deps: [infra:all, build:operator]
@@ -385,7 +380,7 @@ tasks:
   operator:image:load:
     desc: Tag and load operator image into minikube
     cmds:
-      - '{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.CHART_VERSION}}'
+      - "{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.CHART_VERSION}}"
       - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
 
@@ -739,8 +734,8 @@ tasks:
       - echo "Deploying echo apps..."
       - task: multicluster:test:deploy:echo-apps
       - echo "Waiting for apps to be ready..."
-      - 'kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
-      - 'kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - "kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s"
+      - "kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s"
       - echo ""
       - echo "============================================"
       - echo "  SETUP COMPLETE - Ready for testing!"
@@ -810,8 +805,8 @@ tasks:
       - echo "Deploying echo apps..."
       - task: multicluster:test:deploy:echo-apps
       - echo "Waiting for apps to be ready..."
-      - 'kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
-      - 'kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s'
+      - "kubectl --context mirrord-primary wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s"
+      - "kubectl --context mirrord-remote-1 wait --for=condition=available deploy/echo-app -n test-multicluster --timeout=120s"
       - echo ""
       - echo "============================================"
       - echo "  SETUP COMPLETE - Ready for testing!"
@@ -882,12 +877,12 @@ tasks:
   test:tls:certs:
     desc: Test TLS certificate configuration
     cmds:
-      - '{{.SCRIPTS_DIR}}/test-tls-certificates.sh'
+      - "{{.SCRIPTS_DIR}}/test-tls-certificates.sh"
 
   test:tls:quick:
     desc: Quick TLS test
     cmds:
-      - '{{.SCRIPTS_DIR}}/quick-tls-test.sh'
+      - "{{.SCRIPTS_DIR}}/quick-tls-test.sh"
 
   clean:namespaces:
     desc: Delete all test namespaces
@@ -973,7 +968,7 @@ tasks:
   describe:pod:
     desc: Describe a pod (shows events and state history)
     vars:
-      POD: '{{.POD}}'
+      POD: "{{.POD}}"
       NAMESPACE: '{{.NAMESPACE | default "default"}}'
     preconditions:
       - sh: test -n "{{.POD}}"
@@ -984,7 +979,7 @@ tasks:
   logs:previous:
     desc: Show logs from previous container instance (after crash)
     vars:
-      POD: '{{.POD}}'
+      POD: "{{.POD}}"
       NAMESPACE: '{{.NAMESPACE | default "default"}}'
     preconditions:
       - sh: test -n "{{.POD}}"
@@ -1001,12 +996,12 @@ tasks:
       - |
         echo "=== Finding last {{.COUNT}} crashed/restarted pods ==="
         echo ""
-        
+
         # Get pods with restarts > 0 or in error state, sorted by restart time
         PODS=$(kubectl get pods --all-namespaces --no-headers 2>/dev/null | \
           awk '($5 > 0) || ($4 ~ /Error|CrashLoop|OOMKilled/) {print $1, $2, $5}' | \
           head -{{.COUNT}})
-        
+
         if [ -z "$PODS" ]; then
           echo "No crashed or restarted pods found."
           echo ""
@@ -1014,7 +1009,7 @@ tasks:
           kubectl get pods --all-namespaces | grep -v "Running\|Completed\|NAMESPACE" | head -{{.COUNT}}
           exit 0
         fi
-        
+
         echo "$PODS" | while read ns pod restarts; do
           echo "=============================================="
           echo "POD: $pod"
@@ -1043,17 +1038,17 @@ tasks:
       - |
         echo "=== Pods with recent warning events ==="
         echo ""
-        
+
         # Get pods from recent warning events
         PODS=$(kubectl get events --all-namespaces --field-selector type!=Normal \
           --sort-by='.lastTimestamp' -o jsonpath='{range .items[*]}{.involvedObject.namespace}{" "}{.involvedObject.name}{"\n"}{end}' 2>/dev/null | \
           grep -v "^$" | tail -{{.COUNT}} | tac)
-        
+
         if [ -z "$PODS" ]; then
           echo "No recent warning events found."
           exit 0
         fi
-        
+
         echo "$PODS" | while read ns pod; do
           if [ -n "$pod" ] && kubectl get pod "$pod" -n "$ns" >/dev/null 2>&1; then
             echo "=============================================="

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"os/signal"
@@ -14,6 +15,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/sqs"
 	"github.com/aws/aws-sdk-go-v2/service/sqs/types"
+	"github.com/aws/smithy-go"
 )
 
 // Message represents the order message body
@@ -42,6 +44,16 @@ func main() {
 	log.Printf("  Cluster:  %s", clusterName)
 	log.Printf("  Queue:    %s", queueName)
 	log.Printf("  Endpoint: %s", sqsEndpoint)
+	log.Printf("  AWS_REGION: %s", getEnv("AWS_REGION", "NOT SET"))
+	
+	// Check if using IRSA (web identity token)
+	if tokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE"); tokenFile != "" {
+		log.Printf("  Using IRSA (token file: %s)", tokenFile)
+	} else if accessKey := os.Getenv("AWS_ACCESS_KEY_ID"); accessKey != "" {
+		log.Printf("  Using static credentials (key: %s...)", accessKey[:min(10, len(accessKey))])
+	} else {
+		log.Println("  No explicit credentials - using default chain")
+	}
 
 	// Configure AWS SDK
 	var cfg aws.Config
@@ -53,8 +65,13 @@ func main() {
 			config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("test", "test", "")),
 		)
 	} else {
-		cfg, err = config.LoadDefaultConfig(ctx)
+		// Explicitly set region from env var
+		region := getEnv("AWS_REGION", getEnv("AWS_DEFAULT_REGION", "us-east-1"))
+		log.Printf("Using AWS region: %s", region)
+		cfg, err = config.LoadDefaultConfig(ctx, config.WithRegion(region))
 	}
+
+	log.Printf("AWS Config region: %s", cfg.Region)
 
 	if err != nil {
 		log.Fatalf("Failed to load config: %v", err)
@@ -77,7 +94,12 @@ func main() {
 			QueueName: aws.String(queueName),
 		})
 		if err != nil {
-			log.Printf("Waiting for queue '%s' (attempt %d/30)", queueName, i+1)
+			var ae smithy.APIError
+			if errors.As(err, &ae) {
+				log.Printf("Waiting for queue '%s' (attempt %d/30): code=%s message=%s", queueName, i+1, ae.ErrorCode(), ae.ErrorMessage())
+			} else {
+				log.Printf("Waiting for queue '%s' (attempt %d/30): %+v", queueName, i+1, err)
+			}
 			time.Sleep(2 * time.Second)
 			continue
 		}

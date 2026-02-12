@@ -1,7 +1,9 @@
 # Operator values for PRIMARY cluster - 3 CLUSTERS (primary + 2 remotes)
 #
-# Cluster discovery: Secret-based
-# Clusters are discovered from Secrets with label mirrord.metalbear.co/remote-cluster=true
+# Cluster discovery: ConfigMap + Secrets
+# - Cluster config (name, server, caData) stored in ConfigMap via Helm values
+# - Auth credentials (bearerToken) stored in Secrets created via task multicluster:secrets:create
+# - Secrets must be named: mirrord-cluster-{cluster-name}
 #
 operator:
   image: mirrord-operator
@@ -9,12 +11,12 @@ operator:
   kafkaSplitting: true
   mysqlBranching: true
   pgBranching: true
+  mongodbBranching: true
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
-  metrics: true 
+  metrics: true
   jsonLog: true
   logLevel: "debug"
-  # Enable hostNetwork for local/CI multi-cluster testing (allows pod to reach Docker network IPs)
-  hostNetwork: true
+  # Note: hostNetwork and hostAliases are patched via kubectl after helm install (not in chart)
   # AWS credentials for LocalStack (SQS splitting tests)
   # Note: AWS_ENDPOINT_URL is set via --set in the task (NodePort URL)
   extraEnv:
@@ -24,13 +26,26 @@ operator:
   multiCluster:
     enabled: true
     clusterName: "primary"
-    defaultCluster: "remote-1"  # Default cluster for stateful ops
-    primaryIsManagementOnly: true  # Primary only runs Envoy
+    defaultCluster: "remote-1" # Default cluster for stateful ops
+    managementOnly: true # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
-    tokenRefreshIntervalSecs: 2700  # 45 minutes
+    tokenRefreshIntervalSecs: 2700 # 45 minutes
     sessionTtlSecs: 60
-    # Cluster credentials are created separately via task multicluster:secrets:create
-    # Not in values.yaml because tokens are generated dynamically
+    # Cluster config - auth credentials (bearerToken) are in Secrets created separately
+    # Note: server and caData are set dynamically via --set in the task
+    clusters:
+      remote-1:
+        authType: bearerToken
+        # server: set via --set (uses cluster hostname for TLS cert validation)
+        # caData: set via --set (extracted from kubeconfig)
+        isDefault: true
+      remote-2:
+        authType: bearerToken
+        # server: set via --set
+        # caData: set via --set
+        isDefault: false
+agent:
+  image: mirrord-agent:custom
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false
