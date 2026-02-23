@@ -189,8 +189,6 @@ tasks:
       - |
         echo "Setting up {{.CLUSTER}}..."
         kubectl --context {{.CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
-        kubectl --context {{.CLUSTER}} apply -f {{.MC_CONFIG_DIR}}/remote-cluster-setup.yaml
-        echo "  ✓ ServiceAccount and RBAC created in {{.CLUSTER}}"
 
   secrets:create:
     desc: Create cluster credential Secrets on the primary cluster

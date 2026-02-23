@@ -11,7 +11,7 @@ operator:
   pgBranching: true
   mongodbBranching: true
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
-  metrics: true 
+  metrics: true
   jsonLog: true
   logLevel: "debug"
   # Note: hostNetwork is patched via kubectl after helm install (not in chart)
@@ -20,6 +20,8 @@ operator:
     AWS_ACCESS_KEY_ID: "test"
     AWS_SECRET_ACCESS_KEY: "test"
     AWS_REGION: "us-east-1"
+  # Mark as a remote cluster member — creates ClusterRole + bindings
+  multiClusterMember: true
   # multiCluster is NOT enabled on remote clusters - they're just regular operators
 agent:
   image: mirrord-agent:custom
