@@ -25,8 +25,8 @@ operator:
     AWS_REGION: "us-east-1"
   multiCluster:
     enabled: true
-    clusterName: "primary"
-    defaultCluster: "remote-1" # Default cluster for stateful ops
+    clusterName: "mirrord-primary"
+    defaultCluster: "mirrord-remote-1" # Default cluster for stateful ops
     managementOnly: true # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700 # 45 minutes
@@ -34,15 +34,11 @@ operator:
     # Cluster config - auth credentials (bearerToken) are in Secrets created separately
     # Note: server and caData are set dynamically via --set in the task
     clusters:
-      remote-1:
+      mirrord-remote-1:
         authType: bearerToken
-        # server: set via --set (uses cluster hostname for TLS cert validation)
-        # caData: set via --set (extracted from kubeconfig)
         isDefault: true
-      remote-2:
+      mirrord-remote-2:
         authType: bearerToken
-        # server: set via --set
-        # caData: set via --set
         isDefault: false
 agent:
   image: mirrord-agent:custom

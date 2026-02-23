@@ -1,0 +1,13 @@
+{
+  "target": {
+    "path": "deploy/echo-app",
+    "namespace": "test-multicluster"
+  },
+  "feature": {
+    "network": {
+      "incoming": {
+        "mode": "steal"
+      }
+    }
+  }
+}

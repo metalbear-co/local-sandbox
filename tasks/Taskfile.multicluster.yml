@@ -221,11 +221,11 @@ tasks:
       - task: secrets:create:cluster
         vars:
           CLUSTER: "{{.REMOTE_CLUSTER_1}}"
-          CLUSTER_NAME: "remote-1"
+          CLUSTER_NAME: "mirrord-remote-1"
           IS_DEFAULT: "true"
       - |
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          task multicluster:secrets:create:cluster CLUSTER={{.REMOTE_CLUSTER_2}} CLUSTER_NAME=remote-2 IS_DEFAULT=false
+          task multicluster:secrets:create:cluster CLUSTER={{.REMOTE_CLUSTER_2}} CLUSTER_NAME=mirrord-remote-2 IS_DEFAULT=false
         fi
       - echo ""
       - echo "Cluster credential Secrets created. Verify with:"
@@ -757,16 +757,16 @@ tasks:
           --set operator.imageTag=custom
           --set agent.image={{.AGENT_IMAGE}}
           --set "operator.extraEnv.AWS_ENDPOINT_URL=$LOCALSTACK_URL"
-          --set "operator.multiCluster.clusters.remote-1.server=$REMOTE1_SERVER"
-          --set "operator.multiCluster.clusters.remote-1.caData=$REMOTE1_CA"
+          --set "operator.multiCluster.clusters.mirrord-remote-1.server=$REMOTE1_SERVER"
+          --set "operator.multiCluster.clusters.mirrord-remote-1.caData=$REMOTE1_CA"
           --wait
         )
 
         # Add remote-2 cluster config if 3 clusters
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           HELM_ARGS+=(
-            --set "operator.multiCluster.clusters.remote-2.server=$REMOTE2_SERVER"
-            --set "operator.multiCluster.clusters.remote-2.caData=$REMOTE2_CA"
+            --set "operator.multiCluster.clusters.mirrord-remote-2.server=$REMOTE2_SERVER"
+            --set "operator.multiCluster.clusters.mirrord-remote-2.caData=$REMOTE2_CA"
           )
         fi
 
@@ -1468,7 +1468,7 @@ tasks:
 
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
-          --context {{.PRIMARY_CLUSTER}} \
+          --context {{.REMOTE_CLUSTER_1}} \
           --target deploy/echo-app \
           --target-namespace {{.MC_NAMESPACE}} \
           --steal \
@@ -1517,7 +1517,7 @@ tasks:
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
           --context {{.PRIMARY_CLUSTER}} \
-          -f mirrord-local.json \
+          -f mirrord-local-no-container.json \
           -- ./echo-app
 
   test:generate:traffic:filtered:
@@ -1920,7 +1920,7 @@ tasks:
         echo "Running with mirrord..."
         # Primary operator routes stateful operations (db branches) to the default cluster
         {{.MIRRORD_BIN}} exec \
-          --context {{.PRIMARY_CLUSTER}} \
+          --context {{.REMOTE_CLUSTER_1}} \
           -f {{.K8S_DIR}}/overlays/multicluster-postgres/mirrord.json \
           -- /tmp/postgres-app
 

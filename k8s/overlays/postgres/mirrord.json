@@ -15,7 +15,8 @@
     },
     "db_branches": [
       {
-        "id": "pg-dev-branch2224444",
+        "id": "pg-dev-random-id",
+        "name": "my_database_name_etc",
         "type": "pg",
         "version": "17",
         "ttl_secs": 600,
@@ -27,15 +28,7 @@
           }
         },
         "copy": {
-          "mode": "schema",
-          "tables": {
-            "users": {
-              "filter": "age > 18"
-            },
-            "orders": {
-              "filter": "amount > 50"
-            }
-          }
+          "mode": "empty"
         }
       }
     ]

@@ -53,7 +53,7 @@ tasks:
   license:create:secret:
     desc: Create license secret in cluster
     vars:
-      LICENSE_FILE: "{{.LICENSE_FILE | default .SCRIPTS_DIR}}/company-license.pem"
+      LICENSE_FILE: "{{.SCRIPTS_DIR}}/company-license.pem"
     preconditions:
       - sh: test -f {{.LICENSE_FILE}}
         msg: "License file not found. Run 'task license:generate' first"
@@ -480,7 +480,6 @@ tasks:
       - task: cluster:delete
       - task: cluster:create
       - task: build:app:postgres
-      - task: license:create:secret
       - task: operator:install:nobuild
       - task: postgres:test
 
