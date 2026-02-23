@@ -1,0 +1,49 @@
+# Operator values for PRIMARY cluster - 3 CLUSTERS (primary + 2 remotes)
+#
+# Cluster discovery: ConfigMap + Secrets
+# - Cluster config (name, server, caData) stored in ConfigMap via Helm values
+# - Auth credentials (bearerToken) stored in Secrets created via task multicluster:secrets:create
+# - Secrets must be named: mirrord-cluster-{cluster-name}
+#
+operator:
+  image: mirrord-operator
+  sqsSplitting: true
+  kafkaSplitting: true
+  mysqlBranching: true
+  pgBranching: true
+  mongodbBranching: true
+  awsRoleArn: arn:aws:iam::000000000000:role/dummy
+  metrics: true
+  jsonLog: true
+  logLevel: "debug"
+  # Note: hostNetwork and hostAliases are patched via kubectl after helm install (not in chart)
+  # AWS credentials for LocalStack (SQS splitting tests)
+  # Note: AWS_ENDPOINT_URL is set via --set in the task (NodePort URL)
+  extraEnv:
+    AWS_ACCESS_KEY_ID: "test"
+    AWS_SECRET_ACCESS_KEY: "test"
+    AWS_REGION: "us-east-1"
+  multiCluster:
+    enabled: true
+    clusterName: "mirrord-primary"
+    defaultCluster: "mirrord-remote-1" # Default cluster for stateful ops
+    managementOnly: true # Primary only runs Envoy
+    remoteSessionTimeoutSecs: 300
+    tokenRefreshIntervalSecs: 2700 # 45 minutes
+    sessionTtlSecs: 60
+    # Cluster config - auth credentials (bearerToken) are in Secrets created separately
+    # Note: server and caData are set dynamically via --set in the task
+    clusters:
+      mirrord-remote-1:
+        authType: bearerToken
+        isDefault: true
+      mirrord-remote-2:
+        authType: bearerToken
+        isDefault: false
+agent:
+  image: mirrord-agent:custom
+license:
+  pemRef: "mirrord-operator-license-pem"
+createNamespace: false
+image:
+  pullPolicy: Never

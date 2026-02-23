@@ -1,0 +1,35 @@
+{
+  "target": {
+    "path": "pod/postgres-test",
+    "namespace": "test-multicluster"
+  },
+  "feature": {
+    "db_branches": [
+      {
+        "id": "pg-multicluster-branch",
+        "type": "pg",
+        "version": "17",
+        "name": "source_db",
+        "ttl_secs": 10,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "copy": {
+          "mode": "schema",
+          "tables": {
+            "users": {
+              "filter": "age >= 18"
+            },
+            "orders": {
+              "filter": "amount > 50"
+            }
+          }
+        }
+      }
+    ]
+  }
+}

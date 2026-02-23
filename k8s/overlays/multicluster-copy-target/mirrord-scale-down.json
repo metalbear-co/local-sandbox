@@ -1,0 +1,15 @@
+{
+  "target": {
+    "path": "deployment/echo-app",
+    "namespace": "test-multicluster"
+  },
+  "operator": true,
+  "feature": {
+    "copy_target": {
+      "enabled": true,
+      "scale_down": true
+    },
+    "env": true,
+    "fs": "local"
+  }
+}

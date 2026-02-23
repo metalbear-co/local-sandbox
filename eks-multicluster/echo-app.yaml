@@ -1,0 +1,48 @@
+# Echo App for EKS Multi-Cluster Testing
+# Deploy to remote clusters (not the primary/management cluster)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-multicluster
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-app
+  namespace: test-multicluster
+  labels:
+    app: echo-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-app
+  template:
+    metadata:
+      labels:
+        app: echo-app
+    spec:
+      containers:
+      - name: echo
+        image: vladrbg/mc-echo-app:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: CLUSTER_ID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: PORT
+          value: "8080"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-app
+  namespace: test-multicluster
+spec:
+  selector:
+    app: echo-app
+  ports:
+  - port: 80
+    targetPort: 8080

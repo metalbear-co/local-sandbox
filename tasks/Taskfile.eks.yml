@@ -1,0 +1,1348 @@
+# AWS EKS Multi-Cluster Deployment
+#
+# Deploys mirrord operator in multi-cluster mode to 3 EKS clusters:
+#   - management: Primary/management operator only (no workloads)
+#   - remote-1 (default): PostgreSQL + all test apps (traffic, postgres, sqs)
+#   - remote-2: All test apps (traffic, postgres, sqs) - no PostgreSQL DB
+#
+# ## Prerequisites
+#
+#   - AWS CLI configured with access to all 3 clusters
+#   - kubectl configured with contexts for all 3 clusters
+#   - Helm 3 installed
+#   - Operator image pushed to ECR or available in clusters
+#
+# ## Usage
+#
+#   # First time setup - creates namespaces, credentials, operators, apps
+#   task eks:setup:all
+#
+#   # Individual steps
+#   task eks:credentials:create     # Create service accounts and tokens
+#   task eks:operator:install:all   # Install operators on all clusters
+#   task eks:apps:deploy:all        # Deploy test apps
+#
+# ## Variables
+#
+#   Override via environment or task variables:
+#   MANAGEMENT_CLUSTER=my-management-cluster
+#   REMOTE_CLUSTER_1=my-remote-1
+#   REMOTE_CLUSTER_2=my-remote-2
+#
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  CHARTS_DIR: "{{.ROOT_DIR}}/../charts/mirrord-operator"
+  APPS_DIR: "{{.ROOT_DIR}}/apps"
+  K8S_DIR: "{{.ROOT_DIR}}/k8s"
+  EKS_CONFIG_DIR: "{{.ROOT_DIR}}/eks-multicluster"
+
+  # EKS cluster context names (override these for your clusters)
+  MANAGEMENT_CLUSTER: '{{.MANAGEMENT_CLUSTER | default "eks-management"}}'
+  REMOTE_CLUSTER_1: '{{.REMOTE_CLUSTER_1 | default "eks-remote-1"}}'
+  REMOTE_CLUSTER_2: '{{.REMOTE_CLUSTER_2 | default "eks-remote-2"}}'
+
+  # Namespace for test workloads
+  APP_NAMESPACE: '{{.APP_NAMESPACE | default "test-multicluster"}}'
+  OPERATOR_NAMESPACE: '{{.OPERATOR_NAMESPACE | default "mirrord"}}'
+
+  # Operator image (should be in ECR or available to clusters)
+  OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "ghcr.io/metalbear-co/operator:latest"}}'
+  AGENT_IMAGE: '{{.AGENT_IMAGE | default "ghcr.io/metalbear-co/mirrord-agent:latest"}}'
+
+  # License file path
+  LICENSE_FILE: '{{.LICENSE_FILE | default (printf "%s/scripts/company-license.pem" .ROOT_DIR)}}'
+
+  # mirrord CLI binary
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+
+  # SQS settings
+  SQS_QUEUE_NAME: '{{.SQS_QUEUE_NAME | default "test-queue"}}'
+  SQS_AWS_REGION: '{{.SQS_AWS_REGION | default "eu-north-1"}}'
+
+tasks:
+  # ============================================================================
+  # FULL SETUP
+  # ============================================================================
+
+  setup:all:
+    desc: Complete setup - credentials, operators, and apps on all EKS clusters
+    cmds:
+      - 'echo "=== EKS Multi-Cluster Setup ==="'
+      - 'echo "Management cluster (primary): {{.MANAGEMENT_CLUSTER}}"'
+      - 'echo "Remote cluster 1 (default): {{.REMOTE_CLUSTER_1}}"'
+      - 'echo "Remote cluster 2: {{.REMOTE_CLUSTER_2}}"'
+      - 'echo ""'
+      - task: config:verify
+      - task: namespaces:create
+      - task: credentials:create
+      - task: operator:install:all
+      - task: postgres:deploy
+      - task: apps:deploy:all
+      - echo ""
+      - echo "=== Setup Complete ==="
+      - echo "Run 'task eks:status' to verify"
+
+  status:
+    desc: Show status of all clusters
+    cmds:
+      - echo "=== EKS Multi-Cluster Status ==="
+      - echo ""
+      - echo "Management Cluster ({{.MANAGEMENT_CLUSTER}}):"
+      - kubectl --context "{{.MANAGEMENT_CLUSTER}}" get pods -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "  (not accessible)"
+      - echo ""
+      - echo "Remote Cluster 1 ({{.REMOTE_CLUSTER_1}}):"
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" get pods -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "  (not accessible)"
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" get pods -n {{.APP_NAMESPACE}} 2>/dev/null || echo "  (no apps)"
+      - echo ""
+      - echo "Remote Cluster 2 ({{.REMOTE_CLUSTER_2}}):"
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" get pods -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "  (not accessible)"
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" get pods -n {{.APP_NAMESPACE}} 2>/dev/null || echo "  (no apps)"
+
+  # ============================================================================
+  # CONFIG DIRECTORY
+  # ============================================================================
+
+  config:verify:
+    desc: Verify EKS config files exist
+    cmds:
+      - |
+        if [ ! -f "{{.EKS_CONFIG_DIR}}/operator-values-primary.yaml" ]; then
+          echo "ERROR: Missing {{.EKS_CONFIG_DIR}}/operator-values-primary.yaml"
+          echo "Run from local-sandbox directory or check EKS_CONFIG_DIR"
+          exit 1
+        fi
+        if [ ! -f "{{.EKS_CONFIG_DIR}}/operator-values-remote.yaml" ]; then
+          echo "ERROR: Missing {{.EKS_CONFIG_DIR}}/operator-values-remote.yaml"
+          exit 1
+        fi
+        echo "Config files verified in {{.EKS_CONFIG_DIR}}"
+
+  # ============================================================================
+  # NAMESPACES
+  # ============================================================================
+
+  namespaces:create:
+    desc: Create namespaces on all clusters
+    cmds:
+      - echo "Creating namespaces on all clusters..."
+      # Management cluster
+      - kubectl --context "{{.MANAGEMENT_CLUSTER}}" create namespace {{.OPERATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.MANAGEMENT_CLUSTER}}" apply -f -
+      # Remote cluster 1
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" create namespace {{.OPERATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.REMOTE_CLUSTER_1}}" apply -f -
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" create namespace {{.APP_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.REMOTE_CLUSTER_1}}" apply -f -
+      # Remote cluster 2
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" create namespace {{.OPERATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.REMOTE_CLUSTER_2}}" apply -f -
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" create namespace {{.APP_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.REMOTE_CLUSTER_2}}" apply -f -
+      - echo "Namespaces created"
+
+  # ============================================================================
+  # CREDENTIALS (Service Accounts and Tokens)
+  # ============================================================================
+
+  credentials:create:
+    desc: Create service accounts on remote clusters and credential secrets on primary
+    cmds:
+      - echo "=== Creating Credentials for Multi-Cluster Auth ==="
+      - task: credentials:create:remote
+        vars:
+          { REMOTE_CLUSTER: "{{.REMOTE_CLUSTER_1}}", REMOTE_NAME: "remote-1" }
+      - task: credentials:create:remote
+        vars:
+          { REMOTE_CLUSTER: "{{.REMOTE_CLUSTER_2}}", REMOTE_NAME: "remote-2" }
+      - echo ""
+      - echo "Credential secrets on management cluster:"
+      - kubectl --context "{{.MANAGEMENT_CLUSTER}}" get secrets -n {{.OPERATOR_NAMESPACE}} -l operator.metalbear.co/remote-cluster-credentials=true
+
+  credentials:create:remote:
+    desc: Create service account on remote cluster and secret on primary
+    vars:
+      REMOTE_CLUSTER: "{{.REMOTE_CLUSTER}}"
+      REMOTE_NAME: "{{.REMOTE_NAME}}"
+    cmds:
+      - |
+        echo "Setting up credentials for {{.REMOTE_NAME}} ({{.REMOTE_CLUSTER}})..."
+
+        # Create service account on remote cluster
+        kubectl --context "{{.REMOTE_CLUSTER}}" apply -f - << 'EOF'
+        apiVersion: v1
+        kind: ServiceAccount
+        metadata:
+          name: mirrord-operator-remote
+          namespace: {{.OPERATOR_NAMESPACE}}
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: mirrord-operator-remote-admin
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: cluster-admin
+        subjects:
+        - kind: ServiceAccount
+          name: mirrord-operator-remote
+          namespace: {{.OPERATOR_NAMESPACE}}
+        EOF
+
+        echo "Service account created on {{.REMOTE_CLUSTER}}"
+      - |
+        # Generate a long-lived token (EKS requires explicit token creation)
+        echo "Creating token for service account..."
+
+        # Create a secret for the service account token
+        kubectl --context "{{.REMOTE_CLUSTER}}" apply -f - << EOF
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: mirrord-operator-remote-token
+          namespace: {{.OPERATOR_NAMESPACE}}
+          annotations:
+            kubernetes.io/service-account.name: mirrord-operator-remote
+        type: kubernetes.io/service-account-token
+        EOF
+
+        # Wait for token to be populated
+        sleep 3
+
+        # Get the token
+        TOKEN=$(kubectl --context "{{.REMOTE_CLUSTER}}" get secret mirrord-operator-remote-token -n {{.OPERATOR_NAMESPACE}} -o jsonpath='{.data.token}' | base64 -d)
+
+        if [ -z "$TOKEN" ]; then
+          echo "ERROR: Failed to get token for {{.REMOTE_NAME}}"
+          exit 1
+        fi
+        echo "Token obtained (${#TOKEN} bytes)"
+
+        # Get cluster server URL and CA data from kubeconfig
+        SERVER=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER}}")].cluster.server}')
+        CA_DATA=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER}}")].cluster.certificate-authority-data}')
+
+        # If CA_DATA is empty, try reading from file
+        if [ -z "$CA_DATA" ]; then
+          CA_FILE=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER}}")].cluster.certificate-authority}')
+          if [ -n "$CA_FILE" ] && [ -f "$CA_FILE" ]; then
+            CA_DATA=$(base64 < "$CA_FILE" | tr -d '\n')
+          fi
+        fi
+
+        echo "Server: $SERVER"
+        echo "CA data: ${#CA_DATA} bytes"
+
+        # Create credential secret on management cluster
+        kubectl --context "{{.MANAGEMENT_CLUSTER}}" create secret generic mirrord-cluster-{{.REMOTE_NAME}} \
+          --namespace {{.OPERATOR_NAMESPACE}} \
+          --from-literal=name={{.REMOTE_NAME}} \
+          --from-literal=server="$SERVER" \
+          --from-literal=caData="$CA_DATA" \
+          --from-literal=bearerToken="$TOKEN" \
+          --dry-run=client -o yaml | kubectl --context "{{.MANAGEMENT_CLUSTER}}" apply -f -
+
+        # Label the secret for discovery
+        kubectl --context "{{.MANAGEMENT_CLUSTER}}" label secret mirrord-cluster-{{.REMOTE_NAME}} \
+          -n {{.OPERATOR_NAMESPACE}} \
+          operator.metalbear.co/remote-cluster-credentials=true \
+          --overwrite
+
+        echo "Credential secret created on management cluster for {{.REMOTE_NAME}}"
+
+  credentials:refresh:
+    desc: Refresh tokens for all remote clusters
+    cmds:
+      - echo "Refreshing tokens for all remote clusters..."
+      - task: credentials:create:remote
+        vars:
+          { REMOTE_CLUSTER: "{{.REMOTE_CLUSTER_1}}", REMOTE_NAME: "remote-1" }
+      - task: credentials:create:remote
+        vars:
+          { REMOTE_CLUSTER: "{{.REMOTE_CLUSTER_2}}", REMOTE_NAME: "remote-2" }
+      - echo "Tokens refreshed. Restart primary operator to pick up new tokens:"
+      - echo "  task eks:operator:restart:primary"
+
+  # ============================================================================
+  # OPERATOR INSTALLATION
+  # ============================================================================
+
+  operator:install:all:
+    desc: Install operators on all clusters
+    cmds:
+      - task: operator:install:remotes
+      - task: operator:install:primary
+      - echo ""
+      - echo "All operators installed!"
+
+  operator:install:primary:
+    desc: Install primary operator (management cluster)
+    cmds:
+      - |
+        echo "=== Installing Primary Operator on {{.MANAGEMENT_CLUSTER}} ==="
+
+        # Create license secret
+        kubectl --context "{{.MANAGEMENT_CLUSTER}}" create secret generic mirrord-operator-license-pem \
+          --from-file=license.pem={{.LICENSE_FILE}} \
+          -n {{.OPERATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.MANAGEMENT_CLUSTER}}" apply -f -
+
+        # Get cluster config for remote-1
+        REMOTE1_SERVER=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_1}}")].cluster.server}')
+        REMOTE1_CA=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_1}}")].cluster.certificate-authority-data}')
+        if [ -z "$REMOTE1_CA" ]; then
+          CA_FILE=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_1}}")].cluster.certificate-authority}')
+          if [ -n "$CA_FILE" ] && [ -f "$CA_FILE" ]; then
+            REMOTE1_CA=$(base64 < "$CA_FILE" | tr -d '\n')
+          fi
+        fi
+
+        # Get cluster config for remote-2
+        REMOTE2_SERVER=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_2}}")].cluster.server}')
+        REMOTE2_CA=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_2}}")].cluster.certificate-authority-data}')
+        if [ -z "$REMOTE2_CA" ]; then
+          CA_FILE=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_2}}")].cluster.certificate-authority}')
+          if [ -n "$CA_FILE" ] && [ -f "$CA_FILE" ]; then
+            REMOTE2_CA=$(base64 < "$CA_FILE" | tr -d '\n')
+          fi
+        fi
+
+        echo "Remote-1: $REMOTE1_SERVER"
+        echo "Remote-2: $REMOTE2_SERVER"
+
+        # Install with helm
+        helm upgrade --install mirrord-operator {{.CHARTS_DIR}} \
+          --kube-context {{.MANAGEMENT_CLUSTER}} \
+          --namespace {{.OPERATOR_NAMESPACE}} \
+          -f {{.EKS_CONFIG_DIR}}/operator-values-primary.yaml \
+          --set operator.image={{.OPERATOR_IMAGE}} \
+          --set agent.image={{.AGENT_IMAGE}} \
+          --set "operator.multiCluster.clusters.remote-1.server=$REMOTE1_SERVER" \
+          --set "operator.multiCluster.clusters.remote-1.caData=$REMOTE1_CA" \
+          --set "operator.multiCluster.clusters.remote-2.server=$REMOTE2_SERVER" \
+          --set "operator.multiCluster.clusters.remote-2.caData=$REMOTE2_CA" \
+          --wait
+
+        echo "Primary operator installed"
+        kubectl --context "{{.MANAGEMENT_CLUSTER}}" get pods -n {{.OPERATOR_NAMESPACE}}
+
+  operator:install:remotes:
+    desc: Install operators on remote clusters
+    cmds:
+      - task: operator:install:remote
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - task: operator:install:remote
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  operator:install:remote:
+    desc: Install operator on a remote cluster
+    vars:
+      CLUSTER: "{{.CLUSTER}}"
+    cmds:
+      - |
+        echo "=== Installing Remote Operator on {{.CLUSTER}} ==="
+
+        # Create license secret
+        kubectl --context "{{.CLUSTER}}" create secret generic mirrord-operator-license-pem \
+          --from-file=license.pem={{.LICENSE_FILE}} \
+          -n {{.OPERATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.CLUSTER}}" apply -f -
+
+        # Install with helm
+        helm upgrade --install mirrord-operator {{.CHARTS_DIR}} \
+          --kube-context {{.CLUSTER}} \
+          --namespace {{.OPERATOR_NAMESPACE}} \
+          -f {{.EKS_CONFIG_DIR}}/operator-values-remote.yaml \
+          --set operator.image={{.OPERATOR_IMAGE}} \
+          --set agent.image={{.AGENT_IMAGE}} \
+          --wait
+
+        echo "Remote operator installed on {{.CLUSTER}}"
+        kubectl --context "{{.CLUSTER}}" get pods -n {{.OPERATOR_NAMESPACE}}
+
+  operator:restart:primary:
+    desc: Restart primary operator
+    cmds:
+      - kubectl --context "{{.MANAGEMENT_CLUSTER}}" rollout restart deployment/mirrord-operator -n {{.OPERATOR_NAMESPACE}}
+      - kubectl --context "{{.MANAGEMENT_CLUSTER}}" rollout status deployment/mirrord-operator -n {{.OPERATOR_NAMESPACE}}
+
+  operator:logs:primary:
+    desc: Tail primary operator logs
+    cmds:
+      - kubectl --context "{{.MANAGEMENT_CLUSTER}}" logs -f -n {{.OPERATOR_NAMESPACE}} -l app.kubernetes.io/name=mirrord-operator
+
+  operator:logs:remote1:
+    desc: Tail remote-1 operator logs
+    cmds:
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" logs -f -n {{.OPERATOR_NAMESPACE}} -l app.kubernetes.io/name=mirrord-operator
+
+  operator:logs:remote2:
+    desc: Tail remote-2 operator logs
+    cmds:
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" logs -f -n {{.OPERATOR_NAMESPACE}} -l app.kubernetes.io/name=mirrord-operator
+
+  # ============================================================================
+  # POSTGRESQL DATABASE
+  # ============================================================================
+  #
+  # Deploy PostgreSQL to any cluster:
+  #   task eks:postgres:deploy CLUSTER=eks-remote-1
+  #   task eks:postgres:deploy:remote1
+  #   task eks:postgres:deploy:remote2
+  #
+  # ============================================================================
+
+  postgres:deploy:
+    desc: "Deploy PostgreSQL database (usage: CLUSTER=eks-remote-1 task eks:postgres:deploy)"
+    vars:
+      CLUSTER: "{{.CLUSTER | default .REMOTE_CLUSTER_1}}"
+    cmds:
+      - 'echo "=== Deploying PostgreSQL to {{.CLUSTER}} ==="'
+      - kubectl --context "{{.CLUSTER}}" create namespace {{.APP_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.CLUSTER}}" apply -f -
+      - |
+        # Create temp file for YAML
+        YAML_FILE=$(mktemp)
+        cat > "$YAML_FILE" << 'YAMLEOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: postgres-test
+          labels:
+            app: postgres-test
+        spec:
+          initContainers:
+            - name: init-db-script
+              image: postgres:17
+              command:
+                - sh
+                - -c
+                - |
+                  cat > /docker-entrypoint-initdb.d/01-init-user-db.sql << 'EOSQL'
+                  CREATE DATABASE source_db;
+                  \c source_db
+                  CREATE TABLE users (id SERIAL PRIMARY KEY, name VARCHAR(50), email VARCHAR(100), age INT);
+                  INSERT INTO users (name, email, age) VALUES ('Alice', 'alice@example.com', 25), ('Bob', 'bob@example.com', 30), ('Charlie', 'charlie@example.com', 17);
+                  CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id INT, amount DECIMAL(10, 2), status VARCHAR(50));
+                  INSERT INTO orders (user_id, amount, status) VALUES (1, 100.00, 'completed'), (2, 150.50, 'pending'), (1, 75.25, 'completed');
+                  EOSQL
+              volumeMounts:
+                - name: initdb
+                  mountPath: /docker-entrypoint-initdb.d
+          containers:
+            - name: postgres
+              image: postgres:17
+              env:
+                - name: POSTGRES_PASSWORD
+                  value: postgres
+                - name: POSTGRES_USER
+                  value: postgres
+              ports:
+                - containerPort: 5432
+              volumeMounts:
+                - name: initdb
+                  mountPath: /docker-entrypoint-initdb.d
+              readinessProbe:
+                exec:
+                  command: ["pg_isready", "-U", "postgres"]
+                initialDelaySeconds: 5
+                periodSeconds: 5
+          volumes:
+            - name: initdb
+              emptyDir: {}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: postgres-test
+        spec:
+          selector:
+            app: postgres-test
+          ports:
+            - name: postgres
+              port: 5432
+              targetPort: 5432
+        ---
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: pg-connection-secret
+        type: Opaque
+        stringData:
+          url: postgresql://postgres:postgres@postgres-test/source_db
+        YAMLEOF
+
+        # Apply with namespace flag instead of in YAML
+        # Use --validate=false to avoid OpenAPI download which can fail with EKS ARN contexts
+        kubectl --context "{{.CLUSTER}}" apply -n {{.APP_NAMESPACE}} --validate=false -f "$YAML_FILE"
+        rm -f "$YAML_FILE"
+      - 'echo "Waiting for PostgreSQL to be ready..."'
+      - kubectl --context "{{.CLUSTER}}" wait --for=condition=ready pod/postgres-test -n {{.APP_NAMESPACE}} --timeout=120s
+      - 'echo "PostgreSQL deployed to {{.CLUSTER}}"'
+
+  postgres:deploy:remote1:
+    desc: Deploy PostgreSQL to remote-1 (alias)
+    cmds:
+      - task: postgres:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  postgres:deploy:remote2:
+    desc: Deploy PostgreSQL to remote-2
+    cmds:
+      - task: postgres:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  postgres:delete:
+    desc: "Delete PostgreSQL from a cluster (usage: CLUSTER=eks-remote-1 task eks:postgres:delete)"
+    vars:
+      CLUSTER: "{{.CLUSTER | default .REMOTE_CLUSTER_1}}"
+    cmds:
+      - kubectl --context "{{.CLUSTER}}" delete pod postgres-test -n {{.APP_NAMESPACE}} --ignore-not-found
+      - kubectl --context "{{.CLUSTER}}" delete service postgres-test -n {{.APP_NAMESPACE}} --ignore-not-found
+      - kubectl --context "{{.CLUSTER}}" delete secret pg-connection-secret -n {{.APP_NAMESPACE}} --ignore-not-found
+      - echo "PostgreSQL deleted from {{.CLUSTER}}"
+
+  postgres:delete:remote1:
+    desc: Delete PostgreSQL from remote-1
+    cmds:
+      - task: postgres:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  postgres:delete:remote2:
+    desc: Delete PostgreSQL from remote-2
+    cmds:
+      - task: postgres:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  postgres:status:
+    desc: Check PostgreSQL status on all clusters
+    cmds:
+      - echo "=== PostgreSQL on Remote-1 ({{.REMOTE_CLUSTER_1}}) ==="
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" get pod postgres-test -n {{.APP_NAMESPACE}} 2>/dev/null || echo "  (not deployed)"
+      - echo ""
+      - echo "=== PostgreSQL on Remote-2 ({{.REMOTE_CLUSTER_2}}) ==="
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" get pod postgres-test -n {{.APP_NAMESPACE}} 2>/dev/null || echo "  (not deployed)"
+
+  # ============================================================================
+  # TEST APPLICATIONS
+  # ============================================================================
+  #
+  # Individual app deployment with cluster selection:
+  #   task eks:app:echo:deploy CLUSTER=eks-remote-1
+  #   task eks:app:postgres:deploy CLUSTER=eks-remote-1
+  #   task eks:app:sqs:deploy CLUSTER=eks-remote-1
+  #
+  # Shortcuts for specific clusters:
+  #   task eks:app:echo:deploy:remote1
+  #   task eks:app:echo:deploy:remote2
+  #
+  # Deploy all apps to a cluster:
+  #   task eks:apps:deploy CLUSTER=eks-remote-1
+  #
+  # ============================================================================
+
+  # --- BUILD ALL APPS ---
+
+  apps:build:all:
+    desc: Build and push all apps to Docker Hub
+    cmds:
+      - task: app:echo:build
+      - task: app:postgres:build
+      - task: app:sqs:build
+      - echo "All apps built and pushed!"
+
+  # --- LIST / STATUS ---
+
+  apps:list:
+    desc: List deployed apps on all clusters
+    cmds:
+      - echo "=== Apps on Remote-1 ({{.REMOTE_CLUSTER_1}}) ==="
+      - kubectl --context "{{.REMOTE_CLUSTER_1}}" get deployments,pods -n {{.APP_NAMESPACE}} 2>/dev/null || echo "  (not accessible)"
+      - echo ""
+      - echo "=== Apps on Remote-2 ({{.REMOTE_CLUSTER_2}}) ==="
+      - kubectl --context "{{.REMOTE_CLUSTER_2}}" get deployments,pods -n {{.APP_NAMESPACE}} 2>/dev/null || echo "  (not accessible)"
+
+  # --- DEPLOY ALL ---
+
+  apps:deploy:all:
+    desc: Deploy all apps to both remote clusters
+    cmds:
+      - task: apps:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - task: apps:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+      - echo ""
+      - echo "All apps deployed to both clusters!"
+
+  apps:deploy:
+    desc: "Deploy all apps to a cluster (usage: CLUSTER=eks-remote-1 task eks:apps:deploy)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          echo "Usage: CLUSTER=eks-remote-1 task eks:apps:deploy"
+          echo "   or: task eks:apps:deploy CLUSTER=eks-remote-1"
+          exit 1
+        fi
+      - task: app:echo:deploy
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      - task: app:postgres:deploy
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      - task: app:sqs:deploy
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      - echo "All apps deployed to {{.CLUSTER}}"
+
+  apps:deploy:remote1:
+    desc: Deploy all apps to remote-1
+    cmds:
+      - task: apps:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  apps:deploy:remote2:
+    desc: Deploy all apps to remote-2
+    cmds:
+      - task: apps:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  # --- DELETE ALL ---
+
+  apps:delete:all:
+    desc: Delete all apps from both remote clusters
+    cmds:
+      - task: apps:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - task: apps:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  apps:delete:
+    desc: "Delete all apps from a cluster (usage: CLUSTER=eks-remote-1 task eks:apps:delete)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          echo "Usage: CLUSTER=eks-remote-1 task eks:apps:delete"
+          exit 1
+        fi
+      - task: app:echo:delete
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      - task: app:postgres:delete
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      - task: app:sqs:delete
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      - echo "All apps deleted from {{.CLUSTER}}"
+
+  apps:delete:remote1:
+    desc: Delete all apps from remote-1
+    cmds:
+      - task: apps:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  apps:delete:remote2:
+    desc: Delete all apps from remote-2
+    cmds:
+      - task: apps:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  # ============================================================================
+  # ECHO APP (Traffic mirroring/stealing)
+  # ============================================================================
+
+  app:echo:build:
+    desc: Build and push echo-app to Docker Hub (multi-platform for EKS)
+    vars:
+      EKS_ECHO_IMAGE: "vladrbg/mc-echo-app:latest"
+    cmds:
+      - 'echo "Building echo-app image: {{.EKS_ECHO_IMAGE}} (linux/amd64 for EKS)"'
+      - docker buildx build --platform linux/amd64 -t {{.EKS_ECHO_IMAGE}} --push {{.APPS_DIR}}/echo-app
+      - 'echo "Done! Image pushed to {{.EKS_ECHO_IMAGE}}"'
+
+  app:echo:deploy:
+    desc: "Deploy echo app (usage: CLUSTER=eks-remote-1 task eks:app:echo:deploy)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          echo "Usage: CLUSTER=eks-remote-1 task eks:app:echo:deploy"
+          exit 1
+        fi
+      - kubectl --context "{{.CLUSTER}}" create namespace {{.APP_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.CLUSTER}}" apply -f -
+      - |
+        echo "Deploying echo-app to {{.CLUSTER}}..."
+        kubectl --context "{{.CLUSTER}}" apply -n {{.APP_NAMESPACE}} --validate=false -f - << 'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app
+          namespace: {{.APP_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: echo-app
+          template:
+            metadata:
+              labels:
+                app: echo-app
+            spec:
+              containers:
+              - name: echo
+                image: vladrbg/mc-echo-app:latest
+                imagePullPolicy: Always
+                ports:
+                - containerPort: 8080
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: echo-app
+          namespace: {{.APP_NAMESPACE}}
+        spec:
+          selector:
+            app: echo-app
+          ports:
+          - port: 80
+            targetPort: 8080
+        EOF
+        echo "echo-app deployed to {{.CLUSTER}}"
+
+  app:echo:deploy:remote1:
+    desc: Deploy echo app to remote-1
+    cmds:
+      - task: app:echo:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  app:echo:deploy:remote2:
+    desc: Deploy echo app to remote-2
+    cmds:
+      - task: app:echo:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  app:echo:delete:
+    desc: "Delete echo app (usage: CLUSTER=eks-remote-1 task eks:app:echo:delete)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          exit 1
+        fi
+      - kubectl --context "{{.CLUSTER}}" delete deployment echo-app -n {{.APP_NAMESPACE}} --ignore-not-found
+      - kubectl --context "{{.CLUSTER}}" delete service echo-app -n {{.APP_NAMESPACE}} --ignore-not-found
+      - echo "echo-app deleted from {{.CLUSTER}}"
+
+  app:echo:delete:remote1:
+    desc: Delete echo app from remote-1
+    cmds:
+      - task: app:echo:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  app:echo:delete:remote2:
+    desc: Delete echo app from remote-2
+    cmds:
+      - task: app:echo:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  # ============================================================================
+  # POSTGRES APP (Database branching)
+  # ============================================================================
+
+  app:postgres:build:
+    desc: Build and push postgres-app to Docker Hub (multi-platform for EKS)
+    vars:
+      EKS_POSTGRES_IMAGE: "vladrbg/mc-postgres-app:latest"
+    cmds:
+      - 'echo "Building postgres-app image: {{.EKS_POSTGRES_IMAGE}} (linux/amd64 for EKS)"'
+      - docker buildx build --platform linux/amd64 -t {{.EKS_POSTGRES_IMAGE}} --push {{.APPS_DIR}}/postgres-app
+      - 'echo "Done! Image pushed to {{.EKS_POSTGRES_IMAGE}}"'
+
+  app:postgres:deploy:
+    desc: "Deploy postgres app (usage: CLUSTER=eks-remote-1 task eks:app:postgres:deploy)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          echo "Usage: CLUSTER=eks-remote-1 task eks:app:postgres:deploy"
+          exit 1
+        fi
+      - kubectl --context "{{.CLUSTER}}" create namespace {{.APP_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.CLUSTER}}" apply -f -
+      - |
+        echo "Deploying postgres-app to {{.CLUSTER}}..."
+        kubectl --context "{{.CLUSTER}}" apply -n {{.APP_NAMESPACE}} --validate=false -f - << 'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: postgres-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: postgres-app
+          template:
+            metadata:
+              labels:
+                app: postgres-app
+            spec:
+              containers:
+              - name: app
+                image: vladrbg/mc-postgres-app:latest
+                imagePullPolicy: Always
+                env:
+                - name: DATABASE_URL
+                  value: "postgresql://postgres:postgres@postgres-test.{{.APP_NAMESPACE}}.svc.cluster.local:5432/source_db?sslmode=disable"
+        EOF
+        echo "postgres-app deployed to {{.CLUSTER}}"
+
+  app:postgres:deploy:remote1:
+    desc: Deploy postgres app to remote-1
+    cmds:
+      - task: app:postgres:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  app:postgres:deploy:remote2:
+    desc: Deploy postgres app to remote-2
+    cmds:
+      - task: app:postgres:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  app:postgres:delete:
+    desc: "Delete postgres app (usage: CLUSTER=eks-remote-1 task eks:app:postgres:delete)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          exit 1
+        fi
+      - kubectl --context "{{.CLUSTER}}" delete deployment postgres-app -n {{.APP_NAMESPACE}} --ignore-not-found
+      - echo "postgres-app deleted from {{.CLUSTER}}"
+
+  app:postgres:delete:remote1:
+    desc: Delete postgres app from remote-1
+    cmds:
+      - task: app:postgres:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  app:postgres:delete:remote2:
+    desc: Delete postgres app from remote-2
+    cmds:
+      - task: app:postgres:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  # ============================================================================
+  # SQS CONSUMER APP (Queue splitting)
+  # ============================================================================
+
+  app:sqs:build:
+    desc: Build and push sqs-consumer to Docker Hub (multi-platform for EKS)
+    vars:
+      EKS_SQS_IMAGE: "vladrbg/mc-sqs-consumer:latest"
+    cmds:
+      - 'echo "Building sqs-consumer image: {{.EKS_SQS_IMAGE}} (linux/amd64 for EKS)"'
+      - docker buildx build --platform linux/amd64 -t {{.EKS_SQS_IMAGE}} --push {{.APPS_DIR}}/sqs-consumer
+      - 'echo "Done! Image pushed to {{.EKS_SQS_IMAGE}}"'
+
+  app:sqs:deploy:
+    desc: "Deploy SQS consumer app (usage: CLUSTER=eks-remote-1 task eks:app:sqs:deploy)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          echo "Usage: CLUSTER=eks-remote-1 task eks:app:sqs:deploy"
+          exit 1
+        fi
+      - kubectl --context "{{.CLUSTER}}" create namespace {{.APP_NAMESPACE}} --dry-run=client -o yaml | kubectl --context "{{.CLUSTER}}" apply -f -
+      - |
+        echo "Deploying sqs-consumer to {{.CLUSTER}}..."
+        kubectl --context "{{.CLUSTER}}" apply -n {{.APP_NAMESPACE}} --validate=false -f - << 'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: consumer
+                image: vladrbg/mc-sqs-consumer:latest
+                imagePullPolicy: Always
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_REGION
+                  value: "eu-north-1"
+                - name: APP_NAME
+                  value: "sqs-consumer"
+                - name: CLUSTER_NAME
+                  value: "eks-dev2"
+        EOF
+        echo "sqs-consumer deployed to {{.CLUSTER}}"
+
+  app:sqs:deploy:remote1:
+    desc: Deploy SQS consumer to remote-1
+    cmds:
+      - task: app:sqs:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  app:sqs:deploy:remote2:
+    desc: Deploy SQS consumer to remote-2
+    cmds:
+      - task: app:sqs:deploy
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  app:sqs:delete:
+    desc: "Delete SQS consumer app (usage: CLUSTER=eks-remote-1 task eks:app:sqs:delete)"
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.CLUSTER}}" ]; then
+          echo "ERROR: CLUSTER variable required"
+          exit 1
+        fi
+      - kubectl --context "{{.CLUSTER}}" delete deployment sqs-consumer -n {{.APP_NAMESPACE}} --ignore-not-found
+      - echo "sqs-consumer deleted from {{.CLUSTER}}"
+
+  app:sqs:delete:remote1:
+    desc: Delete SQS consumer from remote-1
+    cmds:
+      - task: app:sqs:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+
+  app:sqs:delete:remote2:
+    desc: Delete SQS consumer from remote-2
+    cmds:
+      - task: app:sqs:delete
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
+  # ============================================================================
+  # CLEANUP
+  # ============================================================================
+
+  cleanup:all:
+    desc: Remove everything from all clusters
+    cmds:
+      - echo "=== Cleaning up all clusters ==="
+      - task: cleanup:cluster
+        vars: { CLUSTER: "{{.MANAGEMENT_CLUSTER}}" }
+      - task: cleanup:cluster
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - task: cleanup:cluster
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+      - echo "Cleanup complete"
+
+  cleanup:cluster:
+    desc: Remove mirrord from a cluster
+    vars:
+      CLUSTER: "{{.CLUSTER}}"
+    cmds:
+      - echo "Cleaning up {{.CLUSTER}}..."
+      - helm uninstall mirrord-operator --kube-context {{.CLUSTER}} -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || true
+      - kubectl --context "{{.CLUSTER}}" delete namespace {{.APP_NAMESPACE}} --ignore-not-found 2>/dev/null || true
+      - kubectl --context "{{.CLUSTER}}" delete namespace {{.OPERATOR_NAMESPACE}} --ignore-not-found 2>/dev/null || true
+
+  # ============================================================================
+  # ECHO APP TESTS
+  # ============================================================================
+
+  test:echo:multi-cluster:
+    desc: "Test echo app via multi-cluster primary (simple HTTP steal test)"
+    cmds:
+      - |
+        echo "=== Echo App Test (Multi-Cluster via EKS) ==="
+        echo "Management cluster: {{.MANAGEMENT_CLUSTER}}"
+        echo ""
+
+        cd {{.APPS_DIR}}/echo-app
+
+        # Build the echo app
+        echo "Building echo-app..."
+        go build -o /tmp/echo-app main.go 2>/dev/null || echo "Build may have failed"
+
+        echo "Starting mirrord session (steal mode with header filter)..."
+        echo ""
+        echo "To send test requests from another terminal:"
+        echo "  task eks:test:echo:send"
+        echo ""
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.MANAGEMENT_CLUSTER}} \
+          -f {{.EKS_CONFIG_DIR}}/mirrord-echo-test.json \
+          -- /tmp/echo-app
+
+  test:echo:multi-cluster:mirror:
+    desc: "Test echo app via multi-cluster primary (mirror mode — no header filter)"
+    cmds:
+      - |
+        echo "=== Echo App Mirror Test (Multi-Cluster via EKS) ==="
+        echo "Management cluster: {{.MANAGEMENT_CLUSTER}}"
+        echo ""
+
+        cd {{.APPS_DIR}}/echo-app
+
+        # Build the echo app
+        echo "Building echo-app..."
+        go build -o /tmp/echo-app main.go 2>/dev/null || echo "Build may have failed"
+
+        # Create a mirror config on the fly
+        cat > /tmp/mirrord-echo-mirror.json << 'EOF'
+        {
+          "target": {
+            "path": "deploy/echo-app",
+            "namespace": "test-multicluster"
+          },
+          "feature": {
+            "network": {
+              "incoming": {
+                "mode": "mirror"
+              }
+            }
+          }
+        }
+        EOF
+
+        echo "Starting mirrord session (mirror mode)..."
+        echo ""
+        echo "To send test requests from another terminal:"
+        echo "  task eks:test:echo:send"
+        echo ""
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.MANAGEMENT_CLUSTER}} \
+          -f /tmp/mirrord-echo-mirror.json \
+          -- /tmp/echo-app
+
+  test:echo:send:
+    desc: "Send test HTTP requests to echo-app on both remote clusters"
+    vars:
+      COUNT: '{{.COUNT | default "3"}}'
+    cmds:
+      - |
+        echo "=== Sending requests to echo-app on both remotes ==="
+
+        # Port-forward to both clusters
+        kubectl --context "{{.REMOTE_CLUSTER_1}}" port-forward -n {{.APP_NAMESPACE}} svc/echo-app 18080:80 &
+        PF1=$!
+        kubectl --context "{{.REMOTE_CLUSTER_2}}" port-forward -n {{.APP_NAMESPACE}} svc/echo-app 18081:80 &
+        PF2=$!
+        trap "kill $PF1 $PF2 2>/dev/null" EXIT
+        sleep 2
+
+        for i in $(seq 1 {{.COUNT}}); do
+          echo ""
+          echo "=== Request $i ==="
+
+          echo "--- Remote 1 (dev2) - no filter header ---"
+          curl -s "http://localhost:18080/echo" \
+            -H "Content-Type: application/json" \
+            -d "{\"test\": $i, \"cluster\": \"dev2\"}" | jq . 2>/dev/null || echo "(failed)"
+
+          echo "--- Remote 1 (dev2) - with X-My-Header: filtered-data ---"
+          curl -s "http://localhost:18080/echo" \
+            -H "Content-Type: application/json" \
+            -H "X-My-Header: filtered-data" \
+            -d "{\"test\": $i, \"cluster\": \"dev2\", \"filtered\": true}" | jq . 2>/dev/null || echo "(failed)"
+
+          echo "--- Remote 2 (dev3) - no filter header ---"
+          curl -s "http://localhost:18081/echo" \
+            -H "Content-Type: application/json" \
+            -d "{\"test\": $i, \"cluster\": \"dev3\"}" | jq . 2>/dev/null || echo "(failed)"
+
+          echo "--- Remote 2 (dev3) - with X-My-Header: filtered-data ---"
+          curl -s "http://localhost:18081/echo" \
+            -H "Content-Type: application/json" \
+            -H "X-My-Header: filtered-data" \
+            -d "{\"test\": $i, \"cluster\": \"dev3\", \"filtered\": true}" | jq . 2>/dev/null || echo "(failed)"
+        done
+
+        echo ""
+        echo "=== Done ==="
+
+  # ============================================================================
+  # SQS SPLIT TESTS
+  # ============================================================================
+
+  test:sqs:split:multi-cluster:
+    desc: "Test SQS splitting via multi-cluster primary (usage: FILTER=premium task eks:test:sqs:split:multi-cluster)"
+    vars:
+      FILTER: '{{.FILTER | default "*"}}'
+    cmds:
+      - |
+        echo "=== SQS Split Test (Multi-Cluster via EKS) ==="
+        echo "Filter type: {{.FILTER}}"
+        echo ""
+
+        # Determine config file based on filter
+        case "{{.FILTER}}" in
+          premium)    CONFIG="mirrord-premium.json" ;;
+          gold)       CONFIG="mirrord-gold.json" ;;
+          vip)        CONFIG="mirrord-vip.json" ;;
+          enterprise) CONFIG="mirrord-enterprise.json" ;;
+          all)        CONFIG="mirrord-all.json" ;;
+          *)          CONFIG="mirrord.json" ;;
+        esac
+
+        echo "Using config: $CONFIG"
+        echo "Management cluster: {{.MANAGEMENT_CLUSTER}}"
+        echo ""
+
+        cd {{.APPS_DIR}}/sqs-consumer
+
+        # Build the consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+
+        export AWS_REGION={{.SQS_AWS_REGION}}
+        export QUEUE_NAME={{.SQS_QUEUE_NAME}}
+
+        echo "Starting mirrord session..."
+        echo "Send messages with: task eks:sqs:send"
+        echo ""
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.MANAGEMENT_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-sqs/$CONFIG \
+          -- /tmp/sqs-consumer
+
+  test:sqs:split:single-cluster:
+    desc: "Test SQS splitting directly on a remote cluster (usage: CLUSTER=eks-remote-1 task eks:test:sqs:split:single-cluster)"
+    vars:
+      CLUSTER: "{{.CLUSTER | default .REMOTE_CLUSTER_1}}"
+    cmds:
+      - |
+        echo "=== SQS Split Test (Single-Cluster on {{.CLUSTER}}) ==="
+        echo ""
+        echo "This connects directly to {{.CLUSTER}} (bypassing multi-cluster primary)"
+        echo "Use this to compare single-cluster vs multi-cluster behavior"
+        echo ""
+
+        # Create a mirrord config for single-cluster test
+        cat > /tmp/mirrord-eks-single-cluster-sqs.json << 'EOF'
+        {
+          "target": {
+            "path": "deployment/sqs-consumer",
+            "namespace": "test-multicluster"
+          },
+          "operator": true,
+          "feature": {
+            "split_queues": {
+              "test-queue": {
+                "queue_type": "SQS",
+                "message_filter": {
+                  "type": "^premium$"
+                }
+              }
+            },
+            "env": true,
+            "fs": "local"
+          }
+        }
+        EOF
+
+        echo "Running local SQS consumer with mirrord (single-cluster)..."
+        cd {{.APPS_DIR}}/sqs-consumer
+
+        # Build the consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+
+        export AWS_REGION={{.SQS_AWS_REGION}}
+        export QUEUE_NAME={{.SQS_QUEUE_NAME}}
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.CLUSTER}} \
+          -f /tmp/mirrord-eks-single-cluster-sqs.json \
+          -- /tmp/sqs-consumer
+
+  test:sqs:split:multi-cluster:all:
+    desc: "Show commands to run multiple filter tests in parallel"
+    cmds:
+      - |
+        echo "=== Multi-Filter SQS Test (EKS) ==="
+        echo ""
+        echo "Open 4 terminals and run these commands:"
+        echo ""
+        echo "  Terminal 1 (premium):    task eks:test:sqs:split:multi-cluster FILTER=premium"
+        echo "  Terminal 2 (gold):       task eks:test:sqs:split:multi-cluster FILTER=gold"
+        echo "  Terminal 3 (vip):        task eks:test:sqs:split:multi-cluster FILTER=vip"
+        echo "  Terminal 4 (enterprise): task eks:test:sqs:split:multi-cluster FILTER=enterprise"
+        echo ""
+        echo "Then send test messages from another terminal:"
+        echo ""
+        echo "  task eks:sqs:send COUNT=10"
+        echo ""
+        echo "Watch each terminal receive only its matching messages!"
+
+  sqs:send:
+    desc: "Send test messages to SQS queue from inside the cluster (usage: task eks:sqs:send FILTERED=5 UNFILTERED=5)"
+    vars:
+      FILTERED: '{{.FILTERED | default "5"}}'
+      UNFILTERED: '{{.UNFILTERED | default "5"}}'
+      CLUSTER: "{{.CLUSTER | default .REMOTE_CLUSTER_1}}"
+    cmds:
+      - |
+        echo "=== Sending messages to SQS from inside cluster ==="
+        echo "Sending {{.FILTERED}} filtered (type=premium) + {{.UNFILTERED}} unfiltered (type=basic) messages..."
+        echo "Queue: {{.SQS_QUEUE_NAME}} | Region: {{.SQS_AWS_REGION}}"
+        echo ""
+
+        QUEUE_URL="https://sqs.{{.SQS_AWS_REGION}}.amazonaws.com/526936346962/{{.SQS_QUEUE_NAME}}"
+
+        # Send filtered messages (type=premium - will be split to local app)
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl --context "{{.CLUSTER}}" run "sqs-send-f$i" --rm -i --restart=Never \
+            -n {{.APP_NAMESPACE}} --image=amazon/aws-cli --command -- \
+            sh -c "aws sqs send-message --queue-url $QUEUE_URL --region {{.SQS_AWS_REGION}} \
+              --message-body '{\"order_id\":\"ORD-F$i\",\"amount\":$((RANDOM % 1000)),\"tenant\":\"premium-customer\"}' \
+              --message-attributes '{\"type\":{\"DataType\":\"String\",\"StringValue\":\"premium\"}}' \
+              --query MessageId --output text 2>&1" 2>/dev/null && echo "FILTERED $i: sent" || echo "FILTERED $i: failed"
+        done
+
+        # Send unfiltered messages (type=basic - stays in original queue)
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl --context "{{.CLUSTER}}" run "sqs-send-u$i" --rm -i --restart=Never \
+            -n {{.APP_NAMESPACE}} --image=amazon/aws-cli --command -- \
+            sh -c "aws sqs send-message --queue-url $QUEUE_URL --region {{.SQS_AWS_REGION}} \
+              --message-body '{\"order_id\":\"ORD-U$i\",\"amount\":$((RANDOM % 100)),\"tenant\":\"basic-customer\"}' \
+              --message-attributes '{\"type\":{\"DataType\":\"String\",\"StringValue\":\"basic\"}}' \
+              --query MessageId --output text 2>&1" 2>/dev/null && echo "UNFILTERED $i: sent" || echo "UNFILTERED $i: failed"
+        done
+
+        echo ""
+        echo "Done! Sent {{.FILTERED}} filtered + {{.UNFILTERED}} unfiltered = $(({{.FILTERED}} + {{.UNFILTERED}})) total"
+
+  sqs:send:multi-filter:
+    desc: "Send messages with multiple filter types (usage: task eks:sqs:send:multi-filter COUNT=3)"
+    vars:
+      COUNT: '{{.COUNT | default "3"}}'
+    cmds:
+      - |
+        echo "=== Sending multi-filter messages to SQS ==="
+        echo "Sending {{.COUNT}} messages per type (premium, gold, vip, enterprise, basic)..."
+        echo ""
+
+        QUEUE_URL=$(aws sqs get-queue-url --queue-name {{.SQS_QUEUE_NAME}} --region {{.SQS_AWS_REGION}} --output text 2>/dev/null)
+        if [ -z "$QUEUE_URL" ]; then
+          echo "ERROR: Could not find queue '{{.SQS_QUEUE_NAME}}' in region {{.SQS_AWS_REGION}}"
+          exit 1
+        fi
+
+        for TYPE in premium gold vip enterprise basic; do
+          for i in $(seq 1 {{.COUNT}}); do
+            MSG_ID=$(aws sqs send-message \
+              --queue-url "$QUEUE_URL" \
+              --region {{.SQS_AWS_REGION}} \
+              --message-body "{\"order_id\": \"ORD-${TYPE}-$i\", \"amount\": $((RANDOM % 1000)), \"tenant\": \"${TYPE}-customer\", \"type\": \"$TYPE\"}" \
+              --message-attributes "{\"type\":{\"DataType\":\"String\",\"StringValue\":\"$TYPE\"}}" \
+              --output text --query 'MessageId' 2>/dev/null) && echo "$TYPE: $MSG_ID" || echo "$TYPE: failed"
+          done
+        done
+
+        echo ""
+        echo "Done! Sent $(({{.COUNT}} * 5)) total messages ({{.COUNT}} per type)"
+
+  sqs:status:
+    desc: Show SQS queue stats and session status
+    cmds:
+      - |
+        echo "=== SQS Status (EKS) ==="
+        echo ""
+
+        echo "--- Queue Attributes ({{.SQS_QUEUE_NAME}}) ---"
+        QUEUE_URL=$(aws sqs get-queue-url --queue-name {{.SQS_QUEUE_NAME}} --region {{.SQS_AWS_REGION}} --output text 2>/dev/null)
+        if [ -n "$QUEUE_URL" ]; then
+          aws sqs get-queue-attributes \
+            --queue-url "$QUEUE_URL" \
+            --region {{.SQS_AWS_REGION}} \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --output json 2>/dev/null | jq -r '.Attributes' || echo "(failed)"
+        else
+          echo "(queue not found)"
+        fi
+
+        echo ""
+        echo "--- Management Cluster Sessions ---"
+        kubectl --context {{.MANAGEMENT_CLUSTER}} get mirrordmulticlustersession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+
+        echo ""
+        echo "--- Remote-1 Sessions ---"
+        echo "MirrordClusterSession:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+        echo "MirrordSqsSession:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordsqssession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+
+        echo ""
+        echo "--- Remote-2 Sessions ---"
+        echo "MirrordClusterSession:"
+        kubectl --context {{.REMOTE_CLUSTER_2}} get mirrordclustersession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+        echo "MirrordSqsSession:"
+        kubectl --context {{.REMOTE_CLUSTER_2}} get mirrordsqssession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+
+  sqs:cleanup:sessions:
+    desc: Delete all stale SQS sessions
+    cmds:
+      - |
+        echo "=== Cleaning up SQS sessions ==="
+        echo ""
+        echo "Management cluster sessions:"
+        kubectl --context {{.MANAGEMENT_CLUSTER}} delete mirrordmulticlustersession --all -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none to delete)"
+        echo ""
+        echo "Remote-1 sessions:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} delete mirrordclustersession --all -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none to delete)"
+        echo ""
+        echo "Remote-2 sessions:"
+        kubectl --context {{.REMOTE_CLUSTER_2}} delete mirrordclustersession --all -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none to delete)"
+        echo ""
+        echo "Waiting for SQS sessions to be garbage collected..."
+        sleep 3
+        echo ""
+        echo "Remaining sessions:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersession,mirrordsqssession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+        kubectl --context {{.REMOTE_CLUSTER_2}} get mirrordclustersession,mirrordsqssession -n {{.OPERATOR_NAMESPACE}} 2>/dev/null || echo "(none)"
+
+  sqs:logs:
+    desc: Show SQS consumer logs from remote clusters
+    cmds:
+      - |
+        echo "=== SQS Consumer Logs (EKS) ==="
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.APP_NAMESPACE}} -l app=sqs-consumer --tail=20 2>/dev/null || echo "No logs"
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_2}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.APP_NAMESPACE}} -l app=sqs-consumer --tail=20 2>/dev/null || echo "No logs"
+
+  test:sqs:copy-target:
+    desc: Test SQS with copy_target via multi-cluster primary
+    cmds:
+      - |
+        echo "=== SQS + Copy Target Test (EKS Multi-Cluster) ==="
+        echo ""
+        echo "This tests SQS with copy_target via management cluster."
+        echo "The copy should be created and consume from temp queue."
+        echo ""
+        echo "Config: {{.K8S_DIR}}/overlays/multicluster-sqs/mirrord-copy-target.json"
+        echo ""
+
+        echo "Running with copy_target + SQS split..."
+        cd {{.APPS_DIR}}/sqs-consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+
+        export AWS_REGION={{.SQS_AWS_REGION}}
+        export QUEUE_NAME={{.SQS_QUEUE_NAME}}
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.MANAGEMENT_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-sqs/mirrord-copy-target.json \
+          -- /tmp/sqs-consumer

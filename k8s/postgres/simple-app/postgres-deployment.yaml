@@ -68,6 +68,8 @@ spec:
           value: postgres
         - name: POSTGRES_USER
           value: postgres
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres-test:5432/source_db"
       ports:
         - containerPort: 5432
       volumeMounts:

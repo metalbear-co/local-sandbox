@@ -1,0 +1,13 @@
+{
+  "target": {
+    "path": "pod/echo-app-7bdd7f6f6-9hwpw",
+    "namespace": "test-multicluster"
+  },
+  "feature": {
+    "network": {
+      "incoming": {
+        "mode": "steal"
+      }
+    }
+  }
+}

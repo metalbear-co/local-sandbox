@@ -1,0 +1,35 @@
+# Operator values for REMOTE clusters (AWS EKS)
+#
+# Remote clusters run standard operators with multiClusterMember enabled.
+# This creates the ClusterRole and bindings needed for the primary to manage them.
+#
+# For IAM auth clusters (dev3), also pass:
+#   --set operator.multiClusterMemberIamGroup=mirrord-operator-envoy
+# This creates a ClusterRoleBinding for the IAM group instead of the ServiceAccount.
+#
+operator:
+  # Enable all features
+  sqsSplitting: true
+  kafkaSplitting: true
+  mysqlBranching: true
+  pgBranching: true
+  mongodbBranching: true
+  metrics: true
+  jsonLog: true
+  logLevel: "info"
+
+  # AWS region for SQS
+  extraEnv:
+    AWS_REGION: "eu-north-1"
+
+  # Mark as a remote cluster member — creates ClusterRole + bindings
+  multiClusterMember: true
+
+license:
+  key: "cE-r8nmXETkuHviGdsZq4Vp9sa5MnSrCHQQebqwHfDU"
+  # pemRef: "mirrord-operator-license-pem"
+
+createNamespace: false
+
+image:
+  pullPolicy: Always

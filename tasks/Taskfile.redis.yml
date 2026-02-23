@@ -7,11 +7,13 @@ vars:
   REDIS_NAMESPACE: 'redis-test'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   APP_DIR: "{{.ROOT_DIR}}/apps/redis-app"
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
 
 tasks:
   deploy:
     desc: "Deploy Redis test environment to cluster"
     cmds:
+      - task: build:docker
       - kubectl apply -k {{.ROOT_DIR}}/k8s/redis
       - task: _wait:redis
       - task: _wait:app
@@ -38,18 +40,39 @@ tasks:
       - cd {{.APP_DIR}} && go mod tidy && go build -o redis-app .
 
   build:docker:
-    desc: "Build Redis test app Docker image for minikube"
+    desc: "Build Redis test app Docker image and load into minikube"
     cmds:
-      - cd {{.APP_DIR}} && eval $(minikube docker-env) && docker build -t redis-app:latest .
+      - cd {{.APP_DIR}} && docker build -t redis-app:latest .
+      - minikube -p {{.CLUSTER_NAME}} image load redis-app:latest
 
   run:local:
-    desc: "Run app locally with local Redis (uses outgoing.filter.local config)"
+    desc: "App 1: Redis port 6379, App port 8080 (default)"
     cmds:
       - |
-        cd {{.APP_DIR}} && {{.MIRRORD_BIN}} exec \
+        cd {{.APP_DIR}} && PORT=8080 {{.MIRRORD_BIN}} exec \
           -t deploy/redis-main \
           -n {{.REDIS_NAMESPACE}} \
           -f mirrord-local.json \
+          -- ./redis-app
+
+  run:local:second:
+    desc: "App 2: Redis port 6379 (shared), App port 8081"
+    cmds:
+      - |
+        cd {{.APP_DIR}} && PORT=8081 {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-main \
+          -n {{.REDIS_NAMESPACE}} \
+          -f mirrord-local-second.json \
+          -- ./redis-app
+
+  run:local:third:
+    desc: "App 3: Redis port 6380 (separate), App port 8082"
+    cmds:
+      - |
+        cd {{.APP_DIR}} && PORT=8082 {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-main \
+          -n {{.REDIS_NAMESPACE}} \
+          -f mirrord-local-port-second.json \
           -- ./redis-app
 
   run:cluster:

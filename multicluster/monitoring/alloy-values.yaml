@@ -1,0 +1,126 @@
+# Grafana Alloy Helm Values (2026)
+# Chart: grafana/alloy
+# Docs: https://grafana.com/docs/alloy/latest/
+alloy:
+  # Alloy configuration using the new River syntax
+  configMap:
+    content: |
+      // Discover Kubernetes pods
+      discovery.kubernetes "pods" {
+        role = "pod"
+      }
+
+      // Relabel to add useful labels
+      discovery.relabel "pods" {
+        targets = discovery.kubernetes.pods.targets
+
+        // Keep only running pods
+        rule {
+          source_labels = ["__meta_kubernetes_pod_phase"]
+          regex         = "Pending|Succeeded|Failed|Completed"
+          action        = "drop"
+        }
+
+        // Add namespace label
+        rule {
+          source_labels = ["__meta_kubernetes_namespace"]
+          target_label  = "namespace"
+        }
+
+        // Add pod label
+        rule {
+          source_labels = ["__meta_kubernetes_pod_name"]
+          target_label  = "pod"
+        }
+
+        // Add container label
+        rule {
+          source_labels = ["__meta_kubernetes_pod_container_name"]
+          target_label  = "container"
+        }
+
+        // Add app label from pod labels
+        rule {
+          source_labels = ["__meta_kubernetes_pod_label_app"]
+          target_label  = "app"
+        }
+
+        // Add node label
+        rule {
+          source_labels = ["__meta_kubernetes_pod_node_name"]
+          target_label  = "node"
+        }
+
+        // Set the log file path
+        rule {
+          source_labels = ["__meta_kubernetes_pod_uid", "__meta_kubernetes_pod_container_name"]
+          separator     = "/"
+          target_label  = "__path__"
+          replacement   = "/var/log/pods/*$1/*.log"
+        }
+      }
+
+      // Collect logs from discovered pods
+      loki.source.kubernetes "pods" {
+        targets    = discovery.relabel.pods.output
+        forward_to = [loki.process.pipeline.receiver]
+      }
+
+      // Process logs - parse and add labels
+      loki.process "pipeline" {
+        // Parse container runtime format
+        stage.cri {}
+
+        // Add cluster label (set via environment variable)
+        stage.static_labels {
+          values = {
+            cluster = env("CLUSTER_NAME"),
+          }
+        }
+
+        // Try to parse JSON logs
+        stage.json {
+          expressions = {
+            level   = "level",
+            message = "message",
+            target  = "target",
+          }
+        }
+
+        // Add parsed fields as labels
+        stage.labels {
+          values = {
+            level = "",
+          }
+        }
+
+        forward_to = [loki.write.default.receiver]
+      }
+
+      // Write to Loki
+      loki.write "default" {
+        endpoint {
+          url = env("LOKI_URL")
+        }
+      }
+
+# Controller type - DaemonSet to run on every node
+controller:
+  type: daemonset
+
+# Resource limits
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 256Mi
+
+# Mount log directories
+mounts:
+  varlog: true
+  dockercontainers: true
+
+# Extra environment variables (set at install time)
+# CLUSTER_NAME and LOKI_URL are set via --set

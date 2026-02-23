@@ -15,10 +15,10 @@
     },
     "db_branches": [
       {
-        "id": "pg-dev-branch",
+        "id": "pg-dev-random-id",
+        "name": "my_database_name_etc",
         "type": "pg",
         "version": "17",
-        "name": "source_db",
         "ttl_secs": 600,
         "creation_timeout_secs": 90,
         "connection": {
@@ -28,15 +28,7 @@
           }
         },
         "copy": {
-          "mode": "schema",
-          "tables": {
-            "users": {
-              "filter": "age > 18"
-            },
-            "orders": {
-              "filter": "amount > 50"
-            }
-          }
+          "mode": "empty"
         }
       }
     ]

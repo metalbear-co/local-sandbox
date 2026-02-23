@@ -1,0 +1,31 @@
+# Queue Registry for SQS splitting tests
+#
+# This registry defines the queue ID -> actual queue URL mapping.
+# The mirrord configs (mirrord-premium.json, mirrord-gold.json, etc.)
+# reference these queue IDs and apply their own message filters.
+#
+# All filter types (premium, gold, vip, enterprise) use the same
+# "test-queue" ID - filters are applied at the message level, not queue level.
+#
+# Available mirrord configs:
+#   - mirrord-premium.json    (type=^premium$)
+#   - mirrord-gold.json       (type=^gold$)
+#   - mirrord-vip.json        (type=^vip$)
+#   - mirrord-enterprise.json (type=^enterprise$)
+#   - mirrord-all.json        (type=.* matches all)
+#
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordWorkloadQueueRegistry
+metadata:
+  name: sqs-test-registry
+  namespace: test-multicluster
+spec:
+  queues:
+    # Main test queue - all filter types use this queue ID
+    test-queue:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_NAME
+  consumer:
+    name: sqs-consumer
+    workloadType: Deployment

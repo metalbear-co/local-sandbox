@@ -2,31 +2,33 @@
 # Sets up a simulated multi-cluster environment using minikube
 # for testing mirrord operator's multi-cluster features
 #
-# Usage:
-#   task multicluster:setup                              # 2 clusters, primary has workloads
-#   NUM_CLUSTERS=3 task multicluster:setup               # 3 clusters, primary has workloads
-#   PRIMARY_MANAGEMENT_ONLY=true task multicluster:setup # 2 clusters, primary is management-only
+# ## Cluster Discovery
+#
+# Clusters are discovered from Kubernetes Secrets with label:
+#   operator.metalbear.co/remote-cluster-credentials=true
+#
+# Tokens are auto-refreshed using TokenRequest API every 45 minutes.
+#
+# ## Usage
+#
+#   task multicluster:setup:all                # 2 clusters (primary + 1 remote)
+#   NUM_CLUSTERS=3 task multicluster:setup:all # 3 clusters (primary + 2 remotes)
 #
 #   task multicluster:test:generate:traffic    # Generate traffic
 #   task multicluster:test:steal:multi-cluster # Steal from all clusters
 #
-# Variables:
-#   NUM_CLUSTERS=2|3           - Number of clusters (default: 2)
-#   PRIMARY_MANAGEMENT_ONLY    - If "true", primary only runs Envoy, no workloads (default: false)
-#   PRIMARY_CLUSTER            - Name of primary cluster (default: mirrord-primary)
-#   REMOTE_CLUSTER_1           - Name of first remote cluster (default: mirrord-remote-1)
-#   REMOTE_CLUSTER_2           - Name of second remote cluster (default: mirrord-remote-2)
+# ## Variables
 #
-# Modes:
-#   PRIMARY_MANAGEMENT_ONLY=false (default):
-#     - Primary cluster runs Envoy AND has workloads (echo-app)
-#     - Traffic comes from primary + remote clusters
-#     - default_cluster = primary
+#   NUM_CLUSTERS=2|3        - Number of clusters (default: 2)
+#   PRIMARY_CLUSTER         - Name of primary cluster (default: mirrord-primary)
+#   REMOTE_CLUSTER_1        - Name of first remote cluster (default: mirrord-remote-1)
+#   REMOTE_CLUSTER_2        - Name of second remote cluster (default: mirrord-remote-2)
 #
-#   PRIMARY_MANAGEMENT_ONLY=true:
-#     - Primary cluster ONLY runs Envoy (no workloads)
-#     - Traffic comes from remote clusters only
-#     - default_cluster = remote-1 (first remote cluster)
+# ## Architecture
+#
+#   Primary cluster: Runs Envoy (multi-cluster orchestrator), management-only
+#   Remote clusters: Run standard operators with workloads
+#   Default cluster: remote-1 (handles stateful operations like db branches)
 
 version: "3"
 
@@ -34,32 +36,35 @@ vars:
   # ROOT_DIR is local-sandbox/ (parent of tasks/) - same pattern as other taskfiles
   ROOT_DIR:
     sh: cd .. && pwd
-  CHARTS_DIR: '{{.ROOT_DIR}}/../charts/mirrord-operator'
-  APPS_DIR: '{{.ROOT_DIR}}/apps'
-  K8S_DIR: '{{.ROOT_DIR}}/k8s'
-  
+  CHARTS_DIR: "{{.ROOT_DIR}}/../charts/mirrord-operator"
+  APPS_DIR: "{{.ROOT_DIR}}/apps"
+  K8S_DIR: "{{.ROOT_DIR}}/k8s"
+
   PRIMARY_CLUSTER: '{{.PRIMARY_CLUSTER | default "mirrord-primary"}}'
   REMOTE_CLUSTER_1: '{{.REMOTE_CLUSTER_1 | default "mirrord-remote-1"}}'
   REMOTE_CLUSTER_2: '{{.REMOTE_CLUSTER_2 | default "mirrord-remote-2"}}'
-  
+
   # Number of clusters: 2 (primary + 1 remote) or 3 (primary + 2 remotes)
   # Usage: NUM_CLUSTERS=3 task multicluster:setup
   NUM_CLUSTERS: '{{.NUM_CLUSTERS | default "2"}}'
-  
+
   # If true, primary cluster is management-only (no workloads, only Envoy)
   # Usage: PRIMARY_MANAGEMENT_ONLY=true task multicluster:setup
   PRIMARY_MANAGEMENT_ONLY: '{{.PRIMARY_MANAGEMENT_ONLY | default "false"}}'
-  
+
   # Use MC_NAMESPACE to avoid collision with parent Taskfile's NAMESPACE
   MC_NAMESPACE: '{{.MC_NAMESPACE | default "test-multicluster"}}'
-  
+
   # Directory for multi-cluster config files
-  MC_CONFIG_DIR: '{{.ROOT_DIR}}/multicluster'
-  
+  MC_CONFIG_DIR: "{{.ROOT_DIR}}/multicluster"
+
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
+  AGENT_IMAGE: '{{.AGENT_IMAGE | default "mirrord-agent:custom"}}'
   ECHO_APP_IMAGE: '{{.ECHO_APP_IMAGE | default "echo-app:latest"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  # Path to local mirrord repo for building custom agent
+  MIRRORD_REPO: '{{.MIRRORD_REPO | default (printf "%s/../mirrord" .ROOT_DIR)}}'
 
 tasks:
   clusters:create:
@@ -82,10 +87,9 @@ tasks:
         fi
 
   cluster:create:
-    internal: true
     desc: Create a single minikube cluster profile
     vars:
-      CLUSTER: '{{.CLUSTER}}'
+      CLUSTER: "{{.CLUSTER}}"
     cmds:
       # Add cluster hostnames to the apiserver cert SANs
       # This allows cross-cluster communication using hostnames + hostAliases
@@ -101,6 +105,15 @@ tasks:
           --disk-size=10g \
           --apiserver-names=$APISERVER_NAMES
       - minikube update-context -p {{.CLUSTER}}
+      - |
+        # Fix "too many open files" errors in kube-proxy by increasing inotify limits
+        # See: https://github.com/kubeflow/manifests/issues/2087
+        echo "Configuring inotify limits for {{.CLUSTER}}..."
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_instances=1280" || true
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_watches=655360" || true
+        # Make changes persistent across reboots
+        minikube ssh -p {{.CLUSTER}} -- "echo 'fs.inotify.max_user_instances=1280' | sudo tee -a /etc/sysctl.conf" || true
+        minikube ssh -p {{.CLUSTER}} -- "echo 'fs.inotify.max_user_watches=655360' | sudo tee -a /etc/sysctl.conf" || true
       - echo "Cluster {{.CLUSTER}} created and context updated"
 
   clusters:delete:
@@ -119,124 +132,181 @@ tasks:
     cmds:
       - minikube profile list
 
-  kubeconfig:generate:
-    desc: Generate multi-cluster kubeconfig for operator with embedded certificates and Docker network IPs
+  clusters:fix:inotify:
+    desc: Fix inotify limits on all clusters (fixes "too many open files" in kube-proxy)
     cmds:
       - |
-        # Update contexts to get latest ports (minikube ports can change)
-        echo "Updating minikube contexts..."
-        minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
-        minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
-        
-        # Generate a flattened kubeconfig with embedded certificates
-        # This is required because the operator runs in a container and can't access
-        # local filesystem paths like /Users/.../.minikube/...
-        #
-        # IMPORTANT: We also need to replace 127.0.0.1 URLs with Docker network IPs
-        # because the operator pod can't reach the host's localhost
-        
-        echo "Connecting minikube clusters to each other's Docker networks..."
+        echo "Fixing inotify limits on all clusters..."
+        echo "This addresses 'too many open files' errors in kube-proxy"
+        echo "See: https://github.com/kubeflow/manifests/issues/2087"
+        echo ""
+      - task: cluster:fix:inotify
+        vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}" }
+      - task: cluster:fix:inotify
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:cluster:fix:inotify CLUSTER={{.REMOTE_CLUSTER_2}}
+        fi
+      - echo "Inotify limits updated on all clusters"
+
+  cluster:fix:inotify:
+    desc: Fix inotify limits on a single cluster
+    vars:
+      CLUSTER: "{{.CLUSTER}}"
+    cmds:
+      - |
+        echo "Configuring inotify limits for {{.CLUSTER}}..."
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_instances=1280" || echo "Failed to set max_user_instances"
+        minikube ssh -p {{.CLUSTER}} -- "sudo sysctl -w fs.inotify.max_user_watches=655360" || echo "Failed to set max_user_watches"
+        echo "  fs.inotify.max_user_instances=1280"
+        echo "  fs.inotify.max_user_watches=655360"
+
+  # =============================================================================
+  # Secret-Based Cluster Discovery Setup
+  # =============================================================================
+
+  remote:setup:
+    desc: Setup remote cluster access (ServiceAccount + RBAC) on all remote clusters
+    cmds:
+      - |
+        echo "Setting up remote cluster access..."
+        echo "This creates ServiceAccount + RBAC on remote clusters for primary operator access"
+        echo ""
+      - task: remote:setup:cluster
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:remote:setup:cluster CLUSTER={{.REMOTE_CLUSTER_2}}
+        fi
+      - echo "Remote cluster access setup complete"
+
+  remote:setup:cluster:
+    desc: Setup a single remote cluster for primary access
+    vars:
+      CLUSTER: "{{.CLUSTER}}"
+    cmds:
+      - |
+        echo "Setting up {{.CLUSTER}}..."
+        kubectl --context {{.CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
+
+  secrets:create:
+    desc: Create cluster credential Secrets on the primary cluster
+    cmds:
+      - |
+        echo "Creating cluster credential Secrets on primary cluster..."
+        echo ""
+
+        # Connect Docker networks so primary can reach remote clusters
+        echo "Connecting Docker networks..."
         docker network connect mirrord-remote-1 mirrord-primary 2>/dev/null || true
         docker network connect mirrord-primary mirrord-remote-1 2>/dev/null || true
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           docker network connect mirrord-remote-2 mirrord-primary 2>/dev/null || true
           docker network connect mirrord-primary mirrord-remote-2 2>/dev/null || true
         fi
-        
-        echo "Getting Docker network IPs..."
-        # Get mirrord-remote-1's IP on mirrord-primary's network (reachable from primary pods)
-        REMOTE1_IP=$(docker inspect mirrord-remote-1 --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
-        # Get mirrord-primary's IP on its own network
-        PRIMARY_IP=$(docker inspect mirrord-primary --format '{{`{{.NetworkSettings.Networks}}`}}' | sed -n 's/.*mirrord-primary[^}]*IPAddress:\([0-9.]*\).*/\1/p')
-        PRIMARY_IP=$(docker inspect mirrord-primary --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
-        
-        REMOTE2_IP=""
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          REMOTE2_IP=$(docker inspect mirrord-remote-2 --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
-        fi
-        
-        echo "  mirrord-primary IP: $PRIMARY_IP"
-        echo "  mirrord-remote-1 IP (on primary network): $REMOTE1_IP"
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          echo "  mirrord-remote-2 IP (on primary network): $REMOTE2_IP"
-        fi
-        
-        echo "Generating flattened kubeconfig..."
-        mkdir -p {{.MC_CONFIG_DIR}}
-        KUBECONFIG="" kubectl config view --flatten > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp
-        
-        # Get the port numbers from the original config
-        PRIMARY_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-primary")].cluster.server}' | sed 's/.*://')
-        REMOTE1_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-remote-1")].cluster.server}' | sed 's/.*://')
-        
-        echo "Replacing 127.0.0.1 URLs with hostnames (TLS certs include these names)..."
-        # Use hostnames instead of IPs - the certs have these names in SANs
-        # We'll use hostAliases to resolve them to Docker network IPs
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          REMOTE2_PORT=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="mirrord-remote-2")].cluster.server}' | sed 's/.*://')
-          sed -e "s|https://127.0.0.1:$PRIMARY_PORT|https://{{.PRIMARY_CLUSTER}}:8443|g" \
-              -e "s|https://127.0.0.1:$REMOTE1_PORT|https://{{.REMOTE_CLUSTER_1}}:8443|g" \
-              -e "s|https://127.0.0.1:$REMOTE2_PORT|https://{{.REMOTE_CLUSTER_2}}:8443|g" \
-              {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
-        else
-          sed -e "s|https://127.0.0.1:$PRIMARY_PORT|https://{{.PRIMARY_CLUSTER}}:8443|g" \
-              -e "s|https://127.0.0.1:$REMOTE1_PORT|https://{{.REMOTE_CLUSTER_1}}:8443|g" \
-              {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp > {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
-        fi
-        
-        rm {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml.tmp
-        
-        # Save host aliases for operator deployment
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          cat > {{.MC_CONFIG_DIR}}/multi-cluster-host-aliases.yaml << EOF
-        hostAliases:
-        - ip: "$PRIMARY_IP"
-          hostnames:
-          - "{{.PRIMARY_CLUSTER}}"
-        - ip: "$REMOTE1_IP"
-          hostnames:
-          - "{{.REMOTE_CLUSTER_1}}"
-        - ip: "$REMOTE2_IP"
-          hostnames:
-          - "{{.REMOTE_CLUSTER_2}}"
-        EOF
-        else
-          cat > {{.MC_CONFIG_DIR}}/multi-cluster-host-aliases.yaml << EOF
-        hostAliases:
-        - ip: "$PRIMARY_IP"
-          hostnames:
-          - "{{.PRIMARY_CLUSTER}}"
-        - ip: "$REMOTE1_IP"
-          hostnames:
-          - "{{.REMOTE_CLUSTER_1}}"
-        EOF
-        fi
-        
-        echo "Multi-cluster kubeconfig generated at multicluster/multi-cluster-kubeconfig.yaml"
-        echo "Cluster URLs:"
-        grep "server:" {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
-        echo ""
-        echo "Host aliases (for operator pod):"
-        echo "  {{.PRIMARY_CLUSTER}} -> $PRIMARY_IP"
-        echo "  {{.REMOTE_CLUSTER_1}} -> $REMOTE1_IP"
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          echo "  {{.REMOTE_CLUSTER_2}} -> $REMOTE2_IP"
-        fi
-        echo ""
-        echo "Contexts available:"
-        kubectl --kubeconfig={{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml config get-contexts -o name
 
-  kubeconfig:create:secret:
-    desc: Create kubeconfig secret in primary cluster
-    deps: [kubeconfig:generate]
+        # Update kubectl contexts - Docker network changes can break port mappings
+        echo "Updating kubectl contexts..."
+        minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube update-context -p {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+
+        # Create namespace
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+      - task: secrets:create:cluster
+        vars:
+          CLUSTER: "{{.REMOTE_CLUSTER_1}}"
+          CLUSTER_NAME: "mirrord-remote-1"
+          IS_DEFAULT: "true"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          task multicluster:secrets:create:cluster CLUSTER={{.REMOTE_CLUSTER_2}} CLUSTER_NAME=mirrord-remote-2 IS_DEFAULT=false
+        fi
+      - echo ""
+      - echo "Cluster credential Secrets created. Verify with:"
+      - echo "  kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true"
+
+  secrets:create:cluster:
+    desc: Create a cluster credential Secret for a single remote cluster (auth only)
+    vars:
+      CLUSTER: "{{.CLUSTER}}" # minikube context (e.g., mirrord-remote-1)
+      CLUSTER_NAME: "{{.CLUSTER_NAME}}" # logical name (e.g., remote-1)
+      IS_DEFAULT: '{{.IS_DEFAULT | default "false"}}'
     cmds:
-      - kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-      - kubectl --context {{.PRIMARY_CLUSTER}} create secret generic mirrord-multi-cluster-kubeconfig --from-file=config={{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-      - echo "Kubeconfig secret created in {{.PRIMARY_CLUSTER}}"
+      - |
+        echo "Creating credential Secret for {{.CLUSTER_NAME}} (from {{.CLUSTER}})..."
+
+        # Get a token for the mirrord-operator-envoy ServiceAccount
+        # Note: Cluster config (server, caData) is in ConfigMap via Helm values
+        #       This Secret only contains auth credentials (bearerToken)
+        TOKEN=$(kubectl --context {{.CLUSTER}} create token mirrord-operator-envoy -n mirrord --duration=1h 2>/dev/null || echo "")
+        if [ -z "$TOKEN" ]; then
+          echo "  ERROR: Failed to get token. Make sure remote:setup was run first."
+          echo "  Debug: Run 'kubectl --context {{.CLUSTER}} get sa -n mirrord' to check ServiceAccount"
+          exit 1
+        fi
+        echo "  Token: (${#TOKEN} chars)"
+
+        # Create the Secret on the primary cluster
+        # Only contains auth credentials - cluster config (server, caData) is in ConfigMap
+        # Secret name must be: mirrord-cluster-{cluster-name} (naming convention)
+        cat <<EOF | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: mirrord-cluster-{{.CLUSTER_NAME}}
+          namespace: mirrord
+          labels:
+            operator.metalbear.co/remote-cluster-credentials: "true"
+        type: Opaque
+        stringData:
+          bearerToken: "$TOKEN"
+        EOF
+
+        echo "  ✓ Secret mirrord-cluster-{{.CLUSTER_NAME}} created (auth credentials only)"
+
+  secrets:delete:
+    desc: Delete all cluster credential Secrets from primary cluster
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true --ignore-not-found=true
+      - echo "Cluster credential Secrets deleted"
+
+  secrets:list:
+    desc: List all cluster credential Secrets
+    cmds:
+      - |
+        echo "=== Cluster Credential Secrets ==="
+        kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true
+        echo ""
+        echo "Details (auth credentials only - cluster config is in ConfigMap):"
+        for secret in $(kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true -o name 2>/dev/null); do
+          NAME=$(echo $secret | sed 's|secret/mirrord-cluster-||')
+          SERVER=$(kubectl --context {{.PRIMARY_CLUSTER}} get $secret -n mirrord -o jsonpath='{.data.server}' | base64 -d)
+          IS_DEFAULT=$(kubectl --context {{.PRIMARY_CLUSTER}} get $secret -n mirrord -o jsonpath='{.data.isDefault}' | base64 -d)
+          echo "  $NAME: $SERVER (isDefault: $IS_DEFAULT)"
+        done
+
+  secrets:refresh:
+    desc: Refresh tokens in cluster credential Secrets (run before they expire)
+    cmds:
+      - echo "Refreshing tokens in cluster credential Secrets..."
+      - task: secrets:create
+      - echo "Tokens refreshed"
 
   operator:load:images:
-    desc: Load operator image to all clusters
+    desc: Load operator image to all clusters (removes old image first)
     cmds:
+      # Remove old images first to ensure new image is loaded
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+        fi
+      # Load new images
       - minikube -p {{.PRIMARY_CLUSTER}} image load {{.OPERATOR_IMAGE}}
       - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.OPERATOR_IMAGE}}
       - |
@@ -244,118 +314,483 @@ tasks:
           minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
         fi
       - echo "Image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+  operator:lease:delete:
+    desc: Delete leader election leases for operators in all clusters
+    cmds:
+      - kubectl delete lease mirrord-operator-leader -n mirrord --context {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord --context {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete lease mirrord-operator-leader -n mirrord --context {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+      - echo "Leader election leases deleted"
+      - echo "Restarting operators..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - sleep 2
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo "Operators restarted and ready!"
+  operator:rebuild:
+    desc: Build, load, and restart operators in all clusters (quick update)
+    cmds:
+      - echo "Building operator image..."
+      - |
+        cd {{.ROOT_DIR}}/../operator/.. && docker build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
+          operator
+      - |
+        # Verify the binary size is reasonable (should be > 10MB)
+        echo "Verifying operator binary size..."
+        CONTAINER_ID=$(docker create {{.OPERATOR_IMAGE}})
+        docker cp $CONTAINER_ID:/operator-service /tmp/operator-service-check
+        docker rm $CONTAINER_ID > /dev/null
+        SIZE=$(stat -f%z /tmp/operator-service-check 2>/dev/null || stat -c%s /tmp/operator-service-check 2>/dev/null)
+        rm /tmp/operator-service-check
+        echo "Binary size: $SIZE bytes"
+        if [ "$SIZE" -lt 10000000 ]; then
+          echo ""
+          echo "ERROR: Binary too small ($SIZE bytes). Build likely failed or used stale cache."
+          echo ""
+          echo "Try cleaning cache and rebuilding:"
+          echo "  docker builder prune -af"
+          echo "  docker rmi mirrord-operator:custom --force"
+          echo "  task multicluster:operator:rebuild:clean"
+          echo ""
+          exit 1
+        fi
+        echo "Binary size OK (>10MB)"
+      - echo "Removing old images from clusters (required for minikube to load new image)..."
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+        fi
+      - echo "Loading image to all clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} image load {{.OPERATOR_IMAGE}}
+      - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.OPERATOR_IMAGE}}
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
+        fi
+      - echo "Deleting leader election leases (speeds up restart)..."
+      - kubectl delete lease mirrord-operator-leader -n mirrord --context {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord --context {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete lease mirrord-operator-leader -n mirrord --context {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+      - echo "Restarting operators..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - sleep 2
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo ""
+      - echo "=== VERIFICATION ==="
+      - |
+        # Check operators are actually running (not CrashLoopBackOff)
+        echo "Checking operator pod status..."
+        sleep 5
+        PRIMARY_STATUS=$(kubectl get pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} -o jsonpath='{.items[0].status.phase}')
+        REMOTE1_STATUS=$(kubectl get pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} -o jsonpath='{.items[0].status.phase}')
+        echo "Primary: $PRIMARY_STATUS"
+        echo "Remote-1: $REMOTE1_STATUS"
+        if [ "$PRIMARY_STATUS" != "Running" ] || [ "$REMOTE1_STATUS" != "Running" ]; then
+          echo "ERROR: Operators not running properly!"
+          echo "Primary logs:"
+          kubectl logs -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --tail=20
+          exit 1
+        fi
+      - echo "Image age in clusters (should show 'seconds ago' or 'About a minute ago'):"
+      - echo "Primary:"
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - echo "Remote-1:"
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+        fi
+      - echo ""
+      - echo "All operators updated and running!"
+
+  operator:rebuild:clean:
+    desc: Force clean rebuild (clears docker cache) - use when build seems stale
+    cmds:
+      - |
+        echo "=== Clean Rebuild ==="
+        echo ""
+        echo "If this fails, try manually clearing ALL cache:"
+        echo "  docker builder prune -af"
+        echo "  docker rmi mirrord-operator:custom --force"
+        echo "  task multicluster:operator:rebuild:clean"
+        echo ""
+      - echo "Cleaning docker build cache for operator..."
+      - docker builder prune -f --filter "until=24h" 2>/dev/null || true
+      - docker rmi {{.OPERATOR_IMAGE}} --force 2>/dev/null || true
+      - echo "Building operator image from scratch (no cache)..."
+      - |
+        cd {{.ROOT_DIR}}/../operator/.. && docker build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --no-cache \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
+          operator
+      - |
+        # Verify the binary size is reasonable (should be > 10MB)
+        echo "Verifying operator binary size..."
+        CONTAINER_ID=$(docker create {{.OPERATOR_IMAGE}})
+        docker cp $CONTAINER_ID:/operator-service /tmp/operator-service-check
+        docker rm $CONTAINER_ID > /dev/null
+        SIZE=$(stat -f%z /tmp/operator-service-check 2>/dev/null || stat -c%s /tmp/operator-service-check 2>/dev/null)
+        rm /tmp/operator-service-check
+        echo "Binary size: $SIZE bytes"
+        if [ "$SIZE" -lt 10000000 ]; then
+          echo "ERROR: Binary too small ($SIZE bytes). Build failed."
+          exit 1
+        fi
+        echo "Binary size OK (>10MB)"
+      - echo "Removing old images from clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.OPERATOR_IMAGE}} --force" 2>/dev/null || true
+        fi
+      - echo "Loading image to all clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} image load {{.OPERATOR_IMAGE}}
+      - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.OPERATOR_IMAGE}}
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.OPERATOR_IMAGE}}
+        fi
+      - echo "Restarting operators..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - sleep 10
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - echo ""
+      - echo "=== Clean rebuild complete! ==="
+
+  operator:upgrade:
+    desc: Helm upgrade operators in all clusters (applies values changes only, no rebuild)
+    cmds:
+      - echo "Upgrading operators via helm (values only, no rebuild)..."
+      - task: operator:install:remote
+      - task: operator:install:primary
+      - echo "Restarting operator pods to pick up new values..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo "All operators upgraded with new values!"
+
+  operator:rebuild:upgrade:
+    desc: Build, load, and helm upgrade operators in all clusters (applies chart AND code changes)
+    cmds:
+      - echo "Building operator image..."
+      - |
+        cd {{.ROOT_DIR}}/../operator/.. && docker build \
+          -f operator/Dockerfile \
+          -t {{.OPERATOR_IMAGE}} \
+          --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
+          operator
+      - echo "Loading image to all clusters..."
+      - task: operator:load:images
+      - echo "Upgrading operators via helm..."
+      - task: operator:install:remote
+      - task: operator:install:primary
+      - echo "Deleting leader election leases (speeds up restart)..."
+      - kubectl delete lease mirrord-operator-leader -n mirrord --context {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord --context {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete lease mirrord-operator-leader -n mirrord --context {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+      - echo "Restarting operator pods to pick up new image..."
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.PRIMARY_CLUSTER}} --force --grace-period=0 2>/dev/null || true
+      - kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_1}} --force --grace-period=0 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --context {{.REMOTE_CLUSTER_2}} --force --grace-period=0 2>/dev/null || true
+        fi
+      - echo "Waiting for operators to be ready..."
+      - sleep 2
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_1}} --timeout=120s
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.REMOTE_CLUSTER_2}} --timeout=120s
+        fi
+      - echo "Waiting for operators to acquire leadership and serve API..."
+      - |
+        # Wait for the operator to actually serve the MirrordOperator API (not just pod ready)
+        for i in $(seq 1 30); do
+          if kubectl --context {{.PRIMARY_CLUSTER}} get mirrordoperators.operator.metalbear.co operator -o name 2>/dev/null; then
+            echo "Primary operator API is ready!"
+            break
+          fi
+          if [ $i -eq 30 ]; then
+            echo "Warning: Primary operator API not ready after 30 attempts"
+          fi
+          sleep 1
+        done
+      - echo ""
+      - echo "=== VERIFICATION ==="
+      - echo "Image age in clusters (should show 'seconds ago' or 'About a minute ago'):"
+      - echo "Primary:"
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - echo "Remote-1:"
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker images {{.OPERATOR_IMAGE}} --format 'table {{ "{{" }}.Repository{{ "}}" }}:{{ "{{" }}.Tag{{ "}}" }} - Created {{ "{{" }}.CreatedSince{{ "}}" }}'"
+        fi
+      - echo ""
+      - echo "All operators upgraded and restarted!"
 
   operator:install:remote:
-    desc: Install operator in remote clusters (without multi-cluster)
+    desc: Install operator in remote clusters (standard operators, not multi-cluster)
     cmds:
       - |
-        CLUSTERS="{{.REMOTE_CLUSTER_1}}"
+        # Get LocalStack URL (NodePort on remote-1)
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        echo "LocalStack URL for SQS: $LOCALSTACK_URL"
+
+        # Install on remote-1 (standard operator, NOT multi-cluster)
+        echo "Installing operator in {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        kubectl --context {{.REMOTE_CLUSTER_1}} create secret generic mirrord-operator-license-pem \
+          --from-file=license.pem={{.ROOT_DIR}}/scripts/company-license.pem \
+          -n mirrord --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+
+        # Delete old pods first to free up hostNetwork ports
+        echo "Deleting old operator pods in {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
+        sleep 2
+
+        # Remove hostNetwork from existing deployment if present (conflicts with sysctls in chart)
+        kubectl --context {{.REMOTE_CLUSTER_1}} patch deployment mirrord-operator -n mirrord --type=strategic \
+          -p '{"spec":{"template":{"spec":{"hostNetwork":null,"dnsPolicy":"ClusterFirst","hostAliases":null}}}}' 2>/dev/null || true
+
+        helm upgrade --install mirrord-operator {{.CHARTS_DIR}} \
+          --kube-context {{.REMOTE_CLUSTER_1}} \
+          --namespace mirrord \
+          -f {{.MC_CONFIG_DIR}}/operator-values-remote.yaml \
+          --set operator.image=mirrord-operator \
+          --set operator.imageTag=custom \
+          --set agent.image={{.AGENT_IMAGE}} \
+          --set operator.extraEnv.AWS_ENDPOINT_URL="$LOCALSTACK_URL" \
+          --wait
+
+        # Patch deployment with hostNetwork (for local multicluster testing only)
+        # Must remove sysctls first (not allowed with hostNetwork)
+        echo "Patching operator deployment with hostNetwork..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} patch deployment mirrord-operator -n mirrord --type=json -p '[{"op":"remove","path":"/spec/template/spec/securityContext/sysctls"}]' 2>/dev/null || true
+        kubectl --context {{.REMOTE_CLUSTER_1}} patch deployment mirrord-operator -n mirrord --type=strategic -p '{"spec":{"template":{"spec":{"hostNetwork":true,"dnsPolicy":"ClusterFirstWithHostNet"}}}}'
+        kubectl --context {{.REMOTE_CLUSTER_1}} rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+        echo "Operator installed in {{.REMOTE_CLUSTER_1}}"
+
+        # Install on remote-2 if 3 clusters
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          CLUSTERS="{{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}}"
-        fi
-        
-        for cluster in $CLUSTERS; do
-          echo "Installing operator in $cluster..."
-          # Create namespace and license secret first
-          kubectl --context $cluster create namespace mirrord --dry-run=client -o yaml | kubectl --context $cluster apply -f -
-          kubectl --context $cluster create secret generic mirrord-operator-license-pem \
+          echo "Installing operator in {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          kubectl --context {{.REMOTE_CLUSTER_2}} create secret generic mirrord-operator-license-pem \
             --from-file=license.pem={{.ROOT_DIR}}/scripts/company-license.pem \
-            -n mirrord --dry-run=client -o yaml | kubectl --context $cluster apply -f -
+            -n mirrord --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          
+          # Delete old pods first to free up hostNetwork ports
+          echo "Deleting old operator pods in {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
+          sleep 2
+          
+          # Remove hostNetwork from existing deployment if present (conflicts with sysctls in chart)
+          kubectl --context {{.REMOTE_CLUSTER_2}} patch deployment mirrord-operator -n mirrord --type=strategic \
+            -p '{"spec":{"template":{"spec":{"hostNetwork":null,"dnsPolicy":"ClusterFirst","hostAliases":null}}}}' 2>/dev/null || true
           
           helm upgrade --install mirrord-operator {{.CHARTS_DIR}} \
-            --kube-context $cluster \
+            --kube-context {{.REMOTE_CLUSTER_2}} \
             --namespace mirrord \
-            -f {{.ROOT_DIR}}/operator-values.yaml \
+            -f {{.MC_CONFIG_DIR}}/operator-values-remote.yaml \
             --set operator.image=mirrord-operator \
             --set operator.imageTag=custom \
-            --set extraEnv.MIRRORD_MULTI_CLUSTER_ENABLED=true \
-            --set extraEnv.MIRRORD_IS_PRIMARY_CLUSTER=false \
+            --set agent.image={{.AGENT_IMAGE}} \
+            --set operator.extraEnv.AWS_ENDPOINT_URL="$LOCALSTACK_URL" \
             --wait
-          echo "Operator installed in $cluster"
-        done
+          
+          # Patch deployment with hostNetwork (for local multicluster testing only)
+          # Must remove sysctls first (not allowed with hostNetwork)
+          echo "Patching operator deployment with hostNetwork..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} patch deployment mirrord-operator -n mirrord --type=json -p '[{"op":"remove","path":"/spec/template/spec/securityContext/sysctls"}]' 2>/dev/null || true
+          kubectl --context {{.REMOTE_CLUSTER_2}} patch deployment mirrord-operator -n mirrord --type=strategic -p '{"spec":{"template":{"spec":{"hostNetwork":true,"dnsPolicy":"ClusterFirstWithHostNet"}}}}'
+          kubectl --context {{.REMOTE_CLUSTER_2}} rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+          echo "Operator installed in {{.REMOTE_CLUSTER_2}}"
+        fi
 
   operator:install:primary:
-    desc: Install operator in primary cluster with multi-cluster enabled
-    deps: [kubeconfig:create:secret]
+    desc: Install operator in primary cluster with multi-cluster enabled (ConfigMap + Secrets)
     cmds:
+      # Run setup sequentially (deps run in parallel which breaks secrets:create)
+      - task: remote:setup
+      - task: secrets:create
       - |
-        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
         echo "Installing operator in {{.PRIMARY_CLUSTER}} with multi-cluster..."
-        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
-        
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}"
+        echo "  Discovery: ConfigMap (cluster config) + Secrets (auth credentials)"
+
         # Get Docker network IPs for hostAliases
         PRIMARY_IP=$(docker inspect {{.PRIMARY_CLUSTER}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
         REMOTE1_IP=$(docker inspect {{.REMOTE_CLUSTER_1}} --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
         echo "  Host aliases: {{.PRIMARY_CLUSTER}}=$PRIMARY_IP, {{.REMOTE_CLUSTER_1}}=$REMOTE1_IP"
-        
+
         REMOTE2_IP=""
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           REMOTE2_IP=$(docker inspect {{.REMOTE_CLUSTER_2}} --format '{{`{{range $k, $v := .NetworkSettings.Networks}}{{if eq $k "mirrord-primary"}}{{$v.IPAddress}}{{end}}{{end}}`}}')
           echo "                {{.REMOTE_CLUSTER_2}}=$REMOTE2_IP"
         fi
-        
-        # Build the MIRRORD_MULTI_CLUSTER_CONTEXTS JSON
-        # If PRIMARY_MANAGEMENT_ONLY=true, don't include primary in the workload clusters
-        if [ "$MGMT_ONLY" = "true" ]; then
-          # Management-only: primary has no workloads, only remotes
-          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-            CONTEXTS_JSON='{"remote-1":"{{.REMOTE_CLUSTER_1}}","remote-2":"{{.REMOTE_CLUSTER_2}}"}'
-          else
-            CONTEXTS_JSON='{"remote-1":"{{.REMOTE_CLUSTER_1}}"}'
-          fi
-          # Default cluster is remote-1 (first remote with workloads)
-          DEFAULT_CLUSTER="remote-1"
-          echo "  Mode: PRIMARY_MANAGEMENT_ONLY (no workloads on primary)"
-          echo "  Workload clusters: remote-1$([ "{{.NUM_CLUSTERS}}" = "3" ] && echo ", remote-2")"
-          echo "  Default cluster: $DEFAULT_CLUSTER"
+
+        # Select values file based on NUM_CLUSTERS
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          VALUES_FILE="{{.MC_CONFIG_DIR}}/operator-values-multicluster-3-clusters.yaml"
         else
-          # Normal mode: primary has workloads too
-          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-            CONTEXTS_JSON='{"primary":"{{.PRIMARY_CLUSTER}}","remote-1":"{{.REMOTE_CLUSTER_1}}","remote-2":"{{.REMOTE_CLUSTER_2}}"}'
-          else
-            CONTEXTS_JSON='{"primary":"{{.PRIMARY_CLUSTER}}","remote-1":"{{.REMOTE_CLUSTER_1}}"}'
-          fi
-          DEFAULT_CLUSTER="primary"
-          echo "  Mode: PRIMARY_HAS_WORKLOADS"
-          echo "  Workload clusters: primary, remote-1$([ "{{.NUM_CLUSTERS}}" = "3" ] && echo ", remote-2")"
-          echo "  Default cluster: $DEFAULT_CLUSTER"
+          VALUES_FILE="{{.MC_CONFIG_DIR}}/operator-values-multicluster-2-clusters.yaml"
         fi
-        
+        echo "  Using values file: $VALUES_FILE"
+
         # Create namespace and license secret first
         kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
         kubectl --context {{.PRIMARY_CLUSTER}} create secret generic mirrord-operator-license-pem \
           --from-file=license.pem={{.ROOT_DIR}}/scripts/company-license.pem \
           -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-        
-        # Build helm command with dynamic hostAliases
+
+        # Get LocalStack URL (NodePort on remote-1)
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        echo "  LocalStack URL: $LOCALSTACK_URL"
+
+        # Get cluster config for remote-1 (server URL and CA data)
+        # Server uses cluster hostname for TLS cert validation (resolved via hostAliases)
+        REMOTE1_SERVER="https://{{.REMOTE_CLUSTER_1}}:8443"
+        REMOTE1_CA=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_1}}")].cluster.certificate-authority-data}' 2>/dev/null)
+        if [ -z "$REMOTE1_CA" ]; then
+          CA_FILE=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_1}}")].cluster.certificate-authority}' 2>/dev/null)
+          if [ -n "$CA_FILE" ] && [ -f "$CA_FILE" ]; then
+            REMOTE1_CA=$(base64 < "$CA_FILE" | tr -d '\n')
+          fi
+        fi
+        echo "  remote-1: server=$REMOTE1_SERVER, caData=${#REMOTE1_CA} bytes"
+
+        # Get cluster config for remote-2 if 3 clusters
+        REMOTE2_SERVER=""
+        REMOTE2_CA=""
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          REMOTE2_SERVER="https://{{.REMOTE_CLUSTER_2}}:8443"
+          REMOTE2_CA=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_2}}")].cluster.certificate-authority-data}' 2>/dev/null)
+          if [ -z "$REMOTE2_CA" ]; then
+            CA_FILE=$(kubectl config view --raw -o jsonpath='{.clusters[?(@.name=="{{.REMOTE_CLUSTER_2}}")].cluster.certificate-authority}' 2>/dev/null)
+            if [ -n "$CA_FILE" ] && [ -f "$CA_FILE" ]; then
+              REMOTE2_CA=$(base64 < "$CA_FILE" | tr -d '\n')
+            fi
+          fi
+          echo "  remote-2: server=$REMOTE2_SERVER, caData=${#REMOTE2_CA} bytes"
+        fi
+
+        # Delete old pods first to free up hostNetwork ports
+        echo "Deleting old operator pods in {{.PRIMARY_CLUSTER}}..."
+        kubectl --context {{.PRIMARY_CLUSTER}} delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
+        sleep 2
+
+        # Remove hostNetwork from existing deployment if present (conflicts with sysctls in chart)
+        echo "Removing hostNetwork from existing deployment (if present)..."
+        kubectl --context {{.PRIMARY_CLUSTER}} patch deployment mirrord-operator -n mirrord --type=strategic \
+          -p '{"spec":{"template":{"spec":{"hostNetwork":null,"dnsPolicy":"ClusterFirst","hostAliases":null}}}}' 2>/dev/null || true
+
+        # Build helm command with cluster config passed via --set
+        # Cluster config goes to ConfigMap, auth credentials are in Secrets (created separately)
         HELM_ARGS=(
           upgrade --install mirrord-operator {{.CHARTS_DIR}}
           --kube-context {{.PRIMARY_CLUSTER}}
           --namespace mirrord
-          -f {{.MC_CONFIG_DIR}}/operator-values-multicluster-primary.yaml
+          -f "$VALUES_FILE"
           --set operator.image=mirrord-operator
           --set operator.imageTag=custom
-          --set operator.multiCluster.kubeconfigSecret=mirrord-multi-cluster-kubeconfig
-          --set operator.multiCluster.kubeconfigPath=/etc/kubeconfig/config
-          --set "operator.extraEnv.MIRRORD_MULTI_CLUSTER_CONTEXTS=$CONTEXTS_JSON"
-          --set "operator.extraEnv.MIRRORD_DEFAULT_CLUSTER=$DEFAULT_CLUSTER"
-          --set "operator.hostAliases[0].ip=$PRIMARY_IP"
-          --set "operator.hostAliases[0].hostnames[0]={{.PRIMARY_CLUSTER}}"
-          --set "operator.hostAliases[1].ip=$REMOTE1_IP"
-          --set "operator.hostAliases[1].hostnames[0]={{.REMOTE_CLUSTER_1}}"
+          --set agent.image={{.AGENT_IMAGE}}
+          --set "operator.extraEnv.AWS_ENDPOINT_URL=$LOCALSTACK_URL"
+          --set "operator.multiCluster.clusters.mirrord-remote-1.server=$REMOTE1_SERVER"
+          --set "operator.multiCluster.clusters.mirrord-remote-1.caData=$REMOTE1_CA"
+          --wait
         )
-        
+
+        # Add remote-2 cluster config if 3 clusters
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           HELM_ARGS+=(
-            --set "operator.hostAliases[2].ip=$REMOTE2_IP"
-            --set "operator.hostAliases[2].hostnames[0]={{.REMOTE_CLUSTER_2}}"
+            --set "operator.multiCluster.clusters.mirrord-remote-2.server=$REMOTE2_SERVER"
+            --set "operator.multiCluster.clusters.mirrord-remote-2.caData=$REMOTE2_CA"
           )
         fi
-        
-        HELM_ARGS+=(--wait)
-        
+
         helm "${HELM_ARGS[@]}"
-        echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster ({{.NUM_CLUSTERS}} clusters, management_only=$MGMT_ONLY)"
+
+        # Patch deployment with hostNetwork and hostAliases (for local multicluster testing only)
+        # Must remove sysctls first (not allowed with hostNetwork)
+        echo "Patching operator deployment with hostNetwork and hostAliases..."
+
+        # Build hostAliases JSON array
+        HOST_ALIASES="[{\"ip\":\"$PRIMARY_IP\",\"hostnames\":[\"{{.PRIMARY_CLUSTER}}\"]},{\"ip\":\"$REMOTE1_IP\",\"hostnames\":[\"{{.REMOTE_CLUSTER_1}}\"]}]"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          HOST_ALIASES="[{\"ip\":\"$PRIMARY_IP\",\"hostnames\":[\"{{.PRIMARY_CLUSTER}}\"]},{\"ip\":\"$REMOTE1_IP\",\"hostnames\":[\"{{.REMOTE_CLUSTER_1}}\"]},{\"ip\":\"$REMOTE2_IP\",\"hostnames\":[\"{{.REMOTE_CLUSTER_2}}\"]}]"
+        fi
+
+        kubectl --context {{.PRIMARY_CLUSTER}} patch deployment mirrord-operator -n mirrord --type=json -p '[{"op":"remove","path":"/spec/template/spec/securityContext/sysctls"}]' 2>/dev/null || true
+        kubectl --context {{.PRIMARY_CLUSTER}} patch deployment mirrord-operator -n mirrord --type=strategic -p "{\"spec\":{\"template\":{\"spec\":{\"hostNetwork\":true,\"dnsPolicy\":\"ClusterFirstWithHostNet\",\"hostAliases\":$HOST_ALIASES}}}}"
+
+        # Wait for rollout to complete after patch
+        kubectl --context {{.PRIMARY_CLUSTER}} rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+
+        echo ""
+        echo "Operator installed in {{.PRIMARY_CLUSTER}} with multi-cluster ({{.NUM_CLUSTERS}} clusters)"
+        echo ""
+        echo "Cluster credential Secrets:"
+        kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true --no-headers
 
   operator:install:all:
     desc: Install operator in all clusters
@@ -363,30 +798,112 @@ tasks:
       - task: operator:install:remote
       - task: operator:install:primary
 
+  agent:build:
+    desc: Build custom mirrord-agent image from local mirrord repo
+    cmds:
+      - |
+        echo "=== Building custom mirrord-agent image ==="
+        echo "Source: {{.MIRRORD_REPO}}"
+        echo "Image: {{.AGENT_IMAGE}}"
+        echo ""
+
+        if [ ! -d "{{.MIRRORD_REPO}}/mirrord/agent" ]; then
+          echo "ERROR: mirrord repo not found at {{.MIRRORD_REPO}}"
+          echo "Set MIRRORD_REPO to point to your local mirrord checkout"
+          exit 1
+        fi
+
+        cd {{.MIRRORD_REPO}}
+        docker build -t {{.AGENT_IMAGE}} -f mirrord/agent/Dockerfile .
+      - echo "Agent image built {{.AGENT_IMAGE}}"
+
+  agent:load:
+    desc: Load custom agent image to all clusters
+    cmds:
+      - echo "Removing old agent images from clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.REMOTE_CLUSTER_1}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+        fi
+      - echo "Loading agent image to all clusters..."
+      - minikube -p {{.PRIMARY_CLUSTER}} image load {{.AGENT_IMAGE}}
+      - minikube -p {{.REMOTE_CLUSTER_1}} image load {{.AGENT_IMAGE}}
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load {{.AGENT_IMAGE}}
+        fi
+      - echo "Agent image loaded to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+
+  agent:rebuild:
+    desc: Build and load custom agent image to all clusters
+    cmds:
+      - task: agent:build
+      - task: agent:load
+      - echo ""
+      - echo "=== Agent image updated ==="
+      - echo "Now restart operators to use new agent:"
+      - echo "  task multicluster:operator:upgrade"
+
+  rebuild:all:
+    desc: Rebuild and reload both operator and agent (use after protocol changes)
+    cmds:
+      - |
+        echo "=== Rebuilding Operator and Agent ==="
+        echo "This is required after protocol changes (e.g., adding hostname field)"
+        echo ""
+      - task: agent:build
+      - task: operator:rebuild
+      - task: agent:load
+      - echo ""
+      - echo "=== All components updated ==="
+      - echo "Both operator and agent now use the latest code"
+
   apps:deploy:
     desc: Deploy test applications to all clusters
     cmds:
       - task: app:deploy
-        vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}", APP_NAME: "nginx-primary", REPLICAS: "2" }
+        vars:
+          {
+            CLUSTER: "{{.PRIMARY_CLUSTER}}",
+            APP_NAME: "nginx-primary",
+            REPLICAS: "2",
+          }
       - task: app:deploy
-        vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}", APP_NAME: "nginx-remote-1", REPLICAS: "2" }
-      - |
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          task multicluster:app:deploy CLUSTER={{.REMOTE_CLUSTER_2}} APP_NAME=nginx-remote-2 REPLICAS=2
-        fi
+        vars:
+          {
+            CLUSTER: "{{.REMOTE_CLUSTER_1}}",
+            APP_NAME: "nginx-remote-1",
+            REPLICAS: "2",
+          }
+      - task: app:deploy:remote-2
       - echo "Test apps deployed to all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+
+  app:deploy:remote-2:
+    internal: true
+    status:
+      - test "{{.NUM_CLUSTERS}}" != "3"
+    cmds:
+      - task: app:deploy
+        vars:
+          {
+            CLUSTER: "{{.REMOTE_CLUSTER_2}}",
+            APP_NAME: "nginx-remote-2",
+            REPLICAS: "2",
+          }
 
   app:deploy:
     internal: true
     desc: Deploy a test application to a cluster
     vars:
-      CLUSTER: '{{.CLUSTER}}'
-      APP_NAME: '{{.APP_NAME}}'
+      CLUSTER: "{{.CLUSTER}}"
+      APP_NAME: "{{.APP_NAME}}"
       REPLICAS: '{{.REPLICAS | default "1"}}'
     cmds:
       - |
         kubectl --context {{.CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
-        
+
         cat <<EOF | kubectl --context {{.CLUSTER}} apply -f -
         apiVersion: apps/v1
         kind: Deployment
@@ -473,7 +990,7 @@ tasks:
   test:crds:
     desc: Test multi-cluster CRD creation
     vars:
-      K8S_DIR: '{{.SANDBOX_DIR}}/k8s/multicluster'
+      K8S_DIR: "{{.SANDBOX_DIR}}/k8s/multicluster"
     cmds:
       - kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/test-session.yaml
       - echo "Test multi-cluster session created"
@@ -506,14 +1023,192 @@ tasks:
       - sleep 2
       - task: setup:all
 
-  setup:all:
-    desc: Complete multi-cluster setup from scratch
+  setup:all:with-databases:clean:
+    desc: Complete setup with PostgreSQL and MySQL databases
     cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-databases
+      - echo ""
+      - echo "Databases also deployed! Use 'task multicluster:databases:status' to check"
+
+  setup:all:with-databases:
+    desc: Complete setup with PostgreSQL and MySQL databases
+    cmds:
+      - task: setup:all
+      - task: databases:deploy
+      - echo ""
+      - echo "Databases also deployed! Use 'task multicluster:databases:status' to check"
+
+  setup:all:with-sqs:clean:
+    desc: Clean setup with SQS (LocalStack) for queue splitting tests
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-sqs
+      - echo ""
+      - echo "=== SQS Setup Complete (Single LocalStack) ==="
+      - echo ""
+      - echo "All clusters share one LocalStack on the primary cluster."
+      - echo ""
+      - echo "To test SQS splitting:"
+      - echo "  task multicluster:sqs:send FILTERED=2 UNFILTERED=2"
+
+  setup:all:with-sqs:
+    desc: Complete setup with SQS (LocalStack) for queue splitting tests
+    cmds:
+      - task: setup:all
+      - task: sqs:setup:single
+      - echo ""
+      - echo "SQS setup complete! Use 'task multicluster:sqs:status' to check"
+
+  setup:all:with-sqs:single:clean:
+    desc: Clean setup with single shared SQS (matches production - all clusters share one SQS)
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-sqs:single
+      - echo ""
+      - echo "=== Single SQS Setup Complete ==="
+      - echo ""
+      - echo "All clusters share one LocalStack on the default cluster."
+      - echo "This matches production where all clusters share AWS SQS."
+      - echo ""
+      - echo "To test SQS splitting:"
+      - 'echo "  Terminal 1: task multicluster:sqs:send:messages:single"'
+      - 'echo "  Terminal 2: task multicluster:test:sqs:split:multi-cluster"'
+
+  setup:all:with-sqs:single:
+    desc: Complete setup with single shared SQS (matches production)
+    cmds:
+      - task: setup:all
+      - task: sqs:setup:single
+      - echo ""
+      - echo "Single-SQS setup complete! All clusters share one LocalStack."
+      - echo "Use 'task multicluster:sqs:status' to check"
+
+  setup:all:with-copy-target:clean:
+    desc: Clean setup with echo-apps for copy_target tests
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-copy-target
+      - echo ""
+      - echo "=== Copy Target Setup Complete ==="
+      - echo ""
+      - echo "To test copy_target:"
+      - echo "  Terminal 1 task multicluster:test:copy-target:watch"
+      - echo "  Terminal 2 task multicluster:test:copy-target:basic"
+
+  setup:all:with-copy-target:
+    desc: Complete setup with echo-apps for copy_target tests
+    cmds:
+      - task: setup:all
+      - task: test:deploy:echo-apps
+      - echo ""
+      - echo "Copy target setup complete!"
+      - echo "Echo apps deployed to all clusters."
+
+  setup:all:with-all:clean:
+    desc: Clean setup with everything (databases, SQS, echo-apps)
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-all
+      - echo ""
+      - echo "=== Full Setup Complete ==="
+      - echo "All features ready for testing!"
+
+  setup:all:with-all:
+    desc: Complete setup with everything (databases, SQS, echo-apps)
+    cmds:
+      - task: setup:all
+      - task: databases:deploy
+      - task: sqs:setup
+      - task: test:deploy:echo-apps
+      - echo ""
+      - echo "Full setup complete!"
+      - echo "  - Databases task multicluster:databases:status"
+      - echo "  - SQS task multicluster:sqs:status"
+      - echo "  - Echo apps deployed to all clusters"
+
+  update:sqs:
+    desc: Add/refresh SQS resources (LocalStack + consumer) - no clean
+    cmds:
+      - echo "Adding/refreshing SQS resources..."
+      - task: sqs:setup
+      - echo ""
+      - echo "SQS updated! Status:"
+      - task: sqs:status
+
+  update:copy-target:
+    desc: Add/refresh echo-apps for copy_target testing - no clean
+    cmds:
+      - echo "Adding/refreshing echo-apps..."
+      - task: test:deploy:echo-apps
+      - echo ""
+      - echo "Echo apps updated!"
+
+  update:databases:
+    desc: Add/refresh databases (PostgreSQL + MySQL) - no clean
+    cmds:
+      - echo "Adding/refreshing databases..."
+      - task: databases:deploy
+      - echo ""
+      - echo "Databases updated! Status:"
+      - task: databases:status
+
+  update:operator:
+    desc: Rebuild and reload operator in all clusters - no clean
+    cmds:
+      - echo "Rebuilding and reloading operator..."
+      - task: operator:rebuild
+      - echo ""
+      - echo "Operator updated!"
+
+  update:agent:
+    desc: Rebuild and reload agent in all clusters - no clean
+    cmds:
+      - echo "Rebuilding and reloading agent..."
+      - task: agent:rebuild
+      - task: operator:upgrade
+      - echo ""
+      - echo "Agent updated and operators restarted to use new agent!"
+
+  update:protocol:
+    desc: Rebuild both operator and agent (required after protocol changes)
+    cmds:
+      - echo "Rebuilding operator and agent after protocol changes..."
+      - task: rebuild:all
+      - echo ""
+      - echo "Protocol update complete!"
+
+  update:all:
+    desc: Refresh all resources (operator, agent, databases, SQS, echo-apps) - no clean
+    cmds:
+      - echo "Refreshing all resources..."
+      - task: agent:rebuild
+      - task: operator:rebuild
+      - task: databases:deploy
+      - task: sqs:setup
+      - task: test:deploy:echo-apps
+      - echo ""
+      - echo "All resources updated!"
+
+  setup:all:
+    desc: Complete multi-cluster setup from scratch (Secret-based discovery)
+    cmds:
+      - |
+        echo "=== Multi-Cluster Setup ==="
+        echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}"
+        echo "  Discovery: Secret-based"
+        echo ""
       - task: clusters:create
-      - task: kubeconfig:generate
       - echo "Waiting for clusters to be ready..."
       - sleep 5
       - task: test:verify:clusters
+      # - task: agent:build
+      # - task: agent:load
       - task: operator:load:images
       - task: operator:install:all
       - echo "Waiting for operators to be ready..."
@@ -524,36 +1219,66 @@ tasks:
       - sleep 5
       - task: test:verify:apps
       - echo ""
-      - echo "Multi-cluster environment setup complete!"
+      - echo "Setting kubectl context to primary cluster ({{.PRIMARY_CLUSTER}})..."
+      - kubectl config use-context {{.PRIMARY_CLUSTER}}
+      - echo ""
+      - echo "=== Multi-Cluster Setup Complete ==="
+      - echo ""
+      - echo "Cluster Credential Secrets:"
+      - kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true --no-headers
       - echo ""
       - echo "To test multi-cluster sessions:"
       - echo "  task multicluster:test:crds"
       - echo ""
-      - echo "To view logs:"
-      - echo "  task multicluster:logs:primary   # Primary cluster logs"
-      - echo "  task multicluster:logs:remote1   # Remote 1 cluster logs"
-      - echo "  task multicluster:logs:remote2   # Remote 2 cluster logs"
+      - echo "To refresh tokens (if they expire):"
+      - echo "  task multicluster:secrets:refresh"
 
   teardown:all:
     desc: Teardown entire multi-cluster environment
     cmds:
       - task: clusters:delete
-      - rm -f {{.MC_CONFIG_DIR}}/multi-cluster-kubeconfig.yaml
       - echo "Multi-cluster environment torn down"
 
   status:
     desc: Show status of multi-cluster environment
     cmds:
-      - echo "=== Clusters ==="
-      - kind get clusters
-      - echo ""
-      - echo "=== Operators ==="
-      - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord 2>/dev/null || echo "Primary - Not running"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n mirrord 2>/dev/null || echo "Remote 1 - Not running"'
-      - echo ""
-      - echo "=== Apps ==="
-      - 'kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null || echo "Primary - No apps"'
-      - 'kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null || echo "Remote 1 - No apps"'
+      - |
+        echo "=== Clusters ==="
+        minikube profile list 2>/dev/null | grep -E "mirrord-primary|mirrord-remote" || echo "No mirrord clusters found"
+        echo ""
+
+        echo "=== Operators ==="
+        echo "Primary:"
+        kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord -l app=mirrord-operator --no-headers 2>/dev/null || echo "  Not running"
+        echo "Remote-1:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n mirrord -l app=mirrord-operator --no-headers 2>/dev/null || echo "  Not running"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n mirrord -l app=mirrord-operator --no-headers 2>/dev/null || echo "  Not running"
+        fi
+        echo ""
+
+        echo "=== Apps ({{.MC_NAMESPACE}}) ==="
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Primary:"
+          kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} --no-headers 2>/dev/null || echo "  No apps"
+        else
+          echo "Primary: (management-only, no workloads)"
+        fi
+        echo "Remote-1:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} --no-headers 2>/dev/null || echo "  No apps"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Remote-2:"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.MC_NAMESPACE}} --no-headers 2>/dev/null || echo "  No apps"
+        fi
+        echo ""
+
+        echo "=== Sessions ==="
+        echo "MultiClusterSessions:"
+        kubectl --context {{.PRIMARY_CLUSTER}} get mirrordmulticlustersessions -A --no-headers 2>/dev/null || echo "  None"
+        echo "ClusterSessions (remote-1):"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersessions -A --no-headers 2>/dev/null || echo "  None"
 
   shell:primary:
     desc: Switch kubectl context to primary cluster
@@ -609,7 +1334,7 @@ tasks:
     cmds:
       - |
         MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
-        
+
         # Deploy to primary only if not management-only
         if [ "$MGMT_ONLY" != "true" ]; then
           echo "Deploying echo-app to {{.PRIMARY_CLUSTER}}..."
@@ -661,14 +1386,15 @@ tasks:
       - echo "Echo apps deleted from all clusters"
 
   test:generate:traffic:
-    desc: Generate traffic to echo-apps in all clusters
+    desc: Generate traffic to echo-apps in all clusters (NO filter header)
     cmds:
       - |
         MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
-        echo "Generating traffic (NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY)..."
+        echo "Generating traffic (NUM_CLUSTERS={{.NUM_CLUSTERS}})..."
+        echo "NO filter header - this traffic should NOT be stolen with http_filter"
         echo "Press Ctrl+C to stop"
         echo ""
-        
+
         i=1
         while true; do
           echo "--- Round $i ---"
@@ -677,19 +1403,19 @@ tasks:
           if [ "$MGMT_ONLY" != "true" ]; then
             echo -n "PRIMARY: "
             kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
-              wget -q -O- --header="X-Source-Cluster: PRIMARY" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+              wget -q -O- http://echo-app:8080/echo?from=primary 2>/dev/null | head -1 || echo "failed"
           fi
           
-          # Traffic to remote-1 (with X-Source-Cluster header)
+          # Traffic to remote-1
           echo -n "REMOTE-1: "
           kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
-            wget -q -O- --header="X-Source-Cluster: REMOTE-1" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+            wget -q -O- http://echo-app:8080/echo?from=remote-1 2>/dev/null | head -1 || echo "failed"
           
           # Traffic to remote-2 (only if NUM_CLUSTERS=3)
           if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
             echo -n "REMOTE-2: "
             kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
-              wget -q -O- --header="X-Source-Cluster: REMOTE-2" http://echo-app:8080/echo?from=traffic-gen 2>/dev/null | head -1 || echo "failed"
+              wget -q -O- http://echo-app:8080/echo?from=remote-2 2>/dev/null | head -1 || echo "failed"
           fi
           
           echo ""
@@ -705,7 +1431,7 @@ tasks:
         echo "Sending burst of 10 requests to each cluster..."
         echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
         echo ""
-        
+
         for i in $(seq 1 10); do
           # Primary only if not management-only
           if [ "$MGMT_ONLY" != "true" ]; then
@@ -719,7 +1445,7 @@ tasks:
               wget -q -O- "http://echo-app:8080/echo?req=$i" 2>/dev/null &
           fi
         done
-        
+
         wait
         echo "Burst complete"
 
@@ -737,10 +1463,10 @@ tasks:
         echo ""
         echo "You should see requests ONLY from PRIMARY cluster."
         echo ""
-        
+
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
-          --context {{.PRIMARY_CLUSTER}} \
+          --context {{.REMOTE_CLUSTER_1}} \
           --target deploy/echo-app \
           --target-namespace {{.MC_NAMESPACE}} \
           --steal \
@@ -756,33 +1482,108 @@ tasks:
         echo "Envoy should aggregate traffic from:"
         echo "  - {{.PRIMARY_CLUSTER}} (PRIMARY)"
         echo "  - {{.REMOTE_CLUSTER_1}} (REMOTE-1)"
+        echo "  - {{.REMOTE_CLUSTER_2}} (REMOTE-2)"
         echo ""
         echo "In another terminal, run:"
         echo "  task multicluster:test:generate:traffic"
         echo ""
         echo "You should see requests from ALL clusters!"
         echo ""
-        
+
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
-          --context {{.PRIMARY_CLUSTER}} \
           --target deploy/echo-app \
+          --context {{.PRIMARY_CLUSTER}} \
           --target-namespace {{.MC_NAMESPACE}} \
           --steal \
           -- ./echo-app
 
-  test:steal:with-config:
-    desc: Test with mirrord config file
+  test:steal:multi-cluster:with-config:
+    desc: Test with mirrord config file (includes HTTP filter)
     cmds:
       - |
         echo "=== Multi-Cluster Traffic Steal with Config ==="
         echo ""
-        
+        echo "Using config: mirrord-local.json"
+        echo "HTTP Filter: X-My-Header: filtered-data"
+        echo ""
+        echo "To test filtering, use:"
+        echo "  task multicluster:test:generate:traffic:filtered   # SHOULD be stolen"
+        echo "  task multicluster:test:generate:traffic            # Should NOT be stolen"
+        echo ""
+
         cd {{.APPS_DIR}}/echo-app
         {{.MIRRORD_BIN}} exec \
           --context {{.PRIMARY_CLUSTER}} \
-          -f mirrord-local.json \
+          -f mirrord-local-no-container.json \
           -- ./echo-app
+
+  test:generate:traffic:filtered:
+    desc: Generate traffic with X-My-Header header (for filter testing)
+    cmds:
+      - |
+        echo "Generating FILTERED traffic (with X-My-Header: filtered-data)..."
+        echo "This traffic SHOULD be stolen when using http_filter"
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Round $i (FILTERED) ---"
+          
+          # Traffic to primary with filter header
+          echo -n "PRIMARY (filtered): "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-My-Header: filtered-data" --header="X-Source-Cluster: PRIMARY" \
+            http://echo-app:8080/echo?from=filtered 2>/dev/null | head -1 || echo "failed"
+          
+          # Traffic to remote-1 with filter header
+          echo -n "REMOTE-1 (filtered): "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-My-Header: filtered-data" --header="X-Source-Cluster: REMOTE-1" \
+            http://echo-app:8080/echo?from=filtered 2>/dev/null | head -1 || echo "failed"
+          
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            echo -n "REMOTE-2 (filtered): "
+            kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+              wget -q -O- --header="X-My-Header: filtered-data" --header="X-Source-Cluster: REMOTE-2" \
+              http://echo-app:8080/echo?from=filtered 2>/dev/null | head -1 || echo "failed"
+          fi
+          
+          echo ""
+          i=$((i + 1))
+          sleep 2
+        done
+
+  test:generate:traffic:mixed:
+    desc: Generate mixed traffic (some filtered, some not) for filter testing
+    cmds:
+      - |
+        echo "Generating MIXED traffic..."
+        echo "  - With X-My-Header: filtered-data -> SHOULD be stolen"
+        echo "  - Without header -> Should NOT be stolen"
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Round $i ---"
+          
+          # Filtered traffic (should be stolen)
+          echo -n "FILTERED (primary): "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-My-Header: filtered-data" \
+            http://echo-app:8080/echo?type=filtered 2>/dev/null | head -1 || echo "failed"
+          
+          # Non-filtered traffic (should NOT be stolen)
+          echo -n "NON-FILTERED (primary): "
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- http://echo-app:8080/echo?type=non-filtered 2>/dev/null | head -1 || echo "failed"
+          
+          echo ""
+          i=$((i + 1))
+          sleep 2
+        done
 
   test:verify:operator-status:
     desc: Verify operator multi-cluster configuration
@@ -791,13 +1592,13 @@ tasks:
         echo "=== Operator Status in Primary Cluster ==="
         kubectl --context {{.PRIMARY_CLUSTER}} get mirrordoperators -o yaml 2>/dev/null || \
           echo "MirrordOperator CRD not found"
-        
+
         echo ""
         echo "=== Operator Pod Env Vars (multi-cluster related) ==="
         kubectl --context {{.PRIMARY_CLUSTER}} get pods -n mirrord -l app=mirrord-operator \
           -o jsonpath='{range .items[0].spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null | \
           grep -iE "(multi|cluster|primary|default)" || echo "No multi-cluster env vars found"
-        
+
         echo ""
         echo "=== Operator Logs (last 30 lines) ==="
         kubectl --context {{.PRIMARY_CLUSTER}} logs -n mirrord -l app=mirrord-operator --tail=30
@@ -813,11 +1614,11 @@ tasks:
       - |
         echo "=== Cluster Sessions in Primary ==="
         kubectl --context {{.PRIMARY_CLUSTER}} get mirrordclustersessions -A 2>/dev/null || echo "None"
-        
+
         echo ""
         echo "=== Cluster Sessions in Remote-1 ==="
         kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersessions -A 2>/dev/null || echo "None"
-        
+
         echo ""
         echo "=== Cluster Sessions in Remote-2 ==="
 
@@ -889,10 +1690,10 @@ tasks:
         echo "=== Automated E2E Multi-Cluster Test ==="
         echo "  NUM_CLUSTERS={{.NUM_CLUSTERS}}, PRIMARY_MANAGEMENT_ONLY=$MGMT_ONLY"
         echo ""
-        
+
         # Ensure apps are deployed
         task multicluster:test:deploy:echo-apps
-        
+
         echo "Waiting for apps to be ready..."
         if [ "$MGMT_ONLY" != "true" ]; then
           kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
@@ -901,10 +1702,10 @@ tasks:
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/echo-app -n {{.MC_NAMESPACE}} --timeout=60s
         fi
-        
+
         echo ""
         echo "Verifying apps respond with correct cluster IDs..."
-        
+
         if [ "$MGMT_ONLY" != "true" ]; then
           echo -n "PRIMARY responds: "
           kubectl --context {{.PRIMARY_CLUSTER}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
@@ -912,17 +1713,17 @@ tasks:
         else
           echo "PRIMARY: (management-only, no workloads)"
         fi
-        
+
         echo -n "REMOTE-1 responds: "
         kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
           wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
-        
+
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           echo -n "REMOTE-2 responds: "
           kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
             wget -q -O- http://localhost:8080/info 2>/dev/null | grep -o '"cluster_id":"[^"]*"'
         fi
-        
+
         echo ""
         echo "E2E test complete. Apps are correctly deployed with cluster-specific IDs."
         echo ""
@@ -935,4 +1736,1607 @@ tasks:
           echo "  3. Verify you see traffic from all 3 clusters"
         else
           echo "  3. Verify you see traffic from both clusters"
+        fi
+
+  # =============================================================================
+  # Database Deployments for Multi-Cluster Testing
+  # =============================================================================
+
+  postgres:deploy:
+    desc: Deploy PostgreSQL to ALL clusters (to verify routing uses correct default cluster)
+    cmds:
+      - |
+        echo "Deploying PostgreSQL to ALL clusters..."
+        echo "(This verifies routing correctly uses default cluster even when DB exists in primary)"
+
+        # Always deploy to primary (for testing routing logic)
+        echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+        fi
+
+        echo "PostgreSQL deployed to ALL clusters"
+
+  postgres:delete:
+    desc: Delete PostgreSQL from all clusters
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete -k {{.K8S_DIR}}/overlays/multicluster-postgres --ignore-not-found=true || true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete -k {{.K8S_DIR}}/overlays/multicluster-postgres --ignore-not-found=true || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete -k {{.K8S_DIR}}/overlays/multicluster-postgres --ignore-not-found=true || true
+        fi
+      - echo "PostgreSQL deleted from all clusters"
+
+  postgres:wait:
+    desc: Wait for PostgreSQL to be ready in all clusters
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Waiting for PostgreSQL to be ready..."
+
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Waiting on {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=ready pod/postgres-test -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+
+        echo "Waiting on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=ready pod/postgres-test -n {{.MC_NAMESPACE}} --timeout=120s || true
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Waiting on {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=ready pod/postgres-test -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+
+        echo "PostgreSQL is ready"
+
+  mysql:deploy:
+    desc: Deploy MySQL to ALL clusters (to verify routing uses correct default cluster)
+    cmds:
+      - |
+        echo "Deploying MySQL to ALL clusters..."
+        echo "(This verifies routing correctly uses default cluster even when DB exists in primary)"
+
+        # Always deploy to primary (for testing routing logic)
+        echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+        kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-mysql
+
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -k {{.K8S_DIR}}/overlays/multicluster-mysql
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -k {{.K8S_DIR}}/overlays/multicluster-mysql
+        fi
+
+        echo "MySQL deployed to ALL clusters"
+
+  mysql:delete:
+    desc: Delete MySQL from all clusters
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete -k {{.K8S_DIR}}/overlays/multicluster-mysql --ignore-not-found=true || true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete -k {{.K8S_DIR}}/overlays/multicluster-mysql --ignore-not-found=true || true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete -k {{.K8S_DIR}}/overlays/multicluster-mysql --ignore-not-found=true || true
+        fi
+      - echo "MySQL deleted from all clusters"
+
+  mysql:wait:
+    desc: Wait for MySQL to be ready in all clusters
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Waiting for MySQL to be ready..."
+
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Waiting on {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/mysql -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+
+        echo "Waiting on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/mysql -n {{.MC_NAMESPACE}} --timeout=120s || true
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Waiting on {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/mysql -n {{.MC_NAMESPACE}} --timeout=120s || true
+        fi
+
+        echo "MySQL is ready"
+
+  databases:deploy:
+    desc: Deploy both PostgreSQL and MySQL to all clusters
+    cmds:
+      - task: postgres:deploy
+      - task: mysql:deploy
+      - task: postgres:wait
+      - task: mysql:wait
+      - echo "All databases deployed and ready"
+
+  databases:delete:
+    desc: Delete both PostgreSQL and MySQL from all clusters
+    cmds:
+      - task: postgres:delete
+      - task: mysql:delete
+      - echo "All databases deleted"
+
+  databases:status:
+    desc: Show database status in all clusters
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "=== Database Status ==="
+        echo ""
+
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "--- {{.PRIMARY_CLUSTER}} ---"
+          kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} -l 'app in (postgres-test, mysql)' 2>/dev/null || echo "No databases"
+        else
+          echo "--- {{.PRIMARY_CLUSTER}} (management-only) ---"
+          echo "No workloads deployed"
+        fi
+
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} -l 'app in (postgres-test, mysql)' 2>/dev/null || echo "No databases"
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.MC_NAMESPACE}} -l 'app in (postgres-test, mysql)' 2>/dev/null || echo "No databases"
+        fi
+
+  # =============================================================================
+  # Run Database Apps with mirrord (Multi-Cluster)
+  # =============================================================================
+
+  postgres:run:
+    desc: Run postgres-app locally with mirrord (multi-cluster mode)
+    cmds:
+      - |
+        echo "=== PostgreSQL App (Multi-Cluster) ==="
+        echo "Target: postgres-test in {{.MC_NAMESPACE}}"
+        echo "Note: Connects to primary operator, routes stateful ops to default cluster"
+        echo ""
+
+        cd {{.APPS_DIR}}/postgres-app
+        echo "Building postgres-app..."
+        go build -o /tmp/postgres-app main.go
+
+        echo "Running with mirrord..."
+        # Primary operator routes stateful operations (db branches) to the default cluster
+        {{.MIRRORD_BIN}} exec \
+          --context {{.REMOTE_CLUSTER_1}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-postgres/mirrord.json \
+          -- /tmp/postgres-app
+
+  mysql:run:
+    desc: Run mysql-app locally with mirrord (multi-cluster mode)
+    cmds:
+      - |
+        echo "=== MySQL App (Multi-Cluster) ==="
+        echo "Target: deploy/mysql in {{.MC_NAMESPACE}}"
+        echo "Note: Connects to primary operator, routes stateful ops to default cluster"
+        echo ""
+
+        cd {{.APPS_DIR}}/mysql-app
+        echo "Building mysql-app..."
+        go build -o /tmp/mysql-app main.go
+
+        echo "Running with mirrord..."
+        # Primary operator routes stateful operations (db branches) to the default cluster
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-mysql/mirrord.json \
+          -- /tmp/mysql-app
+
+  postgres:shell:source:
+    desc: Connect to PostgreSQL source database (psql shell)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        echo "Connecting to PostgreSQL on $CLUSTER..."
+        kubectl --context $CLUSTER exec -it -n {{.MC_NAMESPACE}} postgres-test -- psql -U postgres -d source_db
+
+  postgres:query:
+    desc: Run a query on PostgreSQL (QUERY="SELECT * FROM users")
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        kubectl --context $CLUSTER exec -n {{.MC_NAMESPACE}} postgres-test -- psql -U postgres -d source_db -c "{{.QUERY}}"
+
+  mysql:shell:source:
+    desc: Connect to MySQL source database (mysql shell)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        echo "Connecting to MySQL on $CLUSTER..."
+        kubectl --context $CLUSTER exec -it -n {{.MC_NAMESPACE}} deploy/mysql -- mysql -u myuser -pmypassword mydatabase
+
+  mysql:query:
+    desc: Run a query on MySQL (QUERY="SELECT * FROM users")
+    vars:
+      QUERY: '{{.QUERY | default "SHOW TABLES;"}}'
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        if [ "$MGMT_ONLY" = "true" ]; then
+          CLUSTER="{{.REMOTE_CLUSTER_1}}"
+        else
+          CLUSTER="{{.PRIMARY_CLUSTER}}"
+        fi
+        kubectl --context $CLUSTER exec -n {{.MC_NAMESPACE}} deploy/mysql -- mysql -u myuser -pmypassword mydatabase -e "{{.QUERY}}"
+
+  test:copy-target:deploy:
+    desc: Deploy echo-app for copy_target testing
+    cmds:
+      - task: test:deploy:echo-apps
+      - echo ""
+      - echo "Echo apps deployed. Ready for copy_target tests."
+
+  test:copy-target:basic:
+    desc: Test basic copy_target in multi-cluster (no scale_down)
+    cmds:
+      - |
+        echo "=== Copy Target Test (Multi-Cluster) ==="
+        echo ""
+        echo "This tests copy_target behavior when connecting via primary cluster."
+        echo "Expected behavior: copy should be created on the default cluster."
+        echo ""
+        echo "Config: {{.K8S_DIR}}/overlays/multicluster-copy-target/mirrord.json"
+        echo "  - copy_target.enabled: true"
+        echo "  - copy_target.scale_down: false"
+        echo ""
+
+        echo "Running mirrord with copy_target..."
+        cd {{.APPS_DIR}}/echo-app
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-copy-target/mirrord.json \
+          -- ./echo-app
+
+  test:copy-target:scale-down:
+    desc: Test copy_target with scale_down in multi-cluster
+    cmds:
+      - |
+        echo "=== Copy Target + Scale Down Test (Multi-Cluster) ==="
+        echo ""
+        echo "This tests copy_target with scale_down via primary cluster."
+        echo "Expected: Original deployment scaled to 0, copy pod created."
+        echo ""
+        echo "WARNING: This will scale down the echo-app deployment!"
+        echo ""
+        echo "Config: {{.K8S_DIR}}/overlays/multicluster-copy-target/mirrord-scale-down.json"
+        echo "  - copy_target.enabled: true"
+        echo "  - copy_target.scale_down: true"
+        echo ""
+
+        echo "Running mirrord with copy_target + scale_down..."
+        cd {{.APPS_DIR}}/echo-app
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-copy-target/mirrord-scale-down.json \
+          -- ./echo-app
+
+  test:copy-target:watch:
+    desc: Watch for copy pods in all clusters
+    cmds:
+      - |
+        echo "Watching for copy pods in all clusters..."
+        echo "Look for pods with 'mirrord-copy' in the name"
+        echo ""
+        while true; do
+          echo "=== $(date) ==="
+          echo ""
+          echo "--- {{.PRIMARY_CLUSTER}} ---"
+          kubectl --context {{.PRIMARY_CLUSTER}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null | grep -E "mirrord-copy|echo-app" || echo "  No matching pods"
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_1}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null | grep -E "mirrord-copy|echo-app" || echo "  No matching pods"
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            echo ""
+            echo "--- {{.REMOTE_CLUSTER_2}} ---"
+            kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.MC_NAMESPACE}} 2>/dev/null | grep -E "mirrord-copy|echo-app" || echo "  No matching pods"
+          fi
+          echo ""
+          sleep 3
+        done
+
+  sqs:deploy:localstack:
+    desc: Deploy LocalStack (for SQS) to clusters (respects PRIMARY_MANAGEMENT_ONLY)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Deploying LocalStack for SQS testing..."
+        echo ""
+
+        # Deploy to primary if not management-only
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} create namespace localstack --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+          kubectl --context {{.PRIMARY_CLUSTER}} create configmap localstack-init \
+            --from-file=init.sh={{.K8S_DIR}}/overlays/multicluster-sqs/init.sh \
+            -n localstack --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+          kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/localstack.yaml -n localstack
+        else
+          echo "Skipping {{.PRIMARY_CLUSTER}} (management-only mode)"
+        fi
+
+        # Deploy to remote-1 (default cluster)
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+
+        # Create ConfigMap for init scripts (uses multicluster-sqs config)
+        kubectl --context {{.REMOTE_CLUSTER_1}} create configmap localstack-init \
+          --from-file=init.sh={{.K8S_DIR}}/overlays/multicluster-sqs/init.sh \
+          -n localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/localstack.yaml -n localstack
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} create namespace localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          
+          # Create ConfigMap for init scripts (uses multicluster-sqs config)
+          kubectl --context {{.REMOTE_CLUSTER_2}} create configmap localstack-init \
+            --from-file=init.sh={{.K8S_DIR}}/overlays/multicluster-sqs/init.sh \
+            -n localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+          
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/localstack.yaml -n localstack
+        fi
+
+        echo "LocalStack deployed. Waiting for it to be ready..."
+
+  sqs:wait:localstack:
+    desc: Wait for LocalStack to be ready
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Waiting for LocalStack..."
+        if [ "$MGMT_ONLY" != "true" ]; then
+          kubectl --context {{.PRIMARY_CLUSTER}} wait --for=condition=available deploy/localstack -n localstack --timeout=120s
+        fi
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/localstack -n localstack --timeout=120s
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} wait --for=condition=available deploy/localstack -n localstack --timeout=120s
+        fi
+        echo "LocalStack is ready"
+
+  sqs:create:queue:
+    desc: Create test SQS queue in LocalStack (respects PRIMARY_MANAGEMENT_ONLY)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Creating test SQS queue..."
+
+        # Create queue on primary if not management-only
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Creating queue on {{.PRIMARY_CLUSTER}}..."
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n localstack deploy/localstack -- \
+            awslocal sqs create-queue --queue-name test-queue 2>/dev/null || echo "Queue may already exist"
+          echo "Queues on {{.PRIMARY_CLUSTER}}:"
+          kubectl --context {{.PRIMARY_CLUSTER}} exec -n localstack deploy/localstack -- \
+            awslocal sqs list-queues
+        fi
+
+        # Create queue on remote-1
+        echo "Creating queue on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs create-queue --queue-name test-queue 2>/dev/null || echo "Queue may already exist"
+
+        # Verify
+        echo "Queues on {{.REMOTE_CLUSTER_1}}:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "Creating queue on {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n localstack deploy/localstack -- \
+            awslocal sqs create-queue --queue-name test-queue 2>/dev/null || echo "Queue may already exist"
+          
+          echo "Queues on {{.REMOTE_CLUSTER_2}}:"
+          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n localstack deploy/localstack -- \
+            awslocal sqs list-queues
+        fi
+
+  sqs:deploy:consumer:
+    desc: Deploy SQS consumer app to clusters (respects PRIMARY_MANAGEMENT_ONLY)
+    cmds:
+      - |
+        MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
+        echo "Building SQS consumer..."
+        cd {{.APPS_DIR}}/sqs-consumer
+        docker build -t sqs-consumer:latest . 2>/dev/null || echo "Build may have failed, continuing..."
+
+        echo "Loading image to clusters..."
+        minikube -p {{.REMOTE_CLUSTER_1}} image load sqs-consumer:latest 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load sqs-consumer:latest 2>/dev/null || true
+        fi
+        # Load to primary if not management-only
+        if [ "$MGMT_ONLY" != "true" ]; then
+          minikube -p {{.PRIMARY_CLUSTER}} image load sqs-consumer:latest 2>/dev/null || true
+        fi
+
+        echo "Deploying SQS consumer..."
+
+        # Deploy to primary if not management-only
+        if [ "$MGMT_ONLY" != "true" ]; then
+          echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+          cat <<EOF | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "http://localstack.localstack.svc.cluster.local:4566"
+                - name: CLUSTER_ID
+                  value: "PRIMARY"
+        EOF
+        else
+          echo "Skipping {{.PRIMARY_CLUSTER}} (management-only mode)"
+        fi
+
+        # Deploy to remote-1
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "http://localstack.localstack.svc.cluster.local:4566"
+                - name: CLUSTER_ID
+                  value: "REMOTE-1"
+        EOF
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "http://localstack.localstack.svc.cluster.local:4566"
+                - name: CLUSTER_ID
+                  value: "REMOTE-2"
+        EOF
+        fi
+
+        if [ "$MGMT_ONLY" = "true" ]; then
+          echo "SQS consumer deployed to remote clusters only (PRIMARY_MANAGEMENT_ONLY=true)"
+        else
+          echo "SQS consumer deployed to all clusters"
+        fi
+
+  sqs:setup:
+    desc: Complete SQS setup for multi-cluster testing
+    cmds:
+      - task: sqs:deploy:localstack
+      - task: sqs:wait:localstack
+      - task: sqs:create:queue
+      - task: sqs:deploy:consumer
+      # - task: sqs:deploy:queue-registry
+      - echo ""
+      - echo "SQS setup complete. Run 'task multicluster:sqs:send:messages' to send test messages."
+
+  sqs:setup:single:
+    desc: SQS setup with single LocalStack on default cluster (matches production)
+    cmds:
+      - task: sqs:deploy:localstack:single
+      - task: sqs:wait:localstack:single
+      - task: sqs:create:queue:single
+      - task: sqs:deploy:consumer:single
+      # - task: sqs:deploy:queue-registry
+      - echo ""
+      - echo "Single-SQS setup complete!"
+      - echo "All clusters now share one LocalStack on {{.REMOTE_CLUSTER_1}}"
+      - echo ""
+      - 'echo "To test: task multicluster:sqs:send:messages:single"'
+
+  sqs:deploy:localstack:single:
+    desc: Deploy LocalStack only to default cluster with NodePort (shared SQS)
+    cmds:
+      - |
+        echo "Deploying LocalStack to default cluster only ({{.REMOTE_CLUSTER_1}})..."
+        echo "This matches production where all clusters share one AWS SQS"
+        echo ""
+
+        # Connect all minikube clusters to the same Docker network
+        # This allows cross-cluster communication via NodePort
+        echo "Connecting Docker networks for cross-cluster access..."
+        docker network connect {{.REMOTE_CLUSTER_1}} {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          docker network connect {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+
+        # Deploy only to remote-1 (default cluster)
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+
+        # Create ConfigMap for init scripts
+        kubectl --context {{.REMOTE_CLUSTER_1}} create configmap localstack-init \
+          --from-file=init.sh={{.K8S_DIR}}/overlays/multicluster-sqs/init.sh \
+          -n localstack --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+
+        # Deploy with NodePort service
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/localstack-single.yaml -n localstack
+
+        echo ""
+        echo "LocalStack deployed to {{.REMOTE_CLUSTER_1}} with NodePort 31566"
+
+  sqs:wait:localstack:single:
+    desc: Wait for single LocalStack to be ready
+    cmds:
+      - |
+        echo "Waiting for LocalStack on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=available deploy/localstack -n localstack --timeout=120s
+        echo "LocalStack is ready"
+
+  sqs:create:queue:single:
+    desc: Create test queue on single LocalStack with receive wait time
+    cmds:
+      - |
+        echo "Creating test queue on {{.REMOTE_CLUSTER_1}} with ReceiveMessageWaitTimeSeconds=5..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs create-queue --queue-name test-queue \
+            --attributes ReceiveMessageWaitTimeSeconds=5,VisibilityTimeout=30 \
+          2>/dev/null || echo "Queue may already exist, updating attributes..."
+
+        # Update attributes if queue already exists
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs set-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attributes ReceiveMessageWaitTimeSeconds=5 \
+          2>/dev/null || true
+
+        echo "Queues:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues
+
+  sqs:deploy:consumer:single:
+    desc: Deploy SQS consumer to all clusters, all pointing to single LocalStack
+    cmds:
+      - |
+        echo "Building SQS consumer..."
+        cd {{.APPS_DIR}}/sqs-consumer
+        docker build -t sqs-consumer:latest . 2>/dev/null || echo "Build may have failed, continuing..."
+
+        # Get the minikube IP of the default cluster (where LocalStack runs)
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        echo ""
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo ""
+
+        echo "Loading image to clusters..."
+        minikube -p {{.REMOTE_CLUSTER_1}} image load sqs-consumer:latest 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load sqs-consumer:latest 2>/dev/null || true
+        fi
+
+        # Deploy to remote-1 (default cluster)
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-1"
+        EOF
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-consumer
+          template:
+            metadata:
+              labels:
+                app: sqs-consumer
+            spec:
+              containers:
+              - name: sqs-consumer
+                image: sqs-consumer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-2"
+        EOF
+        fi
+
+        echo ""
+        echo "SQS consumers deployed - all pointing to $LOCALSTACK_URL"
+
+  sqs:send:messages:single:
+    desc: Send test messages to single shared LocalStack
+    cmds:
+      - |
+        QUEUE_URL="http://localhost:4566/000000000000/test-queue"
+
+        echo "Sending test messages via LocalStack on {{.REMOTE_CLUSTER_1}}..."
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Round $i ---"
+
+          # Send premium message (should go to local mirrord consumer)
+          echo -n "Premium: "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order_id\": \"ORD-P$i\", \"amount\": $((RANDOM % 1000)), \"tenant\": \"premium-customer\"}" \
+              --message-attributes '{"type":{"DataType":"String","StringValue":"premium"}}' \
+              --output text --query 'MessageId' 2>/dev/null || echo "failed"
+
+          # Send basic message (should stay with pod consumer)
+          echo -n "Basic:   "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order_id\": \"ORD-B$i\", \"amount\": $((RANDOM % 100)), \"tenant\": \"basic-customer\"}" \
+              --message-attributes '{"type":{"DataType":"String","StringValue":"basic"}}' \
+              --output text --query 'MessageId' 2>/dev/null || echo "failed"
+
+          echo ""
+          i=$((i + 1))
+          sleep 3
+        done
+
+  sqs:deploy:producer:single:
+    desc: Deploy SQS producer to all clusters (sends to shared LocalStack)
+    cmds:
+      - |
+        echo "Building SQS producer..."
+        cd {{.APPS_DIR}}/sqs-producer
+        docker build -t sqs-producer:latest . 2>/dev/null || { echo "Build failed"; exit 1; }
+
+        # Get the LocalStack URL
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo ""
+
+        echo "Loading image to clusters..."
+        minikube -p {{.REMOTE_CLUSTER_1}} image load sqs-producer:latest 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          minikube -p {{.REMOTE_CLUSTER_2}} image load sqs-producer:latest 2>/dev/null || true
+        fi
+
+        # Deploy to remote-1
+        echo "Deploying producer to {{.REMOTE_CLUSTER_1}}..."
+        cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-producer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-producer
+          template:
+            metadata:
+              labels:
+                app: sqs-producer
+            spec:
+              containers:
+              - name: sqs-producer
+                image: sqs-producer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-1"
+                - name: SEND_INTERVAL
+                  value: "5"
+        EOF
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying producer to {{.REMOTE_CLUSTER_2}}..."
+          cat <<EOF | kubectl --context {{.REMOTE_CLUSTER_2}} apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: sqs-producer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: sqs-producer
+          template:
+            metadata:
+              labels:
+                app: sqs-producer
+            spec:
+              containers:
+              - name: sqs-producer
+                image: sqs-producer:latest
+                imagePullPolicy: Never
+                env:
+                - name: QUEUE_NAME
+                  value: "test-queue"
+                - name: AWS_ACCESS_KEY_ID
+                  value: "test"
+                - name: AWS_SECRET_ACCESS_KEY
+                  value: "test"
+                - name: AWS_REGION
+                  value: "us-east-1"
+                - name: AWS_ENDPOINT_URL
+                  value: "$LOCALSTACK_URL"
+                - name: CLUSTER_ID
+                  value: "REMOTE-2"
+                - name: SEND_INTERVAL
+                  value: "5"
+        EOF
+        fi
+
+        echo ""
+        echo "Producers deployed! They will send messages every 5 seconds."
+        echo "Check logs: task multicluster:sqs:logs:producer"
+
+  sqs:logs:producer:
+    desc: Show SQS producer logs from all clusters
+    cmds:
+      - |
+        echo "=== Producer Logs ==="
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} deploy/sqs-producer --tail=10 2>/dev/null || echo "No producer in remote-1"
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} deploy/sqs-producer --tail=10 2>/dev/null || echo "No producer in remote-2"
+        fi
+
+  sqs:delete:producer:
+    desc: Delete SQS producer from all clusters
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete deploy/sqs-producer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete deploy/sqs-producer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+        fi
+      - echo "Producers deleted"
+
+  # ============================================================================
+  # LOCAL PRODUCER TESTING
+  # ============================================================================
+
+  sqs:send:
+    desc: "Send messages: task sqs:send FILTERED=5 UNFILTERED=5"
+    vars:
+      FILTERED: '{{.FILTERED | default "5"}}'
+      UNFILTERED: '{{.UNFILTERED | default "5"}}'
+    cmds:
+      - |
+        echo "Sending {{.FILTERED}} filtered (type=premium) + {{.UNFILTERED}} unfiltered (type=basic) messages..."
+        QUEUE_URL="http://localhost:4566/000000000000/test-queue"
+
+        # Send filtered messages (type=premium - will be split to local app)
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order\": \"ORD-F$i\", \"amount\": \"$((RANDOM % 1000)).99\", \"tenant\": \"premium-customer\"}" \
+              --message-attributes '{"type":{"DataType":"String","StringValue":"premium"}}' \
+              2>/dev/null | jq -r '"FILTERED: " + .MessageId' || echo "FILTERED: failed"
+        done
+
+        # Send unfiltered messages (type=basic - stays in original queue)
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order\": \"ORD-U$i\", \"amount\": \"$((RANDOM % 100)).99\", \"tenant\": \"basic-customer\"}" \
+              --message-attributes '{"type":{"DataType":"String","StringValue":"basic"}}' \
+              2>/dev/null | jq -r '"UNFILTERED: " + .MessageId' || echo "UNFILTERED: failed"
+        done
+
+        echo ""
+        echo "Done! Sent {{.FILTERED}} filtered + {{.UNFILTERED}} unfiltered = $(({{.FILTERED}} + {{.UNFILTERED}})) total"
+
+  sqs:send:burst:
+    desc: "Send messages in PARALLEL for burst testing: task sqs:send:burst FILTERED=50 UNFILTERED=50"
+    vars:
+      FILTERED: '{{.FILTERED | default "20"}}'
+      UNFILTERED: '{{.UNFILTERED | default "20"}}'
+      PARALLEL: '{{.PARALLEL | default "10"}}'
+    cmds:
+      - |
+        echo "BURST MODE: Sending {{.FILTERED}} filtered + {{.UNFILTERED}} unfiltered messages ({{.PARALLEL}} parallel)..."
+        QUEUE_URL="http://localhost:4566/000000000000/test-queue"
+        CONTEXT="{{.REMOTE_CLUSTER_1}}"
+
+        # Generate work items and run in parallel using background jobs
+        for i in $(seq 1 {{.FILTERED}}); do
+          (
+            kubectl --context $CONTEXT exec -n localstack deploy/localstack -- \
+              awslocal sqs send-message \
+                --queue-url $QUEUE_URL \
+                --message-body "{\"order\": \"ORD-F$i\", \"amount\": \"$((RANDOM % 1000)).99\", \"tenant\": \"premium-customer\"}" \
+                --message-attributes '{"type":{"DataType":"String","StringValue":"premium"}}' \
+                2>/dev/null | jq -r '"premium: " + .MessageId' || echo "premium: failed"
+          ) &
+          # Limit parallel jobs (ignore wait -n exit code)
+          [ $(jobs -r | wc -l) -ge {{.PARALLEL}} ] && { wait -n || true; }
+        done
+
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          (
+            kubectl --context $CONTEXT exec -n localstack deploy/localstack -- \
+              awslocal sqs send-message \
+                --queue-url $QUEUE_URL \
+                --message-body "{\"order\": \"ORD-U$i\", \"amount\": \"$((RANDOM % 100)).99\", \"tenant\": \"basic-customer\"}" \
+                --message-attributes '{"type":{"DataType":"String","StringValue":"basic"}}' \
+                2>/dev/null | jq -r '"basic: " + .MessageId' || echo "basic: failed"
+          ) &
+          [ $(jobs -r | wc -l) -ge {{.PARALLEL}} ] && { wait -n || true; }
+        done
+
+        # Wait for all remaining jobs (ignore exit codes from individual jobs)
+        wait || true
+
+        echo ""
+        echo "BURST COMPLETE! Sent $(({{.FILTERED}} + {{.UNFILTERED}})) messages with {{.PARALLEL}} parallel workers"
+
+  sqs:send:multi-filter:
+    desc: "Send messages with MULTIPLE filter types: task sqs:send:multi-filter COUNT=10 PARALLEL=20"
+    vars:
+      COUNT: '{{.COUNT | default "5"}}'
+      PARALLEL: '{{.PARALLEL | default "20"}}'
+    cmds:
+      - |
+        echo "MULTI-FILTER MODE: Sending {{.COUNT}} messages for EACH filter type..."
+        echo "Filter types: premium, gold, vip, enterprise, basic"
+        echo "Parallelism: {{.PARALLEL}}"
+        echo ""
+
+        # Generate all messages as "type index" pairs and pipe to xargs
+        (
+          for i in $(seq 1 {{.COUNT}}); do echo "premium $i"; done
+          for i in $(seq 1 {{.COUNT}}); do echo "gold $i"; done
+          for i in $(seq 1 {{.COUNT}}); do echo "vip $i"; done
+          for i in $(seq 1 {{.COUNT}}); do echo "enterprise $i"; done
+          for i in $(seq 1 {{.COUNT}}); do echo "basic $i"; done
+        ) | xargs -P {{.PARALLEL}} -L 1 sh -c '
+          TYPE=$1
+          IDX=$2
+          QUEUE_URL="http://localhost:4566/000000000000/test-queue"
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --queue-url $QUEUE_URL \
+            --message-body "{\"order\": \"ORD-$TYPE-$IDX\", \"tenant\": \"$TYPE-customer\"}" \
+            --message-attributes "{\"type\":{\"DataType\":\"String\",\"StringValue\":\"$TYPE\"}}" \
+            2>/dev/null | jq -r "\"$TYPE: \" + .MessageId" || echo "$TYPE: failed"
+        ' _
+
+        echo ""
+        echo "MULTI-FILTER COMPLETE! Sent $(({{.COUNT}} * 5)) total messages ({{.COUNT}} per type)"
+        echo ""
+        echo "Available mirrord configs to test:"
+        echo "  - mirrord-premium.json    (type=premium)"
+        echo "  - mirrord-gold.json       (type=gold)"
+        echo "  - mirrord-vip.json        (type=vip)"
+        echo "  - mirrord-enterprise.json (type=enterprise)"
+        echo "  - mirrord-all.json        (type=.* matches all)"
+
+  sqs:send:continuous:
+    desc: "Continuously send messages with random filter types: task sqs:send:continuous INTERVAL=1"
+    vars:
+      INTERVAL: '{{.INTERVAL | default "2"}}'
+    cmds:
+      - |
+        echo "CONTINUOUS MODE: Sending messages every {{.INTERVAL}}s with random filter types..."
+        echo "Press Ctrl+C to stop"
+        echo ""
+        QUEUE_URL="http://localhost:4566/000000000000/test-queue"
+        CONTEXT="{{.REMOTE_CLUSTER_1}}"
+
+        i=1
+
+        while true; do
+          # Pick random type using modulo on process substitution
+          RAND=$((RANDOM % 5))
+          case $RAND in
+            0) TYPE="premium" ;;
+            1) TYPE="gold" ;;
+            2) TYPE="vip" ;;
+            3) TYPE="enterprise" ;;
+            *) TYPE="basic" ;;
+          esac
+          
+          kubectl --context $CONTEXT exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order\": \"ORD-$TYPE-$i\", \"amount\": \"$((RANDOM % 1000)).99\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" \
+              --message-attributes "{\"type\":{\"DataType\":\"String\",\"StringValue\":\"$TYPE\"}}" \
+              2>/dev/null | jq -r "\"[$i] $TYPE: \" + .MessageId" || echo "[$i] $TYPE: failed"
+          
+          i=$((i + 1))
+          sleep {{.INTERVAL}}
+        done
+
+  sqs:run:producer:local:
+    desc: Run SQS producer continuously (sends random messages)
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+
+        echo "Sending continuous random messages..."
+        echo "Queue: test-queue"
+        echo "Endpoint: $LOCALSTACK_URL"
+        echo ""
+
+        cd apps/sqs-producer && \
+          QUEUE_NAME=test-queue \
+          SQS_ENDPOINT=$LOCALSTACK_URL \
+          SEND_INTERVAL=${SEND_INTERVAL:-2} \
+          go run main.go 0 0  # Will fall back to continuous mode if we add it back
+
+  sqs:logs:consumer:
+    desc: Show SQS consumer logs from all clusters (follow mode)
+    cmds:
+      - |
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           SQS CONSUMER LOGS (all clusters)                     ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "Use Ctrl+C to stop watching logs"
+        echo ""
+
+        # Show recent logs and follow
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=50 &
+        PID1=$!
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=50 &
+          PID2=$!
+        fi
+
+        # Wait for Ctrl+C
+        trap "kill $PID1 2>/dev/null; kill $PID2 2>/dev/null; exit 0" INT
+        wait
+
+  sqs:logs:consumer:cluster1:
+    desc: Show SQS consumer logs from cluster 1 only
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=100
+
+  sqs:logs:consumer:cluster2:
+    desc: Show SQS consumer logs from cluster 2 only
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} deploy/sqs-consumer -f --tail=100
+
+  sqs:test:full:
+    desc: "Complete SQS test: Setup + run local producer (use in separate terminal)"
+    cmds:
+      - |
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           COMPLETE SQS SPLITTING TEST                          ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+        echo "This test requires TWO terminals:"
+        echo ""
+        echo "Terminal 1 (this one): Run the producer"
+        echo "Terminal 2: Watch consumer logs with:"
+        echo "  task multicluster:sqs:logs:consumer"
+        echo ""
+        echo "Or test with mirrord:"
+        echo "  1. Run local producer (this terminal)"
+        echo "  2. Run your local app with mirrord and SQS filter"
+        echo ""
+        echo "Press Enter to start the producer, or Ctrl+C to cancel..."
+        read
+
+        task multicluster:sqs:run:producer:local
+
+  sqs:queue:stats:
+    desc: Show queue statistics (message counts)
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+
+        echo "╔════════════════════════════════════════════════════════════════╗"
+        echo "║           SQS QUEUE STATISTICS                                 ║"
+        echo "╚════════════════════════════════════════════════════════════════╝"
+        echo ""
+
+        echo "Queues:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues --output json | jq -r '.QueueUrls[]?' 2>/dev/null || echo "  (none found)"
+
+        echo ""
+        echo "test-queue stats:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs get-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --output json 2>/dev/null | jq -r '.Attributes' || echo "  (queue not found)"
+
+  sqs:queue:purge:
+    desc: Purge all messages from test-queue
+    cmds:
+      - |
+        echo "Purging test-queue..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs purge-queue \
+            --queue-url http://localhost:4566/000000000000/test-queue 2>/dev/null || echo "Queue not found or already empty"
+        echo "Done!"
+
+  sqs:consumer:restart:
+    desc: Restart SQS consumer apps on remote clusters
+    cmds:
+      - |
+        echo "Restarting SQS consumers..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} rollout restart deployment/sqs-consumer -n test-multicluster 2>/dev/null || echo "No consumer on remote-1"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} rollout restart deployment/sqs-consumer -n test-multicluster 2>/dev/null || echo "No consumer on remote-2"
+        fi
+        echo "Waiting for consumers to be ready..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} rollout status deployment/sqs-consumer -n test-multicluster --timeout=60s 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} rollout status deployment/sqs-consumer -n test-multicluster --timeout=60s 2>/dev/null || true
+        fi
+        echo "Done!"
+
+  sqs:verify:connectivity:
+    desc: Verify all clusters can reach the shared LocalStack
+    cmds:
+      - |
+        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
+
+        echo "=== Verifying Shared LocalStack Connectivity ==="
+        echo "LocalStack URL: $LOCALSTACK_URL"
+        echo ""
+
+        echo "--- Testing from {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/sqs-consumer -- \
+          sh -c "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws sqs list-queues \
+            --endpoint-url $LOCALSTACK_URL --region us-east-1 2>&1" && echo "✓ REMOTE-1 can reach LocalStack" || echo "✗ REMOTE-1 FAILED"
+        echo ""
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "--- Testing from {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} exec -n {{.MC_NAMESPACE}} deploy/sqs-consumer -- \
+            sh -c "AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test aws sqs list-queues \
+              --endpoint-url $LOCALSTACK_URL --region us-east-1 2>&1" && echo "✓ REMOTE-2 can reach LocalStack" || echo "✗ REMOTE-2 FAILED"
+          echo ""
+        fi
+
+        echo "--- Queue contents ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs get-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attribute-names ApproximateNumberOfMessages 2>/dev/null || echo "Could not get queue attributes"
+
+  sqs:deploy:queue-registry:
+    desc: Deploy MirrordWorkloadQueueRegistry to all clusters
+    cmds:
+      - |
+        echo "Deploying MirrordWorkloadQueueRegistry to all clusters..."
+
+        # Deploy to primary (for sync controller to pick up)
+        echo "Deploying to {{.PRIMARY_CLUSTER}}..."
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry.yaml
+
+        # Deploy to remote-1
+        echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry.yaml
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "Deploying to {{.REMOTE_CLUSTER_2}}..."
+          kubectl --context {{.REMOTE_CLUSTER_2}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry.yaml
+        fi
+
+        echo "Queue registry deployed to all clusters"
+
+  sqs:deploy:queue-registry:primary:
+    desc: Deploy MirrordWorkloadQueueRegistry to primary only (sync controller will sync to remotes)
+    cmds:
+      - |
+        echo "Deploying MirrordWorkloadQueueRegistry to primary..."
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry.yaml
+        echo "Queue registry deployed. Sync controller will sync to remote clusters."
+
+  sqs:deploy:queue-registry:primary:operator-ns:
+    desc: Deploy MirrordWorkloadQueueRegistry to primary only (sync controller will sync to remotes)
+    cmds:
+      - |
+        echo "Deploying MirrordWorkloadQueueRegistry to primary..."
+        kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry-operator-ns.yaml
+        echo "Queue registry deployed. Sync controller will sync to remote clusters."
+  sqs:check:queue-registry:
+    desc: Check MirrordWorkloadQueueRegistry on all clusters
+    cmds:
+      - |
+        echo "=== Primary cluster ({{.PRIMARY_CLUSTER}}) ==="
+        kubectl --context {{.PRIMARY_CLUSTER}} get mirrordworkloadqueueregistries -A
+
+        echo ""
+        echo "=== Remote cluster 1 ({{.REMOTE_CLUSTER_1}}) ==="
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordworkloadqueueregistries -A
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "=== Remote cluster 2 ({{.REMOTE_CLUSTER_2}}) ==="
+          kubectl --context {{.REMOTE_CLUSTER_2}} get mirrordworkloadqueueregistries -A
+        fi
+
+  sqs:delete:
+    desc: Delete SQS resources from all clusters
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete deploy/sqs-consumer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete namespace localstack --ignore-not-found=true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete deploy/sqs-consumer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+      - kubectl --context {{.REMOTE_CLUSTER_1}} delete namespace localstack --ignore-not-found=true
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete deploy/sqs-consumer -n {{.MC_NAMESPACE}} --ignore-not-found=true
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete namespace localstack --ignore-not-found=true
+        fi
+      - echo "SQS resources deleted"
+
+  sqs:send:messages:
+    desc: Send test messages to SQS queues in all clusters
+    cmds:
+      - |
+        echo "Sending test messages to SQS queues..."
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Round $i ---"
+          
+          # Send to remote-1
+          echo -n "REMOTE-1: "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url http://localhost:4566/000000000000/test-queue \
+              --message-body "{\"msg\": \"test-$i\", \"cluster\": \"remote-1\", \"time\": \"$(date -Iseconds)\"}" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.test"}}' \
+              2>/dev/null | jq -r '.MessageId' || echo "failed"
+          
+          if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+            echo -n "REMOTE-2: "
+            kubectl --context {{.REMOTE_CLUSTER_2}} exec -n localstack deploy/localstack -- \
+              awslocal sqs send-message \
+                --queue-url http://localhost:4566/000000000000/test-queue \
+                --message-body "{\"msg\": \"test-$i\", \"cluster\": \"remote-2\", \"time\": \"$(date -Iseconds)\"}" \
+                --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.test"}}' \
+                2>/dev/null | jq -r '.MessageId' || echo "failed"
+          fi
+          
+          echo ""
+          i=$((i + 1))
+          sleep 3
+        done
+
+  sqs:send:messages:unfiltered:
+    desc: Send messages WITHOUT the filter attribute (should NOT be split)
+    cmds:
+      - |
+        echo "Sending UNFILTERED messages (no tenant attribute)..."
+        echo "These should NOT be split to local app"
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Round $i (UNFILTERED) ---"
+          
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url http://localhost:4566/000000000000/test-queue \
+              --message-body "{\"msg\": \"unfiltered-$i\", \"cluster\": \"remote-1\"}" \
+              2>/dev/null | jq -r '.MessageId'
+          
+          echo ""
+          i=$((i + 1))
+          sleep 3
+        done
+
+  test:sqs:split:multi-cluster:
+    desc: "Test SQS splitting: task test:sqs:split:multi-cluster FILTER=premium|gold|vip|enterprise|all"
+    vars:
+      FILTER: '{{.FILTER | default "premium"}}'
+    cmds:
+      - |
+        echo "=== SQS Split Test (Multi-Cluster) ==="
+        echo "Filter type: {{.FILTER}}"
+        echo ""
+
+        # Determine config file based on filter
+        case "{{.FILTER}}" in
+          premium)   CONFIG="mirrord-premium.json" ;;
+          gold)      CONFIG="mirrord-gold.json" ;;
+          vip)       CONFIG="mirrord-vip.json" ;;
+          enterprise) CONFIG="mirrord-enterprise.json" ;;
+          all)       CONFIG="mirrord-all.json" ;;
+          *)         CONFIG="mirrord.json" ;;
+        esac
+
+        echo "Using config: $CONFIG"
+        echo ""
+
+        cd {{.APPS_DIR}}/sqs-consumer
+
+        # Build the consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+
+        export AWS_ACCESS_KEY_ID=test
+        export AWS_SECRET_ACCESS_KEY=test
+        export AWS_REGION=us-east-1
+        export QUEUE_NAME=test-queue
+
+        echo "Starting mirrord session..."
+        echo "Send messages with: task multicluster:sqs:send:multi-filter"
+        echo ""
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-sqs/$CONFIG \
+          -- /tmp/sqs-consumer
+
+  test:sqs:split:multi-cluster:all:
+    desc: "Run multiple filter tests in parallel (opens 4 terminals)"
+    cmds:
+      - |
+        echo "=== Multi-Filter SQS Test ==="
+        echo ""
+        echo "This will show commands to run in separate terminals."
+        echo "Each terminal will receive only messages matching its filter."
+        echo ""
+        echo "Step 1: Open 4 terminals and run these commands:"
+        echo ""
+        echo "  Terminal 1 (premium):    task multicluster:test:sqs:split:multi-cluster FILTER=premium"
+        echo "  Terminal 2 (gold):       task multicluster:test:sqs:split:multi-cluster FILTER=gold"
+        echo "  Terminal 3 (vip):        task multicluster:test:sqs:split:multi-cluster FILTER=vip"
+        echo "  Terminal 4 (enterprise): task multicluster:test:sqs:split:multi-cluster FILTER=enterprise"
+        echo ""
+        echo "Step 2: Send test messages from another terminal:"
+        echo ""
+        echo "  task multicluster:sqs:send:multi-filter COUNT=10"
+        echo ""
+        echo "Step 3: Watch each terminal receive only its matching messages!"
+        echo ""
+        echo "Available filter types: premium, gold, vip, enterprise, all"
+
+  test:sqs:split:single-cluster:
+    desc: Test SQS splitting in single-cluster mode (directly to remote-1)
+    cmds:
+      - |
+        echo "=== SQS Split Test (Single-Cluster via remote-1) ==="
+        echo ""
+        echo "This connects directly to remote-1 operator (bypassing multi-cluster primary)"
+        echo "Use this to compare single-cluster vs multi-cluster behavior"
+        echo ""
+
+        # Create a mirrord config for single-cluster test
+        cat > /tmp/mirrord-single-cluster-sqs.json << 'EOF'
+        {
+          "target": {
+            "path": "deployment/sqs-consumer",
+            "namespace": "test-multicluster"
+          },
+          "operator": true,
+          "feature": {
+            "split_queues": {
+              "test-queue": {
+                "queue_type": "SQS",
+                "message_filter": {
+                  "type": "^premium$"
+                }
+              }
+            },
+            "env": true,
+            "fs": "local"
+          }
+        }
+        EOF
+
+        echo "Running local SQS consumer with mirrord (single-cluster)..."
+        cd {{.APPS_DIR}}/sqs-consumer
+
+        # Build the consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+
+        export AWS_ACCESS_KEY_ID=test
+        export AWS_SECRET_ACCESS_KEY=test
+        export AWS_REGION=us-east-1
+        export QUEUE_NAME=test-queue
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.REMOTE_CLUSTER_1}} \
+          -f /tmp/mirrord-single-cluster-sqs.json \
+          -- /tmp/sqs-consumer
+
+  sqs:send:single-cluster:
+    desc: "Send messages for single-cluster test: task sqs:send:single-cluster FILTERED=5 UNFILTERED=5"
+    vars:
+      FILTERED: '{{.FILTERED | default "5"}}'
+      UNFILTERED: '{{.UNFILTERED | default "5"}}'
+    cmds:
+      - |
+        echo "=== Sending messages for Single-Cluster Test ==="
+        echo "Sending {{.FILTERED}} filtered (type=premium) + {{.UNFILTERED}} unfiltered (type=basic) messages..."
+        echo ""
+        QUEUE_URL="http://localhost:4566/000000000000/test-queue"
+
+        # Send filtered messages (type=premium - will be split to local app)
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order\": \"ORD-F$i\", \"amount\": \"$((RANDOM % 1000)).99\", \"tenant\": \"premium-customer\"}" \
+              --message-attributes '{"type":{"DataType":"String","StringValue":"premium"}}' \
+              2>/dev/null | jq -r '"FILTERED: " + .MessageId' || echo "FILTERED: failed"
+        done
+
+        # Send unfiltered messages (type=basic - stays in original queue)
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message \
+              --queue-url $QUEUE_URL \
+              --message-body "{\"order\": \"ORD-U$i\", \"amount\": \"$((RANDOM % 100)).99\", \"tenant\": \"basic-customer\"}" \
+              --message-attributes '{"type":{"DataType":"String","StringValue":"basic"}}' \
+              2>/dev/null | jq -r '"UNFILTERED: " + .MessageId' || echo "UNFILTERED: failed"
+        done
+
+        echo ""
+        echo "Done! Sent {{.FILTERED}} filtered + {{.UNFILTERED}} unfiltered = $(({{.FILTERED}} + {{.UNFILTERED}})) total"
+
+  sqs:status:single-cluster:
+    desc: Show SQS session status for single-cluster (remote-1)
+    cmds:
+      - |
+        echo "=== Single-Cluster SQS Status (remote-1) ==="
+        echo ""
+        echo "--- MirrordClusterSession ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersession -n mirrord 2>/dev/null || echo "(none)"
+        echo ""
+        echo "--- MirrordSqsSession ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordsqssession -n mirrord 2>/dev/null || echo "(none)"
+        echo ""
+        echo "--- Queue Stats ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs get-queue-attributes \
+            --queue-url http://localhost:4566/000000000000/test-queue \
+            --attribute-names ApproximateNumberOfMessages ApproximateNumberOfMessagesNotVisible \
+            --output json 2>/dev/null | jq -r '.Attributes' || echo "(queue not found)"
+
+  sqs:cleanup:sessions:single-cluster:
+    desc: Delete all stale sessions on remote-1 (for testing)
+    cmds:
+      - |
+        echo "=== Cleaning up single-cluster sessions on remote-1 ==="
+        echo ""
+        echo "Deleting MirrordClusterSession..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} delete mirrordclustersession --all -n mirrord 2>/dev/null || echo "(none to delete)"
+        echo ""
+        echo "Waiting for SQS sessions to be garbage collected..."
+        sleep 3
+        echo ""
+        echo "Remaining sessions:"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrordclustersession,mirrordsqssession -n mirrord 2>/dev/null || echo "(none)"
+
+  test:sqs:copy-target:
+    desc: Test SQS with copy_target in multi-cluster
+    cmds:
+      - |
+        echo "=== SQS + Copy Target Test (Multi-Cluster) ==="
+        echo ""
+        echo "This tests SQS with copy_target via primary cluster."
+        echo "The copy should be created and consume from temp queue."
+        echo ""
+        echo "Config: {{.K8S_DIR}}/overlays/multicluster-sqs/mirrord-copy-target.json"
+        echo ""
+
+        echo "Running with copy_target + SQS split..."
+        cd {{.APPS_DIR}}/sqs-consumer
+        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+
+        export AWS_ACCESS_KEY_ID=test
+        export AWS_SECRET_ACCESS_KEY=test
+        export AWS_REGION=us-east-1
+        export QUEUE_NAME=test-queue
+
+        {{.MIRRORD_BIN}} exec \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.K8S_DIR}}/overlays/multicluster-sqs/mirrord-copy-target.json \
+          -- /tmp/sqs-consumer
+
+  sqs:status:
+    desc: Show SQS consumer status in all clusters
+    cmds:
+      - |
+        echo "=== SQS Consumer Status ==="
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} -l app=sqs-consumer 2>/dev/null || echo "No SQS consumer"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n localstack 2>/dev/null || echo "No LocalStack"
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n {{.MC_NAMESPACE}} -l app=sqs-consumer 2>/dev/null || echo "No SQS consumer"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get pods -n localstack 2>/dev/null || echo "No LocalStack"
+        fi
+
+  sqs:logs:
+    desc: Show SQS consumer logs from remote clusters
+    cmds:
+      - |
+        echo "=== SQS Consumer Logs ==="
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} -l app=sqs-consumer --tail=20 2>/dev/null || echo "No logs"
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=sqs-consumer --tail=20 2>/dev/null || echo "No logs"
         fi

@@ -112,25 +112,53 @@ func handleEcho(w http.ResponseWriter, r *http.Request) {
 	// Echo back the request with cluster info
 	body, _ := io.ReadAll(r.Body)
 
-	// Check for source cluster header (set by traffic generator)
-	sourceCluster := r.Header.Get("X-Source-Cluster")
-	if sourceCluster == "" {
-		sourceCluster = "unknown"
-	}
+	// Check for filter header (for HTTP filter testing)
+	filterHeader := r.Header.Get("X-My-Header")
 
-	log.Printf("[%s] ECHO #%d: %s %s - From: %s - Body: %s",
-		clusterID, reqNum, r.Method, r.URL.Path, sourceCluster, string(body))
+	// Print formatted multi-line log
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("[%s] ECHO #%d", clusterID, reqNum)
+	log.Printf("  Method:  %s %s", r.Method, r.URL.Path)
+	if r.URL.RawQuery != "" {
+		log.Printf("  Query:   %s", r.URL.RawQuery)
+	}
+	if filterHeader != "" {
+		log.Printf("  Filter:  X-My-Header = %s ", filterHeader)
+	}
+	if len(body) > 0 {
+		if len(body) > 100 {
+			log.Printf("  Body:    (%d bytes) %s...", len(body), string(body[:100]))
+		} else {
+			log.Printf("  Body:    %s", string(body))
+		}
+	}
+	// Print other interesting headers
+	for _, h := range []string{"Content-Type", "User-Agent", "X-Request-Id"} {
+		if v := r.Header.Get(h); v != "" {
+			log.Printf("  %s: %s", h, v)
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("X-Cluster-ID", clusterID)
 
+	// Collect all headers for response
+	headers := make(map[string]string)
+	for key, values := range r.Header {
+		if len(values) > 0 {
+			headers[key] = values[0]
+		}
+	}
+
 	response := map[string]interface{}{
-		"cluster_id":  clusterID,
-		"request_num": reqNum,
-		"echo_body":   string(body),
-		"echo_path":   r.URL.Path,
-		"echo_method": r.Method,
-		"echo_query":  r.URL.RawQuery,
+		"cluster_id":    clusterID,
+		"request_num":   reqNum,
+		"filter_header": filterHeader,
+		"echo_body":     string(body),
+		"echo_path":     r.URL.Path,
+		"echo_method":   r.Method,
+		"echo_query":    r.URL.RawQuery,
+		"headers":       headers,
 	}
 
 	json.NewEncoder(w).Encode(response)
