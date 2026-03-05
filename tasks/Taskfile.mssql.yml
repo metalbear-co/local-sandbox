@@ -1,0 +1,175 @@
+version: '3'
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MODULAR_TESTS_DIR: '{{.ROOT_DIR}}/k8s/mssql/modular-tests'
+  SA_PASSWORD: 'TestP@ssw0rd!'
+  MSSQL_IMAGE: 'mcr.microsoft.com/mssql/server:2022-latest'
+  SQLPACKAGE_IMAGE: 'vladrbg/sqlpackage:latest'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+
+tasks:
+  images:load:
+    desc: "Pull and load MSSQL images into minikube"
+    cmds:
+      - echo "Pulling MSSQL images..."
+      - "{{.CONTAINER_RUNTIME}} pull {{.MSSQL_IMAGE}} || true"
+      - "{{.CONTAINER_RUNTIME}} pull {{.SQLPACKAGE_IMAGE}} || true"
+      - echo "Loading images into minikube..."
+      - minikube -p {{.CLUSTER_NAME}} image load {{.MSSQL_IMAGE}}
+      - minikube -p {{.CLUSTER_NAME}} image load {{.SQLPACKAGE_IMAGE}}
+      - echo "MSSQL images loaded"
+
+  deploy:
+    desc: "Deploy MSSQL source database + env-val scenario"
+    cmds:
+      - task: deploy:all
+
+  deploy:base:
+    desc: "Deploy only source database"
+    cmds:
+      - echo "Deploying MSSQL source database..."
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/base
+      - task: _wait:source
+
+  deploy:all:
+    desc: "Deploy source database and env-val scenario (loads images first)"
+    cmds:
+      - task: images:load
+      - task: deploy:base
+      - task: deploy:scenario
+        vars: {SCENARIO: env-val}
+      - echo "Waiting for branch to be created..."
+      - sleep 10
+      - task: status
+
+  deploy:scenario:
+    desc: "Deploy a specific scenario (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO | default "env-val"}}'
+    cmds:
+      - echo "Deploying scenario {{.SCENARIO}}..."
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/{{.SCENARIO}}
+
+  status:
+    desc: "Show MSSQL test environment status"
+    cmds:
+      - echo "=== Source Database ==="
+      - kubectl get pod mssql-test -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Target Pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l test-scenario -o wide 2>/dev/null || echo "No target pods"
+      - echo ""
+      - echo "=== Branch Databases ==="
+      - kubectl get branchdatabases -n {{.NAMESPACE}} 2>/dev/null || echo "No branches"
+      - echo ""
+      - echo "=== Branch Pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --no-headers 2>/dev/null || echo "No branch pods"
+
+  shell:source:
+    desc: "Shell into source database"
+    interactive: true
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} mssql-test -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '{{.SA_PASSWORD}}' -d source_db -C
+
+  shell:branch:
+    desc: "Shell into branch database"
+    interactive: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mssql-test-branch-env-val --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch pod not found"
+          exit 1
+        fi
+        kubectl exec -it -n {{.NAMESPACE}} $POD -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -C
+
+  query:source:
+    desc: "Query source database (QUERY='SELECT * FROM users')"
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} mssql-test -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '{{.SA_PASSWORD}}' -d source_db -Q "{{.QUERY}}" -C
+
+  query:branch:
+    desc: "Query branch database (QUERY='SELECT * FROM users')"
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mssql-test-branch-env-val --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch pod not found"
+          exit 1
+        fi
+        kubectl exec -n {{.NAMESPACE}} $POD -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -Q "{{.QUERY}}" -C
+
+  logs:source:
+    desc: "Show source database logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} mssql-test --tail=100 -f
+
+  logs:branch:
+    desc: "Show branch pod logs"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mssql-test-branch-env-val -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch pod not found"
+          exit 1
+        fi
+        kubectl logs -n {{.NAMESPACE}} $POD --tail=100 -f
+
+  logs:branch:init:
+    desc: "Show branch init container logs"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mssql-test-branch-env-val -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch pod not found"
+          exit 1
+        fi
+        echo "=== copy-binary ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c copy-binary 2>/dev/null || echo "(no logs)"
+        echo ""
+        echo "=== mssql-branch-dump ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c mssql-branch-dump 2>/dev/null || echo "(no logs)"
+        echo ""
+        echo "=== branch-setup ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c branch-setup 2>/dev/null || echo "(no logs)"
+        echo ""
+        echo "=== mssql ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c mssql 2>/dev/null || echo "(no logs)"
+
+  describe:branch:
+    desc: "Describe branch pod"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name=mssql-test-branch-env-val -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "Branch pod not found"
+          exit 1
+        fi
+        kubectl describe pod -n {{.NAMESPACE}} $POD
+
+  clean:
+    desc: "Remove all MSSQL test resources"
+    cmds:
+      - echo "Cleaning up MSSQL test resources..."
+      - kubectl delete -k {{.MODULAR_TESTS_DIR}}/scenarios/env-val -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete -k {{.MODULAR_TESTS_DIR}}/base -n {{.NAMESPACE}} --ignore-not-found=true
+      - echo "Cleanup complete"
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source MSSQL to be ready..."
+      - kubectl wait --for=condition=ready pod/mssql-test -n {{.NAMESPACE}} --timeout=180s
+      - echo "Waiting for MSSQL to initialize (running init scripts)..."
+      - sleep 30
+      - echo "Source MSSQL is ready"

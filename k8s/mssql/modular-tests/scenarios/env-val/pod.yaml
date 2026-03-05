@@ -1,0 +1,28 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mssql-server-env-val
+  labels:
+    app: mssql-server-env-val
+    test-scenario: env-val
+spec:
+  containers:
+    - name: echo
+      image: ealen/echo-server:latest
+      env:
+        - name: DATABASE_URL
+          value: "mssql://sa:TestP%40ssw0rd!@mssql-test:1433/source_db"
+      ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-mssql-env-val
+spec:
+  selector:
+    app: mssql-server-env-val
+  ports:
+    - port: 80
+      targetPort: 80
+  type: ClusterIP

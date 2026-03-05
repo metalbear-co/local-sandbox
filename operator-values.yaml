@@ -5,8 +5,9 @@ operator:
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true
+  mssqlBranching: true
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
-  metrics: true 
+  metrics: true
   jsonLog: true
   logLevel: "debug"
   # Increased resource limits for multi-cluster operations
@@ -19,6 +20,14 @@ operator:
     AWS_ACCESS_KEY_ID: "test"
     AWS_SECRET_ACCESS_KEY: "test"
     AWS_REGION: "us-east-1"
+  pgBranchConfig:
+    dbPod:
+      image:
+        registry: "pgvector/pgvector"
+      initImage:
+        registry: "pgvector/pgvector"
+      annotations:
+        sidecar.istio.io/inject: "false"
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false

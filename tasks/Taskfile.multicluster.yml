@@ -1751,8 +1751,8 @@ tasks:
 
         # Always deploy to primary (for testing routing logic)
         echo "Deploying to {{.PRIMARY_CLUSTER}}..."
-        kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-        kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+        # kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        # kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
 
         echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
         kubectl --context {{.REMOTE_CLUSTER_1}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -

@@ -1,0 +1,19 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: BranchDatabase
+metadata:
+  name: mssql-test-branch-env-val
+spec:
+  id: mssql-test-env-val-branch
+  dialect: mssql
+  target:
+    pod: mssql-server-env-val
+  connectionSource:
+    url:
+      env:
+        variable: DATABASE_URL
+        container: echo
+  databaseName: source_db
+  version: "2022-latest"
+  ttlSecs: 600
+  copy:
+    mode: all
