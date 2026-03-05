@@ -20,14 +20,14 @@ operator:
     AWS_ACCESS_KEY_ID: "test"
     AWS_SECRET_ACCESS_KEY: "test"
     AWS_REGION: "us-east-1"
-  pgBranchConfig:
-    dbPod:
-      image:
-        registry: "pgvector/pgvector"
-      initImage:
-        registry: "pgvector/pgvector"
-      annotations:
-        sidecar.istio.io/inject: "false"
+  # pgBranchConfig:
+  #   dbPod:
+  #     image:
+  #       registry: "pgvector/pgvector"
+  #     initImage:
+  #       registry: "pgvector/pgvector"
+  #     annotations:
+  #       sidecar.istio.io/inject: "false"
 license:
   pemRef: "mirrord-operator-license-pem"
 createNamespace: false
