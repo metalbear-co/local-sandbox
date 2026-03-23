@@ -34,7 +34,7 @@ version: "3"
 vars:
   ROOT_DIR:
     sh: cd .. && pwd
-  CHARTS_DIR: "{{.ROOT_DIR}}/../charts/mirrord-operator"
+  CHARTS_DIR: "{{.ROOT_DIR}}/../operator/charts/mirrord-operator"
   APPS_DIR: "{{.ROOT_DIR}}/apps"
   K8S_DIR: "{{.ROOT_DIR}}/k8s"
   EKS_CONFIG_DIR: "{{.ROOT_DIR}}/eks-multicluster"

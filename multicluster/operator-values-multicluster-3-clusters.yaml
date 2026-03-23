@@ -27,7 +27,7 @@ operator:
     enabled: true
     clusterName: "mirrord-primary"
     defaultCluster: "mirrord-remote-1" # Default cluster for stateful ops
-    managementOnly: true # Primary only runs Envoy
+    managementOnly: false # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700 # 45 minutes
     sessionTtlSecs: 60

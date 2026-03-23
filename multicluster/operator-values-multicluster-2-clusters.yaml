@@ -1,4 +1,4 @@
-# Operator values for PRIMARY cluster - 2 CLUSTERS (primary + 1 remote)
+# Operator values for PRIMARY cluster - 3 CLUSTERS (primary + 2 remotes)
 #
 # Cluster discovery: ConfigMap + Secrets
 # - Cluster config (name, server, caData) stored in ConfigMap via Helm values
@@ -15,7 +15,7 @@ operator:
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true
-  logLevel: "debug,operator_envoy=debug,operator_controller=debug"
+  logLevel: "debug"
   # Note: hostNetwork and hostAliases are patched via kubectl after helm install (not in chart)
   # AWS credentials for LocalStack (SQS splitting tests)
   # Note: AWS_ENDPOINT_URL is set via --set in the task (NodePort URL)
@@ -25,8 +25,8 @@ operator:
     AWS_REGION: "us-east-1"
   multiCluster:
     enabled: true
-    clusterName: "primary"
-    defaultCluster: "remote-1" # Default cluster for stateful ops (must be a workload cluster)
+    clusterName: "mirrord-primary"
+    defaultCluster: "mirrord-remote-1" # Default cluster for stateful ops
     managementOnly: true # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700 # 45 minutes
@@ -34,11 +34,12 @@ operator:
     # Cluster config - auth credentials (bearerToken) are in Secrets created separately
     # Note: server and caData are set dynamically via --set in the task
     clusters:
-      remote-1:
+      mirrord-remote-1:
         authType: bearerToken
-        # server: set via --set (uses cluster hostname for TLS cert validation)
-        # caData: set via --set (extracted from kubeconfig)
         isDefault: true
+      mirrord-remote-2:
+        authType: bearerToken
+        isDefault: false
 agent:
   image: mirrord-agent:custom
 license:

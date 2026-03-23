@@ -9,12 +9,13 @@ operator:
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true
-  logLevel: "debug"
-  # Increased resource limits for multi-cluster operations
+  logLevel: "mirrord=info,operator=info"
+  otelTraceExportUrl: "http://tempo.observability.svc.cluster.local:4318"
+  otelLogLevel: "operator=debug"
+  injectSessionKeyHeader: true
   limits:
     memory: 512Mi
     cpu: 500m
-  # AWS credentials for LocalStack (SQS splitting tests)
   extraEnv:
     AWS_ENDPOINT_URL: "http://localstack.localstack.svc.cluster.local:4566"
     AWS_ACCESS_KEY_ID: "test"
@@ -28,8 +29,20 @@ operator:
   #       registry: "pgvector/pgvector"
   #     annotations:
   #       sidecar.istio.io/inject: "false"
+
+disableTelemetries: true
+
+agent:
+  image: test
+  extraConfig:
+    log_level: "warn,mirrord=debug"
+    network_interface: lo
+    passthrough_mirroring: true
+    image_pull_policy: "Never"
+
 license:
   pemRef: "mirrord-operator-license-pem"
+  allowSeatOverages: false
 createNamespace: false
 image:
   pullPolicy: Never
