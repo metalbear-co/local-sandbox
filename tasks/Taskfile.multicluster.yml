@@ -36,7 +36,7 @@ vars:
   # ROOT_DIR is local-sandbox/ (parent of tasks/) - same pattern as other taskfiles
   ROOT_DIR:
     sh: cd .. && pwd
-  CHARTS_DIR: "{{.ROOT_DIR}}/../charts/mirrord-operator"
+  CHARTS_DIR: "{{.ROOT_DIR}}/../operator/charts/mirrord-operator"
   APPS_DIR: "{{.ROOT_DIR}}/apps"
   K8S_DIR: "{{.ROOT_DIR}}/k8s"
 
@@ -1634,6 +1634,29 @@ tasks:
         fi
       - echo "All sessions cleaned up"
 
+  test:cleanup:resources:
+    desc: Delete leftover test deployments, services, and copy pods across all clusters
+    cmds:
+      - |
+        for ctx in {{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_1}}; do
+          echo "=== Cleaning $ctx ==="
+          kubectl --context $ctx delete deployments,services -n {{.MC_NAMESPACE}} -l mirrord-e2e-test-resource=true --ignore-not-found=true --wait=false
+          kubectl --context $ctx delete pods -n {{.MC_NAMESPACE}} -l operator.metalbear.co/resource-type=copy-target --ignore-not-found=true --wait=false
+        done
+      - |
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo "=== Cleaning {{.REMOTE_CLUSTER_2}} ==="
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete deployments,services -n {{.MC_NAMESPACE}} -l mirrord-e2e-test-resource=true --ignore-not-found=true --wait=false
+          kubectl --context {{.REMOTE_CLUSTER_2}} delete pods -n {{.MC_NAMESPACE}} -l operator.metalbear.co/resource-type=copy-target --ignore-not-found=true --wait=false
+        fi
+      - echo "All leftover test resources cleaned up"
+
+  test:cleanup:all:
+    desc: Clean up all test sessions and leftover resources
+    cmds:
+      - task: test:cleanup:sessions
+      - task: test:cleanup:resources
+
   test:full:
     desc: Run full multi-cluster test setup
     cmds:
@@ -1751,8 +1774,8 @@ tasks:
 
         # Always deploy to primary (for testing routing logic)
         echo "Deploying to {{.PRIMARY_CLUSTER}}..."
-        kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
-        kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
+        # kubectl --context {{.PRIMARY_CLUSTER}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
+        # kubectl --context {{.PRIMARY_CLUSTER}} apply -k {{.K8S_DIR}}/overlays/multicluster-postgres
 
         echo "Deploying to {{.REMOTE_CLUSTER_1}}..."
         kubectl --context {{.REMOTE_CLUSTER_1}} create namespace {{.MC_NAMESPACE}} --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -

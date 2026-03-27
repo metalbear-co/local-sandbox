@@ -1,0 +1,190 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  RMQ_NAMESPACE: '{{.RMQ_NAMESPACE | default "rabbitmq-system"}}'
+  WORKER_NAMESPACE: '{{.WORKER_NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+
+tasks:
+  deploy:
+    desc: "Deploy RabbitMQ using the Cluster Operator"
+    cmds:
+      - task: deploy:operator
+      - task: deploy:cluster
+      - task: _wait:rabbitmq
+
+  deploy:operator:
+    desc: "Install the RabbitMQ Cluster Operator"
+    cmds:
+      - kubectl apply -f "https://github.com/rabbitmq/cluster-operator/releases/latest/download/cluster-operator.yml"
+      - echo "Waiting for RabbitMQ Cluster Operator to be ready..."
+      - kubectl wait --for=condition=Available deployment/rabbitmq-cluster-operator -n rabbitmq-system --timeout=120s
+
+  deploy:cluster:
+    desc: "Deploy a hello-world RabbitMQ cluster"
+    cmds:
+      - kubectl apply -f https://raw.githubusercontent.com/rabbitmq/cluster-operator/main/docs/examples/hello-world/rabbitmq.yaml
+      - echo "RabbitMQ cluster '{{.RMQ_CLUSTER_NAME}}' deployment initiated."
+
+  send:
+    desc: "Publish a message to RabbitMQ (QUEUE='orders' TENANT='test-user')"
+    vars:
+      QUEUE: '{{.QUEUE | default "orders"}}'
+      MESSAGE: '{{.MESSAGE | default "test message"}}'
+      TENANT: '{{.TENANT | default "test-user"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        echo "Publishing to queue '{{.QUEUE}}' with header tenant={{.TENANT}}"
+        kubectl exec $POD -- \
+          rabbitmqadmin publish \
+            routing_key="{{.QUEUE}}" \
+            payload='{{.MESSAGE}}' \
+            properties='{"headers":{"tenant":"{{.TENANT}}"}}'
+
+  send:nofilter:
+    desc: "Publish a message without filter headers"
+    vars:
+      QUEUE: '{{.QUEUE | default "orders"}}'
+      MESSAGE: '{{.MESSAGE | default "unfiltered message"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        echo "Publishing to queue '{{.QUEUE}}' without filter headers"
+        kubectl exec $POD -- \
+          rabbitmqadmin publish \
+            routing_key="{{.QUEUE}}" \
+            payload='{{.MESSAGE}}'
+
+  logs:
+    desc: "Show RabbitMQ server logs"
+    cmds:
+      - kubectl logs -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} --tail=100 -f
+
+  shell:
+    desc: "Shell into the RabbitMQ pod"
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it $POD -- bash
+
+  status:
+    desc: "Show RabbitMQ environment status"
+    cmds:
+      - echo "=== RabbitMQ Cluster Operator ==="
+      - kubectl get pods -n rabbitmq-system 2>/dev/null || echo "Operator not deployed"
+      - echo ""
+      - echo "=== RabbitMQ Cluster ==="
+      - kubectl get rabbitmqclusters 2>/dev/null || echo "No clusters"
+      - echo ""
+      - echo "=== RabbitMQ Pods ==="
+      - kubectl get pods -l app.kubernetes.io/component=rabbitmq 2>/dev/null || echo "Not running"
+      - echo ""
+      - echo "=== Queues ==="
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec $POD -- rabbitmqctl list_queues name messages consumers 2>/dev/null || echo "Could not list queues"
+        else
+          echo "RabbitMQ not running"
+        fi
+
+  queues:list:
+    desc: "List all RabbitMQ queues with message counts"
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec $POD -- rabbitmqctl list_queues name messages consumers
+
+  queues:purge:
+    desc: "Purge a queue (QUEUE='orders')"
+    vars:
+      QUEUE: '{{.QUEUE | default "orders"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec $POD -- rabbitmqctl purge_queue {{.QUEUE}}
+        echo "Queue '{{.QUEUE}}' purged"
+
+  management:
+    desc: "Port-forward RabbitMQ management UI to localhost:15672"
+    cmds:
+      - echo "Opening RabbitMQ Management at http://localhost:15672"
+      - echo "Credentials can be found in secret '{{.RMQ_CLUSTER_NAME}}-default-user'"
+      - kubectl port-forward svc/{{.RMQ_CLUSTER_NAME}} 15672:15672
+
+  amqp:forward:
+    desc: "Port-forward AMQP port to localhost:5672"
+    cmds:
+      - echo "AMQP available at amqp://localhost:5672/"
+      - echo "Credentials can be found in secret '{{.RMQ_CLUSTER_NAME}}-default-user'"
+      - kubectl port-forward svc/{{.RMQ_CLUSTER_NAME}} 5672:5672
+
+  credentials:
+    desc: "Show RabbitMQ connection credentials"
+    cmds:
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        echo "=== RabbitMQ Credentials ==="
+        echo "Username: $(kubectl get secret $SECRET -o jsonpath='{.data.username}' | base64 -d)"
+        echo "Password: $(kubectl get secret $SECRET -o jsonpath='{.data.password}' | base64 -d)"
+        echo "Host:     $(kubectl get secret $SECRET -o jsonpath='{.data.host}' | base64 -d)"
+        echo "Port:     $(kubectl get secret $SECRET -o jsonpath='{.data.port}' | base64 -d)"
+
+  clean:
+    desc: "Clean RabbitMQ test resources"
+    cmds:
+      - kubectl delete rabbitmqcluster {{.RMQ_CLUSTER_NAME}} --ignore-not-found=true
+      - kubectl delete -f "https://github.com/rabbitmq/cluster-operator/releases/latest/download/cluster-operator.yml" --ignore-not-found=true
+
+  clean:sessions:
+    desc: "Clean up all RMQ sessions and mirrord temp queues"
+    cmds:
+      - echo "=== Cleaning up RMQ sessions ==="
+      - kubectl delete mirrordrmqsessions --all 2>/dev/null || echo "(none to delete)"
+      - echo ""
+      - echo "=== Listing remaining mirrord temp queues ==="
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec $POD -- rabbitmqctl list_queues name 2>/dev/null | grep "^mirrord-" || echo "(no temp queues)"
+        else
+          echo "RabbitMQ not running"
+        fi
+
+  queues:mirrord:
+    desc: "List only mirrord-* temporary queues left in the broker"
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name 2>/dev/null | grep "^mirrord-")
+        if [ -z "$QUEUES" ]; then
+          echo "No mirrord temp queues found."
+        else
+          echo "$QUEUES"
+        fi
+
+  queues:mirrord:delete:
+    desc: "Delete all mirrord-* temporary queues from the broker"
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name --no-table-headers 2>/dev/null | grep "^mirrord-")
+        if [ -z "$QUEUES" ]; then
+          echo "No mirrord temp queues to delete."
+        else
+          echo "$QUEUES" | while read q; do
+            kubectl exec $POD -- rabbitmqctl delete_queue "$q"
+            echo "Deleted: $q"
+          done
+        fi
+
+  _wait:rabbitmq:
+    internal: true
+    cmds:
+      - echo "Waiting for RabbitMQ cluster to be ready..."
+      - kubectl wait --for=condition=ClusterAvailable rabbitmqcluster/{{.RMQ_CLUSTER_NAME}} --timeout=180s
+      - echo "RabbitMQ cluster is ready."

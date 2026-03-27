@@ -1,0 +1,110 @@
+# Source MSSQL database for testing database branching
+# MSSQL doesn't support docker-entrypoint-initdb.d, so we use an entrypoint
+# script that starts sqlservr, waits for it, then runs the init SQL.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mssql-init-script
+data:
+  init.sql: |
+    CREATE DATABASE source_db;
+    GO
+    USE source_db;
+    GO
+
+    CREATE TABLE users (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(100),
+        email NVARCHAR(100),
+        active BIT DEFAULT 1
+    );
+
+    CREATE TABLE orders (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        user_id INT,
+        amount DECIMAL(10,2),
+        status NVARCHAR(50)
+    );
+
+    CREATE TABLE products (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        name NVARCHAR(100),
+        price DECIMAL(10,2)
+    );
+
+    INSERT INTO users (name, email, active) VALUES
+    ('Alice', 'alice@example.com', 1),
+    ('Bob', 'bob@example.com', 1),
+    ('Charlie', 'charlie@example.com', 0),
+    ('Diana', 'diana@example.com', 1),
+    ('Eve', 'eve@example.com', 0);
+
+    INSERT INTO orders (user_id, amount, status) VALUES
+    (1, 100.00, 'completed'),
+    (2, 150.50, 'pending'),
+    (1, 75.25, 'completed'),
+    (3, 25.00, 'completed'),
+    (4, 200.00, 'completed');
+
+    INSERT INTO products (name, price) VALUES
+    ('Laptop', 999.99),
+    ('Mouse', 29.99),
+    ('Keyboard', 79.99),
+    ('Monitor', 299.99);
+    GO
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mssql-test
+  labels:
+    app: mssql-test
+    test-component: source-db
+spec:
+  containers:
+    - name: mssql
+      image: mcr.microsoft.com/mssql/server:2022-latest
+      env:
+        - name: ACCEPT_EULA
+          value: "Y"
+        - name: MSSQL_SA_PASSWORD
+          value: "TestP@ssw0rd!"
+      ports:
+        - containerPort: 1433
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          /opt/mssql/bin/sqlservr & SQLPID=$!
+          for i in $(seq 1 60); do
+            /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'TestP@ssw0rd!' -Q 'SELECT 1' -C -l 1 &>/dev/null && break
+            sleep 1
+          done
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'TestP@ssw0rd!' -i /init/init.sql -C
+          wait $SQLPID
+      volumeMounts:
+        - name: init-script
+          mountPath: /init
+  volumes:
+    - name: init-script
+      configMap:
+        name: mssql-init-script
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-test
+spec:
+  selector:
+    app: mssql-test
+  ports:
+    - name: mssql
+      port: 1433
+      targetPort: 1433
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mssql-connection-secret
+type: Opaque
+stringData:
+  url: "mssql://sa:TestP%40ssw0rd!@mssql-test:1433/source_db"

@@ -202,6 +202,31 @@ task mysql:query:source
 task mysql:query:branch SCENARIO=env-val
 ```
 
+### RabbitMQ Queue Splitting
+
+```bash
+# Fresh cluster with RabbitMQ from scratch
+task test:rmq:clean
+
+# Open the RabbitMQ management UI (http://localhost:15672)
+task rmq:management
+
+# Show RabbitMQ connection credentials
+task rmq:credentials
+
+# List mirrord temp queues left in the broker
+task rmq:queues:mirrord
+
+# Delete all mirrord temp queues from the broker
+task rmq:queues:mirrord:delete
+
+# Publish a test message with a tenant header
+task rmq:send QUEUE="orders" TENANT="a" MESSAGE="hello"
+
+# Run the e2e tests (from the operator/ directory)
+cargo test -p tests -- --ignored rmq_queue_splitting --nocapture
+```
+
 ### SQS/Kafka
 
 ```bash
