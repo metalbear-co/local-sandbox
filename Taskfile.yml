@@ -27,6 +27,9 @@ includes:
   multicluster:
     taskfile: ./tasks/Taskfile.multicluster.yml
     dir: ./tasks
+  rmq:
+    taskfile: ./tasks/Taskfile.rmq.yml
+    dir: ./tasks
   eks:
     taskfile: ./tasks/Taskfile.eks.yml
     dir: ./tasks
@@ -35,7 +38,7 @@ vars:
   ROOT_DIR:
     sh: pwd
   OPERATOR_DIR: '{{.OPERATOR_DIR | default (print .ROOT_DIR "/../operator")}}'
-  CHARTS_DIR: '{{.CHARTS_DIR | default (print .ROOT_DIR "/../charts/mirrord-operator")}}'
+  CHARTS_DIR: '{{.CHARTS_DIR | default (print .ROOT_DIR "/../operator/charts/mirrord-operator")}}'
   SCRIPTS_DIR: '{{.SCRIPTS_DIR | default (print .ROOT_DIR "/scripts")}}'
   MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
@@ -127,6 +130,15 @@ tasks:
           --build-arg GCS_PATH_PREFIX={{.GCS_PATH_PREFIX}} \
           operator
       - task: operator:image:load
+
+  build:mirrord:agent:
+    desc: Build mirrord agent image and load into minikube
+    vars:
+      AGENT_IMAGE: '{{.AGENT_IMAGE | default "test"}}'
+    cmds:
+      - cd {{.MIRRORD_DIR}} && {{.CONTAINER_RUNTIME}} build -f mirrord/agent/Dockerfile -t {{.AGENT_IMAGE}} .
+      - task: mirrord:agent:image:load
+        vars: { AGENT_IMAGE: "{{.AGENT_IMAGE}}" }
 
   build:mirrord:agent:gcs:
     desc: Build mirrord agent with GCS sccache
@@ -686,6 +698,30 @@ tasks:
       - task: license:create:secret
       - task: operator:install
       - task: sqs:deploy:aws
+
+  test:rmq:
+    desc: "Deploy RabbitMQ Cluster Operator + cluster and install operator"
+    deps: [operator:install]
+    cmds:
+      - task: rmq:deploy
+
+  test:rmq:clean:
+    desc: "Clean cluster and deploy RabbitMQ from scratch"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:mirrord:agent
+      - task: operator:install
+      - task: rmq:deploy
+
+  test:rmq:clean:nobuild:
+    desc: "Clean cluster and deploy RabbitMQ (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:mirrord:agent
+      - task: operator:install:nobuild
+      - task: rmq:deploy
 
   test:kafka:
     desc: "Run Kafka test"

@@ -3,39 +3,31 @@ version: "3"
 vars:
   ROOT_DIR:
     sh: cd .. && pwd
-  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  RMQ_NAMESPACE: '{{.RMQ_NAMESPACE | default "rabbitmq-system"}}'
+  WORKER_NAMESPACE: '{{.WORKER_NAMESPACE | default "test-mirrord"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
 
 tasks:
   deploy:
-    desc: "Deploy RabbitMQ test environment"
+    desc: "Deploy RabbitMQ using the Cluster Operator"
     cmds:
-      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/rabbitmq
+      - task: deploy:operator
+      - task: deploy:cluster
       - task: _wait:rabbitmq
-      - task: _wait:worker
 
-  test:
-    desc: "Full RabbitMQ test (deploy + send message)"
+  deploy:operator:
+    desc: "Install the RabbitMQ Cluster Operator"
     cmds:
-      - task: deploy
-      - task: send
-      - echo "Check logs with 'task rmq:logs'"
+      - kubectl apply -f "https://github.com/rabbitmq/cluster-operator/releases/latest/download/cluster-operator.yml"
+      - echo "Waiting for RabbitMQ Cluster Operator to be ready..."
+      - kubectl wait --for=condition=Available deployment/rabbitmq-cluster-operator -n rabbitmq-system --timeout=120s
 
-  test:quick:
-    desc: "Quick test - send message only (no deploy)"
+  deploy:cluster:
+    desc: "Deploy a hello-world RabbitMQ cluster"
     cmds:
-      - task: send
-      - echo "Check logs with 'task rmq:logs'"
-
-  run:local:
-    desc: "Run rabbitmq-worker locally with mirrord"
-    dir: "{{.ROOT_DIR}}/../test-images/rabbitmq-worker"
-    vars:
-      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/rabbitmq/mirrord.json")}}'
-    cmds:
-      - pnpm install
-      - pnpm build
-      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- pnpm start:prod'
+      - kubectl apply -f https://raw.githubusercontent.com/rabbitmq/cluster-operator/main/docs/examples/hello-world/rabbitmq.yaml
+      - echo "RabbitMQ cluster '{{.RMQ_CLUSTER_NAME}}' deployment initiated."
 
   send:
     desc: "Publish a message to RabbitMQ (QUEUE='orders' TENANT='test-user')"
@@ -45,66 +37,57 @@ tasks:
       TENANT: '{{.TENANT | default "test-user"}}'
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}')
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
         echo "Publishing to queue '{{.QUEUE}}' with header tenant={{.TENANT}}"
-        kubectl exec -n {{.NAMESPACE}} $POD -- \
+        kubectl exec $POD -- \
           rabbitmqadmin publish \
             routing_key="{{.QUEUE}}" \
             payload='{{.MESSAGE}}' \
             properties='{"headers":{"tenant":"{{.TENANT}}"}}'
 
   send:nofilter:
-    desc: "Publish a message without the tenant header (stays in cluster)"
+    desc: "Publish a message without filter headers"
     vars:
       QUEUE: '{{.QUEUE | default "orders"}}'
       MESSAGE: '{{.MESSAGE | default "unfiltered message"}}'
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}')
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
         echo "Publishing to queue '{{.QUEUE}}' without filter headers"
-        kubectl exec -n {{.NAMESPACE}} $POD -- \
+        kubectl exec $POD -- \
           rabbitmqadmin publish \
             routing_key="{{.QUEUE}}" \
             payload='{{.MESSAGE}}'
 
   logs:
-    desc: "Show RabbitMQ worker logs"
-    cmds:
-      - kubectl logs -n {{.NAMESPACE}} -l app=rabbitmq-worker --tail=100 -f
-
-  logs:rabbitmq:
     desc: "Show RabbitMQ server logs"
     cmds:
-      - kubectl logs -n {{.NAMESPACE}} -l app=rabbitmq --tail=100 -f
+      - kubectl logs -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} --tail=100 -f
 
   shell:
-    desc: "Shell into RabbitMQ worker pod"
+    desc: "Shell into the RabbitMQ pod"
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq-worker -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -it -n {{.NAMESPACE}} $POD -- sh
-
-  shell:rabbitmq:
-    desc: "Shell into RabbitMQ server pod"
-    cmds:
-      - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -it -n {{.NAMESPACE}} $POD -- bash
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -it $POD -- bash
 
   status:
-    desc: "Show RabbitMQ test environment status"
+    desc: "Show RabbitMQ environment status"
     cmds:
-      - echo "=== RabbitMQ Server ==="
-      - kubectl get pods -n {{.NAMESPACE}} -l app=rabbitmq 2>/dev/null || echo "Not deployed"
+      - echo "=== RabbitMQ Cluster Operator ==="
+      - kubectl get pods -n rabbitmq-system 2>/dev/null || echo "Operator not deployed"
       - echo ""
-      - echo "=== RabbitMQ Worker ==="
-      - kubectl get pods -n {{.NAMESPACE}} -l app=rabbitmq-worker 2>/dev/null || echo "Not deployed"
+      - echo "=== RabbitMQ Cluster ==="
+      - kubectl get rabbitmqclusters 2>/dev/null || echo "No clusters"
+      - echo ""
+      - echo "=== RabbitMQ Pods ==="
+      - kubectl get pods -l app.kubernetes.io/component=rabbitmq 2>/dev/null || echo "Not running"
       - echo ""
       - echo "=== Queues ==="
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
         if [ -n "$POD" ]; then
-          kubectl exec -n {{.NAMESPACE}} $POD -- rabbitmqctl list_queues name messages consumers 2>/dev/null || echo "Could not list queues"
+          kubectl exec $POD -- rabbitmqctl list_queues name messages consumers 2>/dev/null || echo "Could not list queues"
         else
           echo "RabbitMQ not running"
         fi
@@ -113,8 +96,8 @@ tasks:
     desc: "List all RabbitMQ queues with message counts"
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -n {{.NAMESPACE}} $POD -- rabbitmqctl list_queues name messages consumers
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec $POD -- rabbitmqctl list_queues name messages consumers
 
   queues:purge:
     desc: "Purge a queue (QUEUE='orders')"
@@ -122,40 +105,86 @@ tasks:
       QUEUE: '{{.QUEUE | default "orders"}}'
     cmds:
       - |
-        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=rabbitmq -o jsonpath='{.items[0].metadata.name}')
-        kubectl exec -n {{.NAMESPACE}} $POD -- rabbitmqctl purge_queue {{.QUEUE}}
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec $POD -- rabbitmqctl purge_queue {{.QUEUE}}
         echo "Queue '{{.QUEUE}}' purged"
 
   management:
     desc: "Port-forward RabbitMQ management UI to localhost:15672"
     cmds:
       - echo "Opening RabbitMQ Management at http://localhost:15672"
-      - echo "Login -> guest / guest"
-      - kubectl port-forward -n {{.NAMESPACE}} svc/rabbitmq 15672:15672
+      - echo "Credentials can be found in secret '{{.RMQ_CLUSTER_NAME}}-default-user'"
+      - kubectl port-forward svc/{{.RMQ_CLUSTER_NAME}} 15672:15672
 
-  describe:
-    desc: "Describe RabbitMQ worker pod"
+  amqp:forward:
+    desc: "Port-forward AMQP port to localhost:5672"
     cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=rabbitmq-worker
+      - echo "AMQP available at amqp://localhost:5672/"
+      - echo "Credentials can be found in secret '{{.RMQ_CLUSTER_NAME}}-default-user'"
+      - kubectl port-forward svc/{{.RMQ_CLUSTER_NAME}} 5672:5672
 
-  describe:rabbitmq:
-    desc: "Describe RabbitMQ server pod"
+  credentials:
+    desc: "Show RabbitMQ connection credentials"
     cmds:
-      - kubectl describe pod -n {{.NAMESPACE}} -l app=rabbitmq
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        echo "=== RabbitMQ Credentials ==="
+        echo "Username: $(kubectl get secret $SECRET -o jsonpath='{.data.username}' | base64 -d)"
+        echo "Password: $(kubectl get secret $SECRET -o jsonpath='{.data.password}' | base64 -d)"
+        echo "Host:     $(kubectl get secret $SECRET -o jsonpath='{.data.host}' | base64 -d)"
+        echo "Port:     $(kubectl get secret $SECRET -o jsonpath='{.data.port}' | base64 -d)"
 
   clean:
     desc: "Clean RabbitMQ test resources"
     cmds:
-      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/rabbitmq --ignore-not-found=true
+      - kubectl delete rabbitmqcluster {{.RMQ_CLUSTER_NAME}} --ignore-not-found=true
+      - kubectl delete -f "https://github.com/rabbitmq/cluster-operator/releases/latest/download/cluster-operator.yml" --ignore-not-found=true
+
+  clean:sessions:
+    desc: "Clean up all RMQ sessions and mirrord temp queues"
+    cmds:
+      - echo "=== Cleaning up RMQ sessions ==="
+      - kubectl delete mirrordrmqsessions --all 2>/dev/null || echo "(none to delete)"
+      - echo ""
+      - echo "=== Listing remaining mirrord temp queues ==="
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec $POD -- rabbitmqctl list_queues name 2>/dev/null | grep "^mirrord-" || echo "(no temp queues)"
+        else
+          echo "RabbitMQ not running"
+        fi
+
+  queues:mirrord:
+    desc: "List only mirrord-* temporary queues left in the broker"
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name 2>/dev/null | grep "^mirrord-")
+        if [ -z "$QUEUES" ]; then
+          echo "No mirrord temp queues found."
+        else
+          echo "$QUEUES"
+        fi
+
+  queues:mirrord:delete:
+    desc: "Delete all mirrord-* temporary queues from the broker"
+    cmds:
+      - |
+        POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name --no-table-headers 2>/dev/null | grep "^mirrord-")
+        if [ -z "$QUEUES" ]; then
+          echo "No mirrord temp queues to delete."
+        else
+          echo "$QUEUES" | while read q; do
+            kubectl exec $POD -- rabbitmqctl delete_queue "$q"
+            echo "Deleted: $q"
+          done
+        fi
 
   _wait:rabbitmq:
     internal: true
     cmds:
-      - echo "Waiting for RabbitMQ..."
-      - kubectl wait --for=condition=ready pod -l app=rabbitmq -n {{.NAMESPACE}} --timeout=120s
-
-  _wait:worker:
-    internal: true
-    cmds:
-      - echo "Waiting for RabbitMQ worker..."
-      - kubectl wait --for=condition=ready pod -l app=rabbitmq-worker -n {{.NAMESPACE}} --timeout=120s
+      - echo "Waiting for RabbitMQ cluster to be ready..."
+      - kubectl wait --for=condition=ClusterAvailable rabbitmqcluster/{{.RMQ_CLUSTER_NAME}} --timeout=180s
+      - echo "RabbitMQ cluster is ready."

@@ -1,6 +1,7 @@
 operator:
   image: mirrord-operator
   sqsSplitting: true
+  rmqSplitting: true
   kafkaSplitting: true
   mysqlBranching: true
   pgBranching: true
