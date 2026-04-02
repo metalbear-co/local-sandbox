@@ -8,6 +8,7 @@ vars:
   SA_PASSWORD: 'TestP@ssw0rd!'
   MSSQL_IMAGE: 'mcr.microsoft.com/mssql/server:2022-latest'
   SQLPACKAGE_IMAGE: 'vladrbg/sqlpackage:latest'
+  MSSQL_TOOLS_IMAGE: 'ghcr.io/metalbear-co/mssql-tools:latest'
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
@@ -19,9 +20,11 @@ tasks:
       - echo "Pulling MSSQL images..."
       - "{{.CONTAINER_RUNTIME}} pull {{.MSSQL_IMAGE}} || true"
       - "{{.CONTAINER_RUNTIME}} pull {{.SQLPACKAGE_IMAGE}} || true"
+      - "{{.CONTAINER_RUNTIME}} pull {{.MSSQL_TOOLS_IMAGE}} || true"
       - echo "Loading images into minikube..."
       - minikube -p {{.CLUSTER_NAME}} image load {{.MSSQL_IMAGE}}
       - minikube -p {{.CLUSTER_NAME}} image load {{.SQLPACKAGE_IMAGE}}
+      - minikube -p {{.CLUSTER_NAME}} image load {{.MSSQL_TOOLS_IMAGE}}
       - echo "MSSQL images loaded"
 
   deploy:
@@ -40,13 +43,12 @@ tasks:
   deploy:all:
     desc: "Deploy source database and env-val scenario (loads images first)"
     cmds:
+      - task: _patch:operator
       - task: images:load
       - task: deploy:base
       - task: deploy:scenario
         vars: {SCENARIO: env-val}
-      - echo "Waiting for branch to be created..."
-      - sleep 10
-      - task: status
+      - task: _wait:branches
 
   deploy:scenario:
     desc: "Deploy a specific scenario (SCENARIO=env-val)"
@@ -55,6 +57,111 @@ tasks:
     cmds:
       - echo "Deploying scenario {{.SCENARIO}}..."
       - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/{{.SCENARIO}}
+
+  test:
+    desc: "Full MSSQL test (deploy + verify)"
+    cmds:
+      - task: deploy:all
+      - task: verify
+
+  test:quick:
+    desc: "Quick test - verify only (no deploy)"
+    cmds:
+      - task: verify
+
+  verify:
+    desc: "Verify all MSSQL branch data"
+    cmds:
+      - task: verify:all
+
+  verify:all:
+    desc: "Full verification of source and all branches"
+    cmds:
+      - echo ""
+      - task: verify:source
+      - echo ""
+      - task: verify:scenario
+        vars: {SCENARIO: env-val, EXPECTED_USERS: 5, EXPECTED_ORDERS: 5, EXPECTED_PRODUCTS: 4, MODE: "full copy (all)"}
+      - echo ""
+      - echo "Tip - Run 'task mssql:status' to see environment status"
+
+  verify:source:
+    desc: "Verify source database"
+    cmds:
+      - echo "=== Source Database (mssql-test) ==="
+      - kubectl exec -n {{.NAMESPACE}} mssql-test -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P '{{.SA_PASSWORD}}' -d source_db -C -Q "SELECT 'users' AS tbl, COUNT(*) AS cnt FROM users UNION ALL SELECT 'orders', COUNT(*) FROM orders UNION ALL SELECT 'products', COUNT(*) FROM products;"
+
+  verify:scenario:
+    desc: "Verify specific scenario (SCENARIO=env-val)"
+    vars:
+      SCENARIO: '{{.SCENARIO}}'
+      MODE: '{{.MODE | default ""}}'
+      EXPECTED_USERS: '{{.EXPECTED_USERS | default "?"}}'
+      EXPECTED_ORDERS: '{{.EXPECTED_ORDERS | default "?"}}'
+      EXPECTED_PRODUCTS: '{{.EXPECTED_PRODUCTS | default "?"}}'
+    cmds:
+      - |
+        echo "=== Branch [{{.SCENARIO}}] {{if .MODE}}({{.MODE}}){{end}} ==="
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name=mssql-test-branch-{{.SCENARIO}} --no-headers -o custom-columns=":metadata.name" | head -1)
+        if [ -z "$POD" ]; then
+          echo "Branch not found"
+          exit 1
+        fi
+        echo "Pod -> $POD"
+        kubectl exec -n {{.NAMESPACE}} "$POD" -c mssql -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -C -Q "SELECT 'users' AS tbl, COUNT(*) AS cnt FROM users UNION ALL SELECT 'orders', COUNT(*) FROM orders UNION ALL SELECT 'products', COUNT(*) FROM products;"
+        echo "Expected -> users={{.EXPECTED_USERS}}, orders={{.EXPECTED_ORDERS}}, products={{.EXPECTED_PRODUCTS}}"
+
+  run:local:
+    desc: "Run MSSQL app locally with mirrord"
+    dir: '{{.ROOT_DIR}}/apps/mssql-app'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mssql/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/mssql-app main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/mssql-app'
+
+  query:mirrord:
+    desc: "Query the latest mirrord-created branch"
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          echo ""
+          echo "Branch Pod: $POD"
+          echo ""
+          echo "=== TABLES ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -c mssql -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -C -Q "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE'" 2>/dev/null
+          echo ""
+          echo "=== USERS ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -c mssql -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -C -Q "SELECT * FROM users" 2>/dev/null
+          echo ""
+          echo "=== ORDERS ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -c mssql -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -C -Q "SELECT * FROM orders" 2>/dev/null
+          echo ""
+          echo "=== PRODUCTS ==="
+          kubectl exec -n {{.NAMESPACE}} "$POD" -c mssql -- /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Mssql-Branch-P@ss1' -d source_db -C -Q "SELECT * FROM products" 2>/dev/null
+          echo ""
+        else
+          echo "No branch found. Run 'task mssql:run:local' first."
+          exit 1
+        fi
+
+  test:local:
+    desc: "Run app locally with mirrord, then query the branch"
+    cmds:
+      - task: run:local
+      - task: query:mirrord
+
+  setup:local:
+    desc: "Clean and setup minimal environment for local testing"
+    cmds:
+      - task: clean
+      - task: deploy:base
+      - task: deploy:scenario
+        vars: {SCENARIO: env-val}
+      - echo ""
+      - echo "Environment ready. Run 'task mssql:run:local' to test with mirrord."
+      - echo "Config -> k8s/overlays/mssql/mirrord.json"
 
   status:
     desc: "Show MSSQL test environment status"
@@ -165,6 +272,12 @@ tasks:
       - kubectl delete -k {{.MODULAR_TESTS_DIR}}/base -n {{.NAMESPACE}} --ignore-not-found=true
       - echo "Cleanup complete"
 
+  _patch:operator:
+    internal: true
+    cmds:
+      - kubectl patch deployment mirrord-operator -n mirrord --patch '{"spec":{"template":{"spec":{"containers":[{"name":"mirrord-operator","env":[{"name":"MSSQL_TOOLS_IMAGE","value":"ghcr.io/metalbear-co/mssql-tools:latest"}]}]}}}}' --type=strategic || true
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=300s || true
+
   _wait:source:
     internal: true
     cmds:
@@ -173,3 +286,11 @@ tasks:
       - echo "Waiting for MSSQL to initialize (running init scripts)..."
       - sleep 30
       - echo "Source MSSQL is ready"
+
+  _wait:branches:
+    internal: true
+    cmds:
+      - echo "Waiting for MSSQL branch databases (this may take 2-3 minutes)..."
+      - sleep 15
+      - kubectl wait --for=condition=ready pod -l db-owner-name=mssql-test-branch-env-val -n {{.NAMESPACE}} --timeout=300s || true
+      - sleep 5

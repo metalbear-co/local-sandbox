@@ -1,0 +1,20 @@
+{
+  "target": {
+    "path": "deploy/echo-app",
+    "namespace": "test-multicluster"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "http_filter": {
+          "header_filter": "X-Preview: {{ key }}"
+        }
+      }
+    }
+  }
+}

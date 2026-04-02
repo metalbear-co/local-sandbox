@@ -10,10 +10,13 @@ operator:
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true
+  previewEnv: true
+  preview:
+    image_pull_policy: "IfNotPresent"
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true
-  logLevel: "debug"
+  logLevel: "warn,operator=debug,mirrord=debug"
   # Note: hostNetwork is patched via kubectl after helm install (not in chart)
   # AWS credentials for LocalStack - use NodePort URL (set via --set in task)
   extraEnv:

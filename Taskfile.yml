@@ -38,7 +38,7 @@ vars:
   ROOT_DIR:
     sh: pwd
   OPERATOR_DIR: '{{.OPERATOR_DIR | default (print .ROOT_DIR "/../operator")}}'
-  CHARTS_DIR: '{{.CHARTS_DIR | default (print .ROOT_DIR "/../operator/charts/mirrord-operator")}}'
+  CHARTS_DIR: '{{.CHARTS_DIR | default (print .ROOT_DIR "/../operator/public/charts/mirrord-operator")}}'
   SCRIPTS_DIR: '{{.SCRIPTS_DIR | default (print .ROOT_DIR "/scripts")}}'
   MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
@@ -69,7 +69,7 @@ tasks:
   build:operator:
     desc: Build operator image
     cmds:
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false -f operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:nocache:
@@ -77,7 +77,7 @@ tasks:
     cmds:
       - echo "Clearing sccache and target cache mounts..."
       - docker builder prune --filter type=exec.cachemount --force || true
-      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false --no-cache -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false --no-cache -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
   build:operator:gcs:
@@ -95,7 +95,7 @@ tasks:
         msg: "GCS_BUCKET required"
     cmds:
       - |
-        cd {{.OPERATOR_DIR}}/.. && docker build --provenance=false -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
+        cd {{.OPERATOR_DIR}}/.. && docker build --provenance=false -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
           --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
           --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
@@ -122,7 +122,7 @@ tasks:
         msg: "Custom issuer file not found"
     cmds:
       - |
-        cd {{.OPERATOR_DIR}}/.. && docker build --provenance=false -f operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
+        cd {{.OPERATOR_DIR}}/.. && docker build --provenance=false -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}} \
           --secret id=gcp_credentials,src={{.GCS_CREDENTIALS_FILE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.CUSTOM_ISSUER_FILE}})" \
           --build-arg GCS_BUCKET={{.GCS_BUCKET}} \
@@ -630,6 +630,45 @@ tasks:
       - task: postgres:deploy:gcp:path
       - task: postgres:_reset:print:gcp:path
 
+  test:mssql:
+    desc: "Run MSSQL test"
+    deps: [operator:install]
+    cmds:
+      - task: mssql:test
+
+  test:mssql:quick:
+    desc: "Quick MSSQL test - verify only"
+    cmds:
+      - task: mssql:verify
+
+  test:mssql:clean:
+    desc: "Clean cluster and run MSSQL test"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: operator:install
+      - task: mssql:test
+
+  test:mssql:clean:nobuild:
+    desc: "Clean cluster and run MSSQL test (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: mssql:test
+
+  test:mssql:local:
+    desc: "Run MSSQL app locally with mirrord"
+    cmds:
+      - task: mssql:run:local
+
+  test:mssql:setup:
+    desc: "Setup MSSQL environment for local testing"
+    deps: [operator:install]
+    cmds:
+      - task: mssql:setup:local
+
   test:mongodb:
     desc: "Run MongoDB test"
     deps: [build:app:mongodb, operator:install]
@@ -765,8 +804,8 @@ tasks:
       - task: multicluster:teardown:all
       - echo "Building operator image..."
       - task: build:operator:multicluster
-      - echo "Building echo-app..."
-      - task: multicluster:echo-app:build
+      # - echo "Building echo-app..."
+      # - task: multicluster:echo-app:build
       - echo "Creating minikube profiles..."
       - task: multicluster:clusters:create
       - echo "Waiting for clusters to be ready..."
@@ -816,7 +855,7 @@ tasks:
     cmds:
       - |
         cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build \
-          -f operator/Dockerfile \
+          -f operator/public/operator/Dockerfile \
           -t {{.OPERATOR_IMAGE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
           operator
@@ -826,7 +865,7 @@ tasks:
     cmds:
       - |
         cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --no-cache \
-          -f operator/Dockerfile \
+          -f operator/public/operator/Dockerfile \
           -t {{.OPERATOR_IMAGE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" \
           operator
@@ -837,8 +876,8 @@ tasks:
       - task: multicluster:teardown:all
       - echo "Building operator image (no cache)..."
       - task: build:operator:multicluster:nocache
-      - echo "Building echo-app..."
-      - task: multicluster:echo-app:build
+      # - echo "Building echo-app..."
+      # - task: multicluster:echo-app:build
       - echo "Creating minikube profiles..."
       - task: multicluster:clusters:create
       - echo "Waiting for clusters to be ready..."

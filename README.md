@@ -192,6 +192,53 @@ task redis:status
 task redis:clean
 ```
 
+## Preview Environments
+
+Config: `apps/echo-app/mirrord-preview.json` - targets `deploy/echo-app`, steals traffic
+matching `X-Preview: <key>`. The preview pod uses the `echo-app:latest` image by default
+(loaded into minikube, so `image_pull_policy: "IfNotPresent"` is set in local values).
+
+### Single-cluster test
+
+Creates the PreviewSession directly on remote-1. The local operator handles it.
+
+```bash
+task multicluster:preview:start:single-cluster PREVIEW_KEY=my-sc-preview
+
+# Terminal 2 - traffic with header goes to preview pod
+task multicluster:preview:test:traffic PREVIEW_KEY=my-sc-preview
+
+# Terminal 3 - traffic without header goes to original echo-app
+task multicluster:preview:test:traffic:no-header
+
+task multicluster:preview:stop:single-cluster PREVIEW_KEY=my-sc-preview
+```
+
+### Multi-cluster test
+
+Creates the PreviewSession on the primary cluster. The `PreviewSessionSyncController`
+syncs it to the default cluster (remote-1) where the preview pod runs.
+
+```bash
+task multicluster:preview:start PREVIEW_KEY=my-mc-preview
+
+# Verify the CR exists on BOTH clusters (proves sync controller works)
+task multicluster:preview:list
+
+# Traffic is generated on remote-1 where the echo-app service lives
+task multicluster:preview:test:traffic PREVIEW_KEY=my-mc-preview
+
+task multicluster:preview:stop PREVIEW_KEY=my-mc-preview
+```
+
+### What to look for
+
+- `preview:list` should show the PreviewSession on both `mirrord-primary` and `mirrord-remote-1`
+  for multi-cluster, or only on `mirrord-remote-1` for single-cluster
+- Traffic with the `X-Preview` header should return a response from the preview pod
+  (different from the original echo-app's `cluster_id` JSON)
+- Traffic without the header should return normal echo-app responses
+
 ## Other Modules
 
 ### MySQL
