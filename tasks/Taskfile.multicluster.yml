@@ -36,7 +36,7 @@ vars:
   # ROOT_DIR is local-sandbox/ (parent of tasks/) - same pattern as other taskfiles
   ROOT_DIR:
     sh: cd .. && pwd
-  CHARTS_DIR: "{{.ROOT_DIR}}/../operator/charts/mirrord-operator"
+  CHARTS_DIR: "{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator"
   APPS_DIR: "{{.ROOT_DIR}}/apps"
   K8S_DIR: "{{.ROOT_DIR}}/k8s"
 
@@ -90,6 +90,8 @@ tasks:
     desc: Create a single minikube cluster profile
     vars:
       CLUSTER: "{{.CLUSTER}}"
+      MC_CLUSTER_MEMORY: '{{.MC_CLUSTER_MEMORY | default "2048"}}'
+      MC_CLUSTER_CPUS: '{{.MC_CLUSTER_CPUS | default "2"}}'
     cmds:
       # Add cluster hostnames to the apiserver cert SANs
       # This allows cross-cluster communication using hostnames + hostAliases
@@ -100,8 +102,8 @@ tasks:
         fi
         minikube start -p {{.CLUSTER}} \
           --driver={{.CONTAINER_RUNTIME}} \
-          --memory=2048 \
-          --cpus=2 \
+          --memory={{.MC_CLUSTER_MEMORY}} \
+          --cpus={{.MC_CLUSTER_CPUS}} \
           --disk-size=10g \
           --apiserver-names=$APISERVER_NAMES
       - minikube update-context -p {{.CLUSTER}}
@@ -346,7 +348,7 @@ tasks:
       - echo "Building operator image..."
       - |
         cd {{.ROOT_DIR}}/../operator/.. && docker build \
-          -f operator/Dockerfile \
+          -f operator/public/operator/Dockerfile \
           -t {{.OPERATOR_IMAGE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
           operator
@@ -453,7 +455,7 @@ tasks:
       - echo "Building operator image from scratch (no cache)..."
       - |
         cd {{.ROOT_DIR}}/../operator/.. && docker build \
-          -f operator/Dockerfile \
+          -f operator/public/operator/Dockerfile \
           -t {{.OPERATOR_IMAGE}} \
           --no-cache \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
@@ -528,7 +530,7 @@ tasks:
       - echo "Building operator image..."
       - |
         cd {{.ROOT_DIR}}/../operator/.. && docker build \
-          -f operator/Dockerfile \
+          -f operator/public/operator/Dockerfile \
           -t {{.OPERATOR_IMAGE}} \
           --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.ROOT_DIR}}/scripts/license-issuer.pem)" \
           operator
@@ -1207,8 +1209,9 @@ tasks:
       - echo "Waiting for clusters to be ready..."
       - sleep 5
       - task: test:verify:clusters
-      # - task: agent:build
-      # - task: agent:load
+      # Agent image must be built separately (requires GHCR auth):
+      #   task multicluster:agent:rebuild
+      - task: agent:load
       - task: operator:load:images
       - task: operator:install:all
       - echo "Waiting for operators to be ready..."
@@ -1330,7 +1333,7 @@ tasks:
 
   test:deploy:echo-apps:
     desc: Deploy echo apps to all clusters with cluster-specific IDs
-    deps: [echo-app:load]
+    deps: [echo-app:load:all]
     cmds:
       - |
         MGMT_ONLY="{{.PRIMARY_MANAGEMENT_ONLY}}"
@@ -1941,7 +1944,7 @@ tasks:
         echo "Running with mirrord..."
         # Primary operator routes stateful operations (db branches) to the default cluster
         {{.MIRRORD_BIN}} exec \
-          --context {{.REMOTE_CLUSTER_1}} \
+          --context {{.PRIMARY_CLUSTER}} \
           -f {{.K8S_DIR}}/overlays/multicluster-postgres/mirrord.json \
           -- /tmp/postgres-app
 
@@ -3363,3 +3366,391 @@ tasks:
           echo "--- {{.REMOTE_CLUSTER_2}} ---"
           kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=sqs-consumer --tail=20 2>/dev/null || echo "No logs"
         fi
+
+  preview:start:
+    desc: Start a preview environment (multi-cluster, via primary)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        echo "=== Starting Preview Environment (Multi-Cluster) ==="
+        echo ""
+        echo "  Context:  {{.PRIMARY_CLUSTER}} (primary)"
+        echo "  Target:   deploy/echo-app in {{.MC_NAMESPACE}}"
+        echo "  Image:    {{.PREVIEW_IMAGE}}"
+        echo "  Key:      {{.PREVIEW_KEY}}"
+        echo "  Timeout:  {{.PREVIEW_TIMEOUT}}s"
+        echo ""
+        echo "The PreviewSession CR is created on the primary cluster."
+        echo "The sync controller forwards it to the default cluster ({{.REMOTE_CLUSTER_1}})."
+        echo "The preview pod runs on {{.REMOTE_CLUSTER_1}}."
+        echo ""
+
+        {{.MIRRORD_BIN}} preview start \
+          --context {{.PRIMARY_CLUSTER}} \
+          -f {{.APPS_DIR}}/echo-app/mirrord-preview.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:start:single-cluster:
+    desc: Start a preview environment (single-cluster, directly on remote-1)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview-sc"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        echo "=== Starting Preview Environment (Single-Cluster) ==="
+        echo ""
+        echo "  Context:  {{.REMOTE_CLUSTER_1}} (direct)"
+        echo "  Target:   deploy/echo-app in {{.MC_NAMESPACE}}"
+        echo "  Image:    {{.PREVIEW_IMAGE}}"
+        echo "  Key:      {{.PREVIEW_KEY}}"
+        echo "  Timeout:  {{.PREVIEW_TIMEOUT}}s"
+        echo ""
+        echo "The PreviewSession CR is created directly on {{.REMOTE_CLUSTER_1}}."
+        echo "No sync controller involved - the local operator handles it."
+        echo ""
+
+        {{.MIRRORD_BIN}} preview start \
+          --context {{.REMOTE_CLUSTER_1}} \
+          -f {{.APPS_DIR}}/echo-app/mirrord-preview.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:status:
+    desc: Show preview session status
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+    cmds:
+      - |
+        echo "=== Preview Status ==="
+        echo ""
+
+        echo "--- Primary cluster ({{.PRIMARY_CLUSTER}}) ---"
+        kubectl --context {{.PRIMARY_CLUSTER}} get previewsessions -n {{.MC_NAMESPACE}} 2>/dev/null || \
+          kubectl --context {{.PRIMARY_CLUSTER}} get previewsessions -n mirrord 2>/dev/null || \
+          echo "  No preview sessions"
+
+        echo ""
+        echo "--- Default cluster ({{.REMOTE_CLUSTER_1}}) ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get previewsessions -n {{.MC_NAMESPACE}} 2>/dev/null || echo "  No preview sessions"
+
+        echo ""
+        echo "--- Preview pods ({{.REMOTE_CLUSTER_1}}) ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || \
+          kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n {{.MC_NAMESPACE}} | grep -i preview 2>/dev/null || \
+          echo "  No preview pods"
+
+  preview:stop:
+    desc: Stop a preview environment (multi-cluster)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+    cmds:
+      - |
+        echo "Stopping preview with key: {{.PREVIEW_KEY}} (via {{.PRIMARY_CLUSTER}})"
+
+        {{.MIRRORD_BIN}} preview stop \
+          --context {{.PRIMARY_CLUSTER}} \
+          -k "{{.PREVIEW_KEY}}" || true
+
+        echo ""
+        echo "Preview stopped."
+
+  preview:stop:single-cluster:
+    desc: Stop a preview environment (single-cluster)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview-sc"}}'
+    cmds:
+      - |
+        echo "Stopping preview with key: {{.PREVIEW_KEY}} (via {{.REMOTE_CLUSTER_1}})"
+
+        {{.MIRRORD_BIN}} preview stop \
+          --context {{.REMOTE_CLUSTER_1}} \
+          -k "{{.PREVIEW_KEY}}" || true
+
+        echo ""
+        echo "Preview stopped."
+
+  preview:list:
+    desc: List all preview sessions across clusters
+    cmds:
+      - |
+        echo "=== Preview Sessions ==="
+        echo ""
+
+        echo "--- Primary ({{.PRIMARY_CLUSTER}}) ---"
+        kubectl --context {{.PRIMARY_CLUSTER}} get previewsessions -A 2>/dev/null || echo "  None (or CRD not installed)"
+
+        echo ""
+        echo "--- Remote-1 ({{.REMOTE_CLUSTER_1}}) ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get previewsessions -A 2>/dev/null || echo "  None (or CRD not installed)"
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- Remote-2 ({{.REMOTE_CLUSTER_2}}) ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} get previewsessions -A 2>/dev/null || echo "  None (or CRD not installed)"
+        fi
+
+  preview:test:traffic:
+    desc: Generate traffic with preview header (should be routed to preview pod)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+    cmds:
+      - |
+        echo "Generating traffic WITH preview header (X-Preview: {{.PREVIEW_KEY}})"
+        echo "This traffic SHOULD be routed to the preview pod."
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Request $i (with preview header) ---"
+
+          echo -n "REMOTE-1: "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-Preview: {{.PREVIEW_KEY}}" \
+            http://echo-app:8080/echo?from=preview 2>/dev/null | head -1 || echo "failed"
+
+          i=$((i + 1))
+          sleep 2
+        done
+
+  preview:test:traffic:no-header:
+    desc: Generate traffic without preview header (should go to original pod)
+    cmds:
+      - |
+        echo "Generating traffic WITHOUT preview header"
+        echo "This traffic should go to the ORIGINAL pod (not the preview)."
+        echo "Press Ctrl+C to stop"
+        echo ""
+
+        i=1
+        while true; do
+          echo "--- Request $i (no preview header) ---"
+
+          echo -n "REMOTE-1: "
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n {{.MC_NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- http://echo-app:8080/echo?from=normal 2>/dev/null | head -1 || echo "failed"
+
+          i=$((i + 1))
+          sleep 2
+        done
+
+  preview:test:
+    desc: Interactive preview environment test guide
+    cmds:
+      - |
+        echo "============================================"
+        echo "  Preview Environment Test Guide"
+        echo "============================================"
+        echo ""
+        echo "Prerequisites:"
+        echo "  - Multi-cluster setup is running (task multicluster:setup:all)"
+        echo "  - Echo apps are deployed (task multicluster:test:deploy:echo-apps)"
+        echo "  - Echo app image is loaded (task multicluster:echo-app:load)"
+        echo ""
+        echo "============================================"
+        echo "  MULTI-CLUSTER TEST"
+        echo "============================================"
+        echo ""
+        echo "1. Start preview (creates PreviewSession on primary, synced to default cluster):"
+        echo ""
+        echo "   task multicluster:preview:start PREVIEW_KEY=my-preview"
+        echo ""
+        echo "2. Check status:"
+        echo ""
+        echo "   task multicluster:preview:status"
+        echo "   task multicluster:preview:list"
+        echo ""
+        echo "3. In another terminal, send traffic WITH the preview header:"
+        echo ""
+        echo "   task multicluster:preview:test:traffic PREVIEW_KEY=my-preview"
+        echo ""
+        echo "4. In another terminal, send traffic WITHOUT the header (goes to original pod):"
+        echo ""
+        echo "   task multicluster:preview:test:traffic:no-header"
+        echo ""
+        echo "5. Stop the preview:"
+        echo ""
+        echo "   task multicluster:preview:stop PREVIEW_KEY=my-preview"
+        echo ""
+        echo "============================================"
+        echo "  SINGLE-CLUSTER TEST"
+        echo "============================================"
+        echo ""
+        echo "1. Start preview directly on remote-1 (no sync controller):"
+        echo ""
+        echo "   task multicluster:preview:start:single-cluster PREVIEW_KEY=my-sc-preview"
+        echo ""
+        echo "2. Send traffic with the header:"
+        echo ""
+        echo "   task multicluster:preview:test:traffic PREVIEW_KEY=my-sc-preview"
+        echo ""
+        echo "3. Stop:"
+        echo ""
+        echo "   task multicluster:preview:stop:single-cluster PREVIEW_KEY=my-sc-preview"
+        echo ""
+        echo "============================================"
+        echo "  NOTES"
+        echo "============================================"
+        echo ""
+        echo "  - The preview pod uses the echo-app image (echo-app:latest)"
+        echo "  - Traffic with 'X-Preview: <key>' header is stolen by the preview pod"
+        echo "  - Traffic without the header goes to the original deployment"
+        echo "  - Preview sessions have a 30-minute TTL (configurable in mirrord-preview.json)"
+        echo "  - The mirrord config is at: apps/echo-app/mirrord-preview.json"
+        echo ""
+
+  flaky:setup:
+    desc: Setup multi-cluster env with constrained resources to reproduce flaky tests
+    cmds:
+      - |
+        echo "=== Flaky Repro Setup ==="
+        echo "Creating clusters with default resources + network latency to stress timing."
+        echo ""
+      - task: teardown:all
+      - sleep 2
+      - NUM_CLUSTERS=3 task multicluster:setup:all:with-sqs:single
+      - task: flaky:network:slow
+      - echo ""
+      - echo "=== Constrained environment ready ==="
+      - echo ""
+      - echo "Run the flaky tests with:"
+      - echo "  task multicluster:flaky:run"
+      - echo ""
+      - echo "Or run them in a loop until failure:"
+      - echo "  task multicluster:flaky:loop"
+
+  flaky:network:slow:
+    desc: Add network latency between clusters to stress timing-sensitive code paths
+    vars:
+      LATENCY_MS: '{{.LATENCY_MS | default "150"}}'
+      JITTER_MS: '{{.JITTER_MS | default "50"}}'
+    cmds:
+      - |
+        echo "Adding {{.LATENCY_MS}}ms +/- {{.JITTER_MS}}ms latency to cross-cluster traffic..."
+        for CLUSTER in {{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}}; do
+          if docker inspect "$CLUSTER" >/dev/null 2>&1; then
+            docker exec "$CLUSTER" sh -c "apt-get update -qq && apt-get install -y -qq iproute2 >/dev/null 2>&1 || true"
+            docker exec "$CLUSTER" tc qdisc replace dev eth0 root netem delay {{.LATENCY_MS}}ms {{.JITTER_MS}}ms 2>/dev/null \
+              && echo "  $CLUSTER: latency added" \
+              || echo "  $CLUSTER: tc not available (try: docker exec $CLUSTER apt-get install -y iproute2)"
+          else
+            echo "  $CLUSTER: container not found, skipping"
+          fi
+        done
+
+  flaky:network:reset:
+    desc: Remove artificial network latency from clusters
+    cmds:
+      - |
+        echo "Removing network latency..."
+        for CLUSTER in {{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}}; do
+          if docker inspect "$CLUSTER" >/dev/null 2>&1; then
+            docker exec "$CLUSTER" tc qdisc del dev eth0 root 2>/dev/null \
+              && echo "  $CLUSTER: latency removed" \
+              || echo "  $CLUSTER: no qdisc to remove"
+          fi
+        done
+
+  flaky:run:
+    desc: Run the two flaky multicluster tests once
+    dir: "{{.ROOT_DIR}}/../operator"
+    env:
+      MC_PRIMARY_CONTEXT: "{{.PRIMARY_CLUSTER}}"
+      MC_REMOTE_1_NAME: "{{.REMOTE_CLUSTER_1}}"
+      MC_REMOTE_1_CONTEXT: "{{.REMOTE_CLUSTER_1}}"
+      MC_REMOTE_2_NAME: "{{.REMOTE_CLUSTER_2}}"
+      MC_REMOTE_2_CONTEXT: "{{.REMOTE_CLUSTER_2}}"
+      MC_DEFAULT_CLUSTER: "{{.REMOTE_CLUSTER_1}}"
+      MIRRORD_AGENT_IMAGE: test
+      RUST_LOG: warn,mirrord=debug
+    cmds:
+      - |
+        echo "=== Running flaky multicluster tests ==="
+        echo ""
+        echo "Tests:"
+        echo "  - multicluster_mirror_with_header_filter"
+        echo "  - multicluster_copy_target_with_sqs_splitting"
+        echo ""
+      - task: test:cleanup:all
+      - |
+        cargo test -p tests -- \
+          --ignored \
+          --nocapture \
+          --test-threads=1 \
+          multicluster_mirror_with_header_filter
+      # - task: test:cleanup:all
+      # - |
+      #   cargo test -p tests -- \
+      #     --ignored \
+      #     --nocapture \
+      #     --test-threads=1 \
+      #     multicluster_copy_target_with_sqs_splitting
+
+  flaky:loop:
+    desc: Run flaky tests in a loop until one fails (max FLAKY_MAX_RUNS iterations)
+    dir: "{{.ROOT_DIR}}/../operator"
+    vars:
+      FLAKY_MAX_RUNS: '{{.FLAKY_MAX_RUNS | default "20"}}'
+    env:
+      MC_PRIMARY_CONTEXT: "{{.PRIMARY_CLUSTER}}"
+      MC_REMOTE_1_NAME: "{{.REMOTE_CLUSTER_1}}"
+      MC_REMOTE_1_CONTEXT: "{{.REMOTE_CLUSTER_1}}"
+      MC_REMOTE_2_NAME: "{{.REMOTE_CLUSTER_2}}"
+      MC_REMOTE_2_CONTEXT: "{{.REMOTE_CLUSTER_2}}"
+      MC_DEFAULT_CLUSTER: "{{.REMOTE_CLUSTER_1}}"
+      MIRRORD_AGENT_IMAGE: test
+      RUST_LOG: warn,mirrord=debug
+    cmds:
+      - |
+        echo "=== Flaky test loop (max {{.FLAKY_MAX_RUNS}} runs) ==="
+        echo ""
+
+        run_test() {
+          local test_name="$1"
+          task multicluster:test:cleanup:all 2>/dev/null || true
+          cargo test -p tests -- \
+            --ignored \
+            --nocapture \
+            --test-threads=1 \
+            "$test_name"
+        }
+
+        for i in $(seq 1 {{.FLAKY_MAX_RUNS}}); do
+          echo ""
+          echo "========== Run $i / {{.FLAKY_MAX_RUNS}} =========="
+          echo ""
+
+          if ! run_test multicluster_mirror_with_header_filter; then
+            echo ""
+            echo "FAILED multicluster_mirror_with_header_filter on run $i"
+            echo ""
+            echo "Collecting operator logs..."
+            kubectl --context {{.PRIMARY_CLUSTER}} logs -n mirrord deployment/mirrord-operator --tail=50 2>/dev/null || true
+            echo "---"
+            kubectl --context {{.REMOTE_CLUSTER_1}} logs -n mirrord deployment/mirrord-operator --tail=50 2>/dev/null || true
+            exit 1
+          fi
+
+          if ! run_test multicluster_copy_target_with_sqs_splitting; then
+            echo ""
+            echo "FAILED multicluster_copy_target_with_sqs_splitting on run $i"
+            echo ""
+            echo "Collecting operator logs..."
+            kubectl --context {{.PRIMARY_CLUSTER}} logs -n mirrord deployment/mirrord-operator --tail=50 2>/dev/null || true
+            echo "---"
+            kubectl --context {{.REMOTE_CLUSTER_1}} logs -n mirrord deployment/mirrord-operator --tail=50 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Run $i passed"
+        done
+
+        echo ""
+        echo "All {{.FLAKY_MAX_RUNS}} runs passed - could not reproduce the flake."

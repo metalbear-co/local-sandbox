@@ -7,6 +7,9 @@ operator:
   pgBranching: true
   mongodbBranching: true
   mssqlBranching: true
+  previewEnv: true
+  preview:
+    image_pull_policy: "IfNotPresent"
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true

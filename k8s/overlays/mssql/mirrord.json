@@ -1,0 +1,28 @@
+{
+    "operator": true,
+    "target": {
+        "path": "pod/mssql-server-env-val",
+        "namespace": "test-mirrord"
+    },
+    "feature": {
+        "db_branches": [
+            {
+                "id": "mssql-dev-branch",
+                "type": "mssql",
+                "version": "2022-latest",
+                "name": "source_db",
+                "ttl_secs": 600,
+                "creation_timeout_secs": 120,
+                "connection": {
+                    "url": {
+                        "type": "env",
+                        "variable": "DATABASE_URL"
+                    }
+                },
+                "copy": {
+                    "mode": "all"
+                }
+            }
+        ]
+    }
+}
