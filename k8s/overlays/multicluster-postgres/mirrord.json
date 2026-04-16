@@ -6,7 +6,7 @@
   "feature": {
     "db_branches": [
       {
-        "id": "pg-multicluster-branch22",
+        "id": "pg-mc-test-run2",
         "type": "pg",
         "version": "17",
         "name": "source_db",

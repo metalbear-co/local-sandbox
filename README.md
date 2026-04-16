@@ -61,6 +61,11 @@ task kafka:send MESSAGE="hello" USER_ID="123"
 # SQS (LocalStack)
 task test:sqs
 task sqs:run:local
+
+# GCP Pub/Sub splitting
+task test:pubsub
+task pubsub:run:local
+task pubsub:send:match
 ```
 
 ### Clean Tests (Fresh Cluster)
@@ -70,6 +75,7 @@ task test:mysql:clean
 task test:postgres:clean
 task test:kafka:clean
 task test:sqs:clean
+task test:pubsub:clean
 ```
 
 ### Skip Operator Build
@@ -272,6 +278,201 @@ task rmq:send QUEUE="orders" TENANT="a" MESSAGE="hello"
 
 # Run the e2e tests (from the operator/ directory)
 cargo test -p tests -- --ignored rmq_queue_splitting --nocapture
+```
+
+### GCP Pub/Sub Queue Splitting
+
+#### Basic Setup
+
+```bash
+# Fresh cluster with Pub/Sub from scratch
+task test:pubsub:clean
+
+# Deploy emulator + consumer + CRDs (operator must be installed)
+task pubsub:deploy
+
+# Deploy only the emulator (for E2E tests)
+task pubsub:deploy:emulator
+
+# Build the Go consumer image and load into minikube
+task pubsub:build
+```
+
+#### Running Local Consumers
+
+```bash
+# Single session (tenant=^test filter)
+task pubsub:run:local
+
+# Second session (tenant=^beta filter)
+task pubsub:run:local:user-b
+
+# Third session (tenant=^gamma filter)
+task pubsub:run:local:user-c
+
+# Multi-attribute filter (tenant=^test AND type=^premium$)
+task pubsub:run:local:multi-attr
+
+# JQ body filter (type=premium in JSON body)
+task pubsub:run:local:jq
+```
+
+#### Sending Messages
+
+```bash
+# Single messages
+task pubsub:send:match             # tenant=test-user (matched by user A)
+task pubsub:send:nomatch           # tenant=other (goes to target pod)
+task pubsub:send:beta              # tenant=beta (matched by user B)
+task pubsub:send:gamma             # tenant=gamma (matched by user C)
+task pubsub:send TENANT="custom"   # custom tenant value
+
+# Multi-tenant
+task pubsub:send:all-tenants       # one per tenant (test-user, beta, gamma, other)
+task pubsub:send:both              # test-user + other + beta
+
+# Batch send
+task pubsub:test:split:send MATCHED=5 UNMATCHED=3
+
+# Flood test (random tenants)
+task pubsub:send:flood COUNT=30
+```
+
+#### Multi-Queue Setup (Orders + Notifications)
+
+Two independent topics/subscriptions on the same workload.
+
+```bash
+# Deploy with two queues
+task pubsub:deploy:multi-queue
+
+# Split only orders queue
+task pubsub:run:local:orders-only
+
+# Split only notifications queue
+task pubsub:run:local:notifications-only
+
+# Split both queues at once
+task pubsub:run:local:both-queues
+
+# Send to specific queues
+task pubsub:send:orders TENANT=test-user
+task pubsub:send:notifications TENANT=test-user
+task pubsub:send:multi-queue:all   # mixed to both queues
+
+# Logs for multi-queue consumer
+task pubsub:logs:multi-queue
+```
+
+#### Logs and Inspection
+
+```bash
+task pubsub:logs                   # Target pod logs
+task pubsub:logs:emulator          # Emulator logs
+task pubsub:topics:list            # All topics
+task pubsub:subscriptions:list     # All subscriptions
+task pubsub:test:split:status      # Sessions, configs, external resources, topics, subs
+task pubsub:status                 # Quick pod/config overview
+```
+
+#### Automated Tests
+
+```bash
+# Reconnect test (start session, kill it, start new, verify messages route correctly)
+task pubsub:test:reconnect
+
+# Session churn (5 rapid start/stop cycles)
+task pubsub:test:session-churn
+
+# Cleanup sessions and temp resources only
+task pubsub:test:split:cleanup
+
+# Full cleanup
+task pubsub:clean
+```
+
+#### E2E Tests
+
+```bash
+# From the operator/ directory
+cargo test -p tests -- --ignored gcp_pubsub --nocapture
+```
+
+#### Interactive Testing Scenarios
+
+All scenarios below require `task pubsub:deploy` (or `deploy:multi-queue`) to have been run first, and assume you have separate terminal windows open.
+
+**Scenario 1: Single user split (basic)**
+
+| Window | Command | Shows |
+|--------|---------|-------|
+| 1 | `task pubsub:run:local` | Local consumer (tenant=^test) |
+| 2 | `task pubsub:logs` | Target pod (unfiltered) |
+| 3 | `task logs:operator` | Operator activity |
+| 4 | `task pubsub:send:match` / `send:nomatch` | Send and inspect |
+
+**Scenario 2: Two users, same queue, different filters**
+
+| Window | Command | Shows |
+|--------|---------|-------|
+| 1 | `task pubsub:run:local` | User A (tenant=^test) |
+| 2 | `task pubsub:run:local:user-b` | User B (tenant=^beta) |
+| 3 | `task pubsub:logs` | Target pod (unfiltered) |
+| 4 | `task pubsub:send:both` | Send test-user + beta + other |
+
+**Scenario 3: Three users, same queue** (`task pubsub:test:three-sessions` prints these)
+
+| Window | Command | Shows |
+|--------|---------|-------|
+| 1 | `task pubsub:run:local` | User A (tenant=^test) |
+| 2 | `task pubsub:run:local:user-b` | User B (tenant=^beta) |
+| 3 | `task pubsub:run:local:user-c` | User C (tenant=^gamma) |
+| 4 | `task pubsub:logs` | Target pod (unfiltered) |
+| 5 | `task logs:operator` | Operator activity |
+| 6 | `task pubsub:send:all-tenants` / `send:flood COUNT=30` | Send and inspect |
+
+**Scenario 4: Multi-queue, one user per queue** (`task pubsub:test:multi-queue:two-users`)
+
+Requires `task pubsub:deploy:multi-queue` instead of `pubsub:deploy`.
+
+| Window | Command | Shows |
+|--------|---------|-------|
+| 1 | `task pubsub:run:local:orders-only` | User A splits orders |
+| 2 | `task pubsub:run:local:notifications-only` | User B splits notifications |
+| 3 | `task pubsub:logs:multi-queue` | Target pod |
+| 4 | `task pubsub:send:multi-queue:all` | Send to both queues |
+
+User A should only receive order messages with tenant=test-user. User B should only receive notification messages with tenant=test-user. The target pod gets everything else.
+
+**Scenario 5: Multi-queue, one user splits both queues**
+
+| Window | Command | Shows |
+|--------|---------|-------|
+| 1 | `task pubsub:run:local:both-queues` | User splits both queues |
+| 2 | `task pubsub:logs:multi-queue` | Target pod |
+| 3 | `task pubsub:send:multi-queue:all` | Send to both queues |
+
+**Scenario 6: Filter type comparison** (`task pubsub:test:filter-types` prints these)
+
+Test attribute filters vs. multi-attribute filters vs. JQ body filters on the same queue.
+
+| Filter | Command | Matches |
+|--------|---------|---------|
+| Single attribute | `task pubsub:run:local` | tenant=test-user |
+| Multi-attribute | `task pubsub:run:local:multi-attr` | tenant=test-user AND type=premium |
+| JQ body | `task pubsub:run:local:jq` | body JSON has type=premium |
+
+**Scenario 7: Stress and recovery**
+
+```bash
+# Session churn: 5 rapid start/stop cycles, verifies each session receives messages
+task pubsub:test:session-churn
+
+# Reconnect: start session, kill it, start new, verify messages still route
+task pubsub:test:reconnect
+
+# Flood: send many random-tenant messages while sessions are running
+task pubsub:send:flood COUNT=50
 ```
 
 ### SQS/Kafka

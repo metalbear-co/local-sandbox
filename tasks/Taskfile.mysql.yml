@@ -26,6 +26,60 @@ tasks:
       - kubectl apply -k {{.MODULAR_TESTS_DIR}}/base
       - task: _wait:source
 
+  deploy:source:
+    desc: "Deploy source database with custom MySQL version (MYSQL_VERSION=5.7 MYSQL_IMAGE=mysql/mysql-server)"
+    vars:
+      MYSQL_VERSION: '{{.MYSQL_VERSION | default "8.0"}}'
+      MYSQL_IMAGE: '{{.MYSQL_IMAGE | default "mysql/mysql-server"}}'
+    cmds:
+      - echo "Deploying {{.MYSQL_IMAGE}}:{{.MYSQL_VERSION}} source database..."
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl delete pod mysql-test -n {{.NAMESPACE}} --ignore-not-found=true --wait=true
+      - kubectl delete svc mysql-test -n {{.NAMESPACE}} --ignore-not-found=true
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: mysql-test
+          labels:
+            app: mysql-test
+        spec:
+          containers:
+            - name: mysql
+              image: {{.MYSQL_IMAGE}}:{{.MYSQL_VERSION}}
+              env:
+                - name: MYSQL_ROOT_PASSWORD
+                  value: examplepassword
+                - name: MYSQL_DATABASE
+                  value: user
+              ports:
+                - containerPort: 3306
+              readinessProbe:
+                exec:
+                  command: ["mysqladmin", "ping", "-h", "localhost"]
+                initialDelaySeconds: 10
+                periodSeconds: 5
+              volumeMounts:
+                - name: mysql-storage
+                  mountPath: /var/lib/mysql
+          volumes:
+            - name: mysql-storage
+              emptyDir: {}
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: mysql-test
+        spec:
+          selector:
+            app: mysql-test
+          ports:
+            - port: 3306
+              targetPort: 3306
+        EOF
+      - task: _wait:source
+
   deploy:all:
     desc: "Deploy source database and all test scenarios"
     cmds:
@@ -337,6 +391,98 @@ tasks:
     desc: "Clean MariaDB test resources"
     cmds:
       - kubectl delete -f {{.MARIADB_COMPLETE_FILE}} --ignore-not-found=true
+
+  reproduce:glibc:
+    desc: "Reproduce GLIBC error with mysql:5.7 (x86 emulation via Docker)"
+    vars:
+      OPERATOR_VERSION: '{{.OPERATOR_VERSION | default ""}}'
+      OPERATOR_IMAGE_REF: '{{.OPERATOR_IMAGE_REF | default "ghcr.io/metalbear-co/operator"}}'
+      MYSQL_VERSION: '{{.MYSQL_VERSION | default "5.7"}}'
+    cmds:
+      - |
+        VERSION="{{.OPERATOR_VERSION}}"
+        if [ -z "$VERSION" ]; then
+          VERSION=$(grep "appVersion:" {{.ROOT_DIR}}/../operator/public/charts/mirrord-operator/Chart.yaml | awk '{print $2}' | tr -d '"')
+          echo "No OPERATOR_VERSION specified, using chart appVersion: $VERSION"
+        fi
+        IMAGE="{{.OPERATOR_IMAGE_REF}}:$VERSION"
+
+        echo ""
+        echo "=== Reproducing GLIBC error ==="
+        echo "Operator image: $IMAGE (linux/amd64)"
+        echo "MySQL image:    mysql:{{.MYSQL_VERSION}} (linux/amd64)"
+        echo ""
+
+        echo "1. Pulling x86 operator image..."
+        docker pull --platform linux/amd64 "$IMAGE"
+
+        echo ""
+        echo "2. Extracting mysql-branch-init binary..."
+        rm -rf /tmp/mysql-branch-init
+        docker rm -f tmp-glibc-extract 2>/dev/null || true
+        docker create --platform linux/amd64 --name tmp-glibc-extract "$IMAGE" >/dev/null
+        docker cp tmp-glibc-extract:/usr/local/bin/mysql-branch-init /tmp/mysql-branch-init
+        docker rm tmp-glibc-extract >/dev/null
+
+        echo ""
+        echo "3. Running binary inside mysql:{{.MYSQL_VERSION}} (x86 emulated)..."
+        echo ""
+        docker rm -f glibc-test 2>/dev/null || true
+        docker create --platform linux/amd64 --name glibc-test --entrypoint "" \
+          mysql:{{.MYSQL_VERSION}} /tmp/mysql-branch-init --help
+        docker cp /tmp/mysql-branch-init glibc-test:/tmp/mysql-branch-init
+        docker start -a glibc-test 2>&1 || true
+        docker rm glibc-test >/dev/null 2>&1
+
+        echo ""
+        echo "4. glibc version inside mysql:{{.MYSQL_VERSION}}:"
+        docker rm -f glibc-version 2>/dev/null || true
+        docker create --platform linux/amd64 --name glibc-version --entrypoint "" \
+          mysql:{{.MYSQL_VERSION}} sh -c "ldd --version 2>&1 | head -1"
+        docker start -a glibc-version 2>&1 || true
+        docker rm glibc-version >/dev/null 2>&1
+
+        rm -f /tmp/mysql-branch-init
+        echo ""
+        echo "Done."
+
+  reproduce:glibc:local:
+    desc: "Test locally built mysql-branch-init against glibc 2.17 (oraclelinux:7, same base as mysql:5.7)"
+    vars:
+      TEST_IMAGE: '{{.TEST_IMAGE | default "oraclelinux:7"}}'
+      OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
+    cmds:
+      - |
+        echo ""
+        echo "=== Testing local mysql-branch-init against glibc 2.17 ==="
+        echo "Operator image: {{.OPERATOR_IMAGE}}"
+        echo "Test image:     {{.TEST_IMAGE}} (same glibc as mysql:5.7)"
+        echo ""
+
+        echo "1. Extracting mysql-branch-init binary..."
+        rm -rf /tmp/mysql-branch-init
+        docker rm -f tmp-glibc-extract 2>/dev/null || true
+        docker create --name tmp-glibc-extract {{.OPERATOR_IMAGE}} >/dev/null
+        docker cp tmp-glibc-extract:/usr/local/bin/mysql-branch-init /tmp/mysql-branch-init
+        docker rm tmp-glibc-extract >/dev/null
+
+        echo ""
+        echo "2. Checking glibc version inside {{.TEST_IMAGE}}:"
+        docker run --rm --entrypoint "" {{.TEST_IMAGE}} sh -c "ldd --version 2>&1 | head -1"
+
+        echo ""
+        echo "3. Running binary inside {{.TEST_IMAGE}}..."
+        echo ""
+        docker rm -f glibc-test 2>/dev/null || true
+        docker create --name glibc-test --entrypoint "" \
+          {{.TEST_IMAGE}} /tmp/mysql-branch-init --help
+        docker cp /tmp/mysql-branch-init glibc-test:/tmp/mysql-branch-init
+        docker start -a glibc-test 2>&1 || true
+        docker rm glibc-test >/dev/null 2>&1
+
+        rm -f /tmp/mysql-branch-init
+        echo ""
+        echo "Done."
 
   _patch:operator:
     internal: true

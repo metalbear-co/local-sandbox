@@ -1,0 +1,942 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  EMULATOR_NAMESPACE: "pubsub-emulator"
+  PROJECT_ID: "test-project"
+  TOPIC: '{{.TOPIC | default "test-topic"}}'
+  SUBSCRIPTION: '{{.SUBSCRIPTION | default "test-subscription"}}'
+  OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator"
+
+tasks:
+  deploy:emulator:
+    desc: "Deploy only the Pub/Sub emulator (enough for E2E tests)"
+    cmds:
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/pubsub-emulator.yaml
+      - task: _wait:emulator
+
+  deploy:
+    desc: "Deploy emulator + consumer pod + CRDs (for manual testing)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/pubsub-emulator.yaml
+      - task: _wait:emulator
+      - task: _setup:topic
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer.yaml
+      - task: _wait:consumer
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config.yaml
+
+  build:
+    desc: "Build and load the pubsub-consumer image into minikube"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    cmds:
+      - docker build -t pubsub-consumer:local .
+      - minikube -p {{.CLUSTER_NAME}} image load pubsub-consumer:local
+
+  run:
+    desc: "Deploy everything + run local consumer in one shot (tenant=^test filter)"
+    cmds:
+      - task: deploy
+      - task: run:local
+
+  run:local:
+    desc: "Run pubsub consumer locally with mirrord (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/pubsub-emulator/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/pubsub-consumer main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer'
+
+  run:copy-target:
+    desc: "Deploy everything + run local consumer with copy target (tenant=^test filter)"
+    cmds:
+      - task: deploy
+      - task: run:local:copy-target
+
+  run:local:copy-target:
+    desc: "Run pubsub consumer locally with mirrord copy target (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-copy-target.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-ct main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-ct'
+
+  run:local:user-b:
+    desc: "Run a second local consumer with mirrord (tenant=^beta filter)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-user-b.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-b main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-b'
+
+  run:local:user-c:
+    desc: "Run a third local consumer with mirrord (tenant=^gamma filter)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-user-c.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-c main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-c'
+
+  run:local:multi-attr:
+    desc: "Run local consumer matching both tenant=^test AND type=^premium$"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-multi-attr.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-ma main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-ma'
+
+  run:local:jq:
+    desc: "Run local consumer with JQ body filter (type=premium in JSON body)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-jq.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-jq main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-jq'
+
+  run:local:orders-only:
+    desc: "Multi-queue: split only the orders queue (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-orders-only.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-orders main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-orders'
+
+  run:local:notifications-only:
+    desc: "Multi-queue: split only the notifications queue (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-notifications-only.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-notif main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-notif'
+
+  run:local:both-queues:
+    desc: "Multi-queue: split both orders and notifications (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-both-queues.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-both main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-both'
+
+  send:
+    desc: "Publish a test message (TENANT='test-user' TYPE='standard')"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      MESSAGE: '{{.MESSAGE | default "test message"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X POST \
+            "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"messages\": [{
+                \"data\": \"$(echo -n '{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"{{.TYPE}}","amount":100}' | base64)\",
+                \"attributes\": {
+                  \"tenant\": \"{{.TENANT}}\",
+                  \"type\": \"{{.TYPE}}\"
+                }
+              }]
+            }"
+        echo ""
+        echo "Published to {{.TOPIC}} with tenant={{.TENANT}} type={{.TYPE}}"
+
+  send:match:
+    desc: "Publish a message that matches the default filter (tenant=test-user)"
+    cmds:
+      - task: send
+        vars: { TENANT: "test-user", TYPE: "premium", MESSAGE: "matched message" }
+
+  send:nomatch:
+    desc: "Publish a message that does NOT match any filter (tenant=other)"
+    cmds:
+      - task: send
+        vars: { TENANT: "other", TYPE: "basic", MESSAGE: "unmatched message" }
+
+  send:beta:
+    desc: "Publish a message for user B (tenant=beta)"
+    cmds:
+      - task: send
+        vars: { TENANT: "beta", TYPE: "premium", MESSAGE: "beta user message" }
+
+  send:gamma:
+    desc: "Publish a message for user C (tenant=gamma)"
+    cmds:
+      - task: send
+        vars: { TENANT: "gamma", TYPE: "standard", MESSAGE: "gamma user message" }
+
+  send:both:
+    desc: "Send one matched + one unmatched + one beta message"
+    cmds:
+      - task: send:match
+      - task: send:nomatch
+      - task: send:beta
+
+  send:all-tenants:
+    desc: "Send one message per tenant (test-user, beta, gamma, other)"
+    cmds:
+      - task: send
+        vars: { TENANT: "test-user", TYPE: "premium" }
+      - task: send
+        vars: { TENANT: "beta", TYPE: "standard" }
+      - task: send
+        vars: { TENANT: "gamma", TYPE: "premium" }
+      - task: send
+        vars: { TENANT: "other", TYPE: "basic" }
+
+  send:flood:
+    desc: "Send many messages quickly: task pubsub:send:flood COUNT=20"
+    vars:
+      COUNT: '{{.COUNT | default "20"}}'
+    cmds:
+      - |
+        TENANTS=("test-user" "beta" "gamma" "other" "unknown")
+        TYPES=("premium" "standard" "basic")
+
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+
+        echo "Flooding {{.COUNT}} messages across tenants: ${TENANTS[*]}"
+        for i in $(seq 1 {{.COUNT}}); do
+          T=${TENANTS[$((RANDOM % ${#TENANTS[@]}))]}
+          TY=${TYPES[$((RANDOM % ${#TYPES[@]}))]}
+          BODY=$(echo -n "{\"order_id\":\"ORD-F$i\",\"tenant\":\"$T\",\"type\":\"$TY\",\"amount\":$((RANDOM % 1000))}" | base64)
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X POST \
+              "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+              -H "Content-Type: application/json" \
+              -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"$T\",\"type\":\"$TY\"}}]}" >/dev/null
+          echo "$i: tenant=$T type=$TY"
+        done
+        echo ""
+        echo "Sent {{.COUNT}} messages."
+
+  send:to:
+    desc: "Publish to a specific topic: task pubsub:send:to TOPIC=orders-topic TENANT=test-user"
+    vars:
+      SEND_TOPIC: '{{.SEND_TOPIC | default "test-topic"}}'
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        BODY=$(echo -n "{\"order_id\":\"ORD-001\",\"tenant\":\"{{.TENANT}}\",\"type\":\"{{.TYPE}}\",\"amount\":100}" | base64)
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X POST \
+            "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.SEND_TOPIC}}:publish" \
+            -H "Content-Type: application/json" \
+            -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"{{.TENANT}}\",\"type\":\"{{.TYPE}}\"}}]}"
+        echo ""
+        echo "Published to {{.SEND_TOPIC}} with tenant={{.TENANT}}"
+
+  deploy:multi-sub:
+    desc: "Deploy multi-subscription environment (one queue_id, two subscriptions via env_like)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/pubsub-emulator.yaml
+      - task: _wait:emulator
+      - task: _setup:multi-sub-topics
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer-multi-sub.yaml
+      - echo "Waiting for multi-sub consumer..."
+      - kubectl wait --for=condition=ready pod -l app=pubsub-multi-sub-consumer -n {{.NAMESPACE}} --timeout=120s
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-multi-sub.yaml
+
+  run:multi-sub:
+    desc: "Deploy multi-sub environment + run local consumer (tenant=^test filter)"
+    cmds:
+      - task: deploy:multi-sub
+      - task: run:local:multi-sub
+
+  run:local:multi-sub:
+    desc: "Run local consumer against multi-sub deployment (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-multi-sub.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-multi-sub main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-multi-sub'
+
+  send:sub-a:
+    desc: "Publish to topic-a (feeds sub-a)"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+    cmds:
+      - task: send:to
+        vars: { SEND_TOPIC: "topic-a", TENANT: "{{.TENANT}}", TYPE: "{{.TYPE}}" }
+
+  send:sub-b:
+    desc: "Publish to topic-b (feeds sub-b)"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+    cmds:
+      - task: send:to
+        vars: { SEND_TOPIC: "topic-b", TENANT: "{{.TENANT}}", TYPE: "{{.TYPE}}" }
+
+  send:multi-sub:all:
+    desc: "Send matched+unmatched to both sub-a and sub-b"
+    cmds:
+      - task: send:sub-a
+        vars: { TENANT: "test-user", TYPE: "premium" }
+      - task: send:sub-a
+        vars: { TENANT: "other", TYPE: "basic" }
+      - task: send:sub-b
+        vars: { TENANT: "test-user", TYPE: "alert" }
+      - task: send:sub-b
+        vars: { TENANT: "other", TYPE: "info" }
+
+  send:to:sub:
+    desc: "Publish to the topic behind a subscription: task pubsub:send:to:sub SUB=test-subscription TENANT=test-user"
+    vars:
+      SUB: '{{.SUB | default "test-subscription"}}'
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        TOPIC=$(kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/subscriptions/{{.SUB}}" \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['topic'].split('/')[-1])")
+        if [ -z "$TOPIC" ]; then
+          echo "ERROR: Could not find topic for subscription {{.SUB}}"
+          exit 1
+        fi
+        echo "Subscription {{.SUB}} -> topic $TOPIC"
+        BODY=$(echo -n "{\"order_id\":\"ORD-001\",\"tenant\":\"{{.TENANT}}\",\"type\":\"{{.TYPE}}\",\"amount\":100}" | base64)
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X POST \
+            "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/$TOPIC:publish" \
+            -H "Content-Type: application/json" \
+            -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"{{.TENANT}}\",\"type\":\"{{.TYPE}}\"}}]}"
+        echo ""
+        echo "Published to $TOPIC (via sub={{.SUB}}) with tenant={{.TENANT}} type={{.TYPE}}"
+
+  deploy:multi-queue:
+    desc: "Deploy multi-queue environment (orders + notifications topics)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/pubsub-emulator.yaml
+      - task: _wait:emulator
+      - task: _setup:multi-queue-topics
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml
+      - echo "Waiting for multi-queue consumer..."
+      - kubectl wait --for=condition=ready pod -l app=pubsub-multi-consumer -n {{.NAMESPACE}} --timeout=120s
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-multi-queue.yaml
+
+  send:orders:
+    desc: "Publish to the orders topic"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "premium"}}'
+    cmds:
+      - task: send:to
+        vars: { SEND_TOPIC: "orders-topic", TENANT: "{{.TENANT}}", TYPE: "{{.TYPE}}" }
+
+  send:notifications:
+    desc: "Publish to the notifications topic"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "alert"}}'
+    cmds:
+      - task: send:to
+        vars: { SEND_TOPIC: "notifications-topic", TENANT: "{{.TENANT}}", TYPE: "{{.TYPE}}" }
+
+  send:multi-queue:all:
+    desc: "Send to both orders and notifications with mixed tenants"
+    cmds:
+      - task: send:orders
+        vars: { TENANT: "test-user", TYPE: "premium" }
+      - task: send:orders
+        vars: { TENANT: "other", TYPE: "basic" }
+      - task: send:notifications
+        vars: { TENANT: "test-user", TYPE: "alert" }
+      - task: send:notifications
+        vars: { TENANT: "other", TYPE: "info" }
+
+  logs:multi-queue:
+    desc: "Show multi-queue consumer logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=pubsub-multi-consumer --tail=100 -f
+
+  test:split:
+    desc: "Deploy environment for split testing"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Environment ready. Open separate terminal windows and run:"
+      - echo ""
+      - echo "  Window 1 - Local consumer (receives filtered messages):"
+      - echo "    cd local-sandbox && task pubsub:run:local"
+      - echo ""
+      - echo "  Window 2 - Target pod logs (receives unfiltered messages):"
+      - echo "    cd local-sandbox && task pubsub:logs"
+      - echo ""
+      - echo "  Window 3 - Operator logs:"
+      - echo "    cd local-sandbox && task logs:operator"
+      - echo ""
+      - echo "  Window 4 - Send messages:"
+      - echo "    cd local-sandbox && task pubsub:send:match"
+      - echo "    cd local-sandbox && task pubsub:send:nomatch"
+      - echo "    cd local-sandbox && task pubsub:test:split:status"
+
+  test:split:send:
+    desc: "Send filtered and unfiltered messages: task pubsub:test:split:send MATCHED=3 UNMATCHED=2"
+    vars:
+      MATCHED: '{{.MATCHED | default "3"}}'
+      UNMATCHED: '{{.UNMATCHED | default "2"}}'
+    cmds:
+      - |
+        echo "Sending {{.MATCHED}} matched (tenant=test-user) + {{.UNMATCHED}} unmatched (tenant=other) messages..."
+        echo ""
+
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+
+        for i in $(seq 1 {{.MATCHED}}); do
+          BODY=$(echo -n "{\"order_id\":\"ORD-M$i\",\"tenant\":\"test-user\",\"type\":\"premium\",\"amount\":$((RANDOM % 1000))}" | base64)
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X POST \
+              "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+              -H "Content-Type: application/json" \
+              -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"test-user\",\"type\":\"premium\"}}]}" >/dev/null
+          echo "MATCHED $i: tenant=test-user order=ORD-M$i"
+        done
+
+        for i in $(seq 1 {{.UNMATCHED}}); do
+          BODY=$(echo -n "{\"order_id\":\"ORD-U$i\",\"tenant\":\"other\",\"type\":\"basic\",\"amount\":$((RANDOM % 100))}" | base64)
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X POST \
+              "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+              -H "Content-Type: application/json" \
+              -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"other\",\"type\":\"basic\"}}]}" >/dev/null
+          echo "UNMATCHED $i: tenant=other order=ORD-U$i"
+        done
+
+        echo ""
+        echo "Sent {{.MATCHED}} matched + {{.UNMATCHED}} unmatched = $(({{.MATCHED}} + {{.UNMATCHED}})) total"
+
+  test:split:status:
+    desc: "Show split session and emulator state"
+    cmds:
+      - echo "Split Sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Split Config"
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "External Resources"
+      - kubectl get mirrordclusterexternalresources -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Workload Patch Requests"
+      - kubectl get mirrordclusterworkloadpatchrequests -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Topics"
+      - task: topics:list
+      - echo ""
+      - echo "Subscriptions"
+      - task: subscriptions:list
+
+  test:split:cleanup:
+    desc: "Delete all split sessions and temp resources"
+    cmds:
+      - echo "Deleting split sessions..."
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Deleting external resources..."
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Deleting workload patch requests..."
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Cleanup complete."
+
+  test:reconnect:
+    desc: "Test disconnect/reconnect - start session, kill it, start another, verify messages"
+    cmds:
+      - |
+        echo "Pub/Sub Fast Reconnect Test"
+        echo ""
+
+        kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+
+        cd {{.ROOT_DIR}}/apps/pubsub-consumer
+        go build -o /tmp/pubsub-consumer main.go
+
+        MIRRORD_CONFIG="{{.OVERLAY_DIR}}/mirrord.json"
+        SESSION1_LOG="/tmp/pubsub-session1.log"
+        SESSION2_LOG="/tmp/pubsub-session2.log"
+
+        echo "Step 1: Start Session 1"
+        {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/pubsub-consumer > $SESSION1_LOG 2>&1 &
+        SESSION1_PID=$!
+        echo "  PID: $SESSION1_PID"
+        sleep 15
+
+        if ! kill -0 $SESSION1_PID 2>/dev/null; then
+          echo "ERROR: Session 1 died"
+          cat $SESSION1_LOG
+          exit 1
+        fi
+
+        echo ""
+        echo "Step 2: Send message to Session 1"
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        BODY=$(echo -n '{"order_id":"ORD-S1","tenant":"test-user","type":"premium","amount":100}' | base64)
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X POST \
+            "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+            -H "Content-Type: application/json" \
+            -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"test-user\"}}]}" >/dev/null
+        sleep 5
+        echo "  Session 1 output:"
+        cat $SESSION1_LOG | grep "\[MSG" || echo "  (no messages yet)"
+
+        echo ""
+        echo "Step 3: Kill Session 1"
+        kill $SESSION1_PID 2>/dev/null || true
+        wait $SESSION1_PID 2>/dev/null || true
+        echo "  Session 1 terminated"
+
+        echo ""
+        echo "Step 4: Start Session 2 immediately"
+        {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/pubsub-consumer > $SESSION2_LOG 2>&1 &
+        SESSION2_PID=$!
+        echo "  PID: $SESSION2_PID"
+        sleep 15
+
+        if ! kill -0 $SESSION2_PID 2>/dev/null; then
+          echo "ERROR: Session 2 died"
+          cat $SESSION2_LOG
+          exit 1
+        fi
+
+        echo ""
+        echo "Step 5: Send 3 messages"
+        for i in 1 2 3; do
+          BODY=$(echo -n "{\"order_id\":\"ORD-R$i\",\"tenant\":\"test-user\",\"type\":\"premium\",\"amount\":$((i * 100))}" | base64)
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X POST \
+              "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+              -H "Content-Type: application/json" \
+              -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"test-user\"}}]}" >/dev/null
+          echo "  Sent message $i"
+          sleep 1
+        done
+
+        echo "Waiting 10s for processing..."
+        sleep 10
+
+        echo ""
+        echo "Results"
+        echo ""
+        echo "Session 1 Log:"
+        cat $SESSION1_LOG
+        echo ""
+        echo "Session 2 Log:"
+        cat $SESSION2_LOG
+        echo ""
+
+        SESSION1_COUNT=$(grep -c "\[MSG" $SESSION1_LOG 2>/dev/null || echo "0")
+        SESSION2_COUNT=$(grep -c "\[MSG" $SESSION2_LOG 2>/dev/null || echo "0")
+
+        echo "Summary"
+        echo "  Session 1 received: $SESSION1_COUNT messages (expected: 1)"
+        echo "  Session 2 received: $SESSION2_COUNT messages (expected: 3)"
+
+        if [ "$SESSION2_COUNT" -lt 3 ]; then
+          echo "  WARNING: Session 2 missed messages."
+        else
+          echo "  SUCCESS: Session 2 received all messages."
+        fi
+
+        kill $SESSION2_PID 2>/dev/null || true
+        echo ""
+        echo "Test complete."
+
+  reset:
+    desc: "Full reset: clean CRDs, restart emulator, redeploy consumers"
+    cmds:
+      - echo "Cleaning leftover CRDs..."
+      - kubectl delete mirrordclustersplitsessions --all 2>/dev/null || true
+      - kubectl delete mirrordclusterexternalresources --all 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all 2>/dev/null || true
+      - echo ""
+      - echo "Bouncing emulator pod..."
+      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator --wait=true
+      - task: _wait:emulator
+      - task: _setup:topic
+      - task: _setup:multi-sub-topics
+      - echo ""
+      - echo "Rebuilding consumer image..."
+      - task: build
+      - echo ""
+      - echo "Redeploying single-sub consumer..."
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer.yaml
+      - task: _wait:consumer
+      - echo ""
+      - echo "Redeploying multi-sub consumer..."
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer-multi-sub.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer-multi-sub.yaml
+      - kubectl wait --for=condition=ready pod -l app=pubsub-multi-sub-consumer -n {{.NAMESPACE}} --timeout=120s 2>/dev/null || echo "Multi-sub consumer not deployed, skipping"
+      - echo ""
+      - echo "Reapplying CRDs..."
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-multi-sub.yaml 2>/dev/null || true
+      - echo ""
+      - echo "Reset complete. Emulator, consumers, and CRDs are fresh."
+
+  reset:emulator:
+    desc: "Restart the emulator pod to clear all accumulated state, then recreate topics"
+    cmds:
+      - echo "Bouncing emulator pod..."
+      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator --wait=true
+      - task: _wait:emulator
+      - task: _setup:topic
+      - task: _setup:multi-sub-topics
+      - echo "Emulator reset complete."
+
+  logs:
+    desc: "Show Pub/Sub consumer logs (target pod)"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=pubsub-consumer --tail=100 -f
+
+  logs:emulator:
+    desc: "Show Pub/Sub emulator logs"
+    cmds:
+      - kubectl logs -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator --tail=100 -f
+
+  status:
+    desc: "Show Pub/Sub test environment status"
+    cmds:
+      - echo "Pub/Sub Emulator"
+      - kubectl get pods -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "Pub/Sub Consumer"
+      - kubectl get pods -n {{.NAMESPACE}} -l app=pubsub-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "Split Config"
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "No split config"
+      - echo ""
+      - echo "Split Sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "No sessions"
+
+  topics:list:
+    desc: "List topics in the emulator"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics" | python3 -m json.tool 2>/dev/null || echo "No topics"
+
+  subscriptions:list:
+    desc: "List subscriptions in the emulator"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/subscriptions" | python3 -m json.tool 2>/dev/null || echo "No subscriptions"
+
+  clean:
+    desc: "Clean all Pub/Sub resources"
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config-multi-queue.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config-multi-sub.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer-multi-sub.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/pubsub-emulator.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete namespace {{.EMULATOR_NAMESPACE}} --ignore-not-found=true
+
+  _wait:emulator:
+    internal: true
+    cmds:
+      - echo "Waiting for Pub/Sub emulator..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Pub/Sub consumer..."
+      - kubectl wait --for=condition=ready pod -l app=pubsub-consumer -n {{.NAMESPACE}} --timeout=120s
+
+  test:three-sessions:
+    desc: "Deploy and print instructions for running 3 concurrent sessions on the same queue"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Three-session test (same queue, different filters)"
+      - echo "Each session filters by a different tenant on the same subscription."
+      - echo "Unfiltered messages go to the target pod."
+      - echo ""
+      - echo "  Window 1 - User A (tenant=^test):"
+      - echo "    cd local-sandbox && task pubsub:run:local"
+      - echo ""
+      - echo "  Window 2 - User B (tenant=^beta):"
+      - echo "    cd local-sandbox && task pubsub:run:local:user-b"
+      - echo ""
+      - echo "  Window 3 - User C (tenant=^gamma):"
+      - echo "    cd local-sandbox && task pubsub:run:local:user-c"
+      - echo ""
+      - echo "  Window 4 - Target pod logs:"
+      - echo "    cd local-sandbox && task pubsub:logs"
+      - echo ""
+      - echo "  Window 5 - Operator logs:"
+      - echo "    cd local-sandbox && task logs:operator"
+      - echo ""
+      - echo "  Window 6 - Send messages:"
+      - echo "    task pubsub:send:all-tenants   (one per tenant)"
+      - echo "    task pubsub:send:flood COUNT=30 (random mix)"
+      - echo "    task pubsub:test:split:status   (inspect state)"
+
+  test:multi-queue:
+    desc: "Deploy multi-queue environment and print instructions"
+    cmds:
+      - task: deploy:multi-queue
+      - echo ""
+      - echo "Multi-queue test - 2 queues, orders + notifications"
+      - echo ""
+      - echo "  Scenario A - One session splits only orders:"
+      - echo "    cd local-sandbox && task pubsub:run:local:orders-only"
+      - echo ""
+      - echo "  Scenario B - One session splits only notifications:"
+      - echo "    cd local-sandbox && task pubsub:run:local:notifications-only"
+      - echo ""
+      - echo "  Scenario C - One session splits both queues:"
+      - echo "    cd local-sandbox && task pubsub:run:local:both-queues"
+      - echo ""
+      - echo "  Send messages:"
+      - echo "    task pubsub:send:orders TENANT=test-user"
+      - echo "    task pubsub:send:orders TENANT=other"
+      - echo "    task pubsub:send:notifications TENANT=test-user"
+      - echo "    task pubsub:send:notifications TENANT=other"
+      - echo "    task pubsub:send:multi-queue:all  (all at once)"
+      - echo ""
+      - echo "  Logs & status:"
+      - echo "    task pubsub:logs:multi-queue"
+      - echo "    task pubsub:test:split:status"
+
+  test:multi-queue:two-users:
+    desc: "Multi-queue: two users splitting different queues simultaneously"
+    cmds:
+      - task: deploy:multi-queue
+      - echo ""
+      - echo "Two users splitting different queues on the same workload"
+      - echo "User A splits orders, User B splits notifications."
+      - echo ""
+      - echo "  Window 1 - User A (orders only):"
+      - echo "    cd local-sandbox && task pubsub:run:local:orders-only"
+      - echo ""
+      - echo "  Window 2 - User B (notifications only):"
+      - echo "    cd local-sandbox && task pubsub:run:local:notifications-only"
+      - echo ""
+      - echo "  Window 3 - Target pod logs:"
+      - echo "    cd local-sandbox && task pubsub:logs:multi-queue"
+      - echo ""
+      - echo "  Window 4 - Send and verify:"
+      - echo "    task pubsub:send:multi-queue:all"
+      - echo ""
+      - echo "  Expected:"
+      - echo "    User A gets orders with tenant=test-user"
+      - echo "    User B gets notifications with tenant=test-user"
+      - echo "    Target pod gets everything else"
+
+  test:multi-queue:overlap:
+    desc: "Multi-queue: two users splitting the same queue with different filters"
+    cmds:
+      - task: deploy:multi-queue
+      - echo ""
+      - echo "Two users splitting the SAME queue (orders) with different tenant filters"
+      - echo ""
+      - echo "  Window 1 - User A (orders, tenant=^test):"
+      - echo "    cd local-sandbox && task pubsub:run:local:orders-only"
+      - echo ""
+      - echo "  Window 2 - User B (start with custom config):"
+      - echo "    mirrord exec -f k8s/overlays/pubsub-emulator/mirrord-orders-only.json -- /tmp/pubsub-consumer-b"
+      - echo "    (edit mirrord-orders-only.json to use tenant=^beta before starting user B,"
+      - echo "     or create a custom config)"
+      - echo ""
+      - echo "  Window 3 - Send:"
+      - echo "    task pubsub:send:orders TENANT=test-user"
+      - echo "    task pubsub:send:orders TENANT=beta"
+      - echo "    task pubsub:send:orders TENANT=other"
+      - echo ""
+      - echo "  Expected:"
+      - echo "    User A gets orders with tenant=test-user"
+      - echo "    User B gets orders with tenant=beta"
+      - echo "    Target pod gets orders with tenant=other"
+
+  test:session-churn:
+    desc: "Rapidly start/stop sessions to stress the operator"
+    cmds:
+      - |
+        echo "Session churn test: rapidly creating and destroying sessions"
+        echo ""
+
+        cd {{.ROOT_DIR}}/apps/pubsub-consumer
+        go build -o /tmp/pubsub-consumer main.go
+
+        MIRRORD_CONFIG="{{.OVERLAY_DIR}}/mirrord.json"
+
+        for round in 1 2 3 4 5; do
+          echo "Round $round: starting session..."
+          {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/pubsub-consumer > /tmp/pubsub-churn-$round.log 2>&1 &
+          PID=$!
+          sleep 10
+
+          if ! kill -0 $PID 2>/dev/null; then
+            echo "  Session died immediately. Log:"
+            cat /tmp/pubsub-churn-$round.log
+            exit 1
+          fi
+
+          echo "  Session alive (PID $PID). Sending a message..."
+          POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+          BODY=$(echo -n "{\"order_id\":\"ORD-CHURN-$round\",\"tenant\":\"test-user\",\"type\":\"premium\"}" | base64)
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X POST \
+              "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+              -H "Content-Type: application/json" \
+              -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"test-user\"}}]}" >/dev/null
+          sleep 3
+
+          echo "  Killing session..."
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+          sleep 2
+
+          MSG_COUNT=$(grep -c "1:" /tmp/pubsub-churn-$round.log 2>/dev/null || echo "0")
+          echo "  Round $round: received $MSG_COUNT messages"
+          echo ""
+        done
+
+        echo "Checking for leftover sessions..."
+        kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+        echo ""
+        echo "Session churn test complete."
+
+  test:filter-types:
+    desc: "Deploy and print instructions for testing all filter types"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Filter type comparison (all targeting the same queue)"
+      - echo ""
+      - echo "  Test 1 - Attribute filter (single):"
+      - echo "    cd local-sandbox && task pubsub:run:local"
+      - echo "    task pubsub:send TENANT=test-user TYPE=premium"
+      - echo "    task pubsub:send TENANT=other TYPE=premium"
+      - echo "    Expected - only tenant=test-user messages received"
+      - echo ""
+      - echo "  Test 2 - Multi-attribute filter (tenant AND type):"
+      - echo "    cd local-sandbox && task pubsub:run:local:multi-attr"
+      - echo "    task pubsub:send TENANT=test-user TYPE=premium"
+      - echo "    task pubsub:send TENANT=test-user TYPE=basic"
+      - echo "    task pubsub:send TENANT=other TYPE=premium"
+      - echo "    Expected - only tenant=test-user + type=premium received"
+      - echo ""
+      - echo "  Test 3 - JQ body filter:"
+      - echo "    cd local-sandbox && task pubsub:run:local:jq"
+      - echo "    task pubsub:send TENANT=other TYPE=premium"
+      - echo "    task pubsub:send TENANT=other TYPE=basic"
+      - echo "    Expected - only type=premium in body JSON received, regardless of tenant"
+
+  _setup:topic:
+    internal: true
+    desc: "Create the default test topic and subscription in the emulator"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        echo "Creating topic {{.TOPIC}}..."
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}" \
+            -H "Content-Type: application/json" || true
+        echo ""
+        echo "Creating subscription {{.SUBSCRIPTION}} on topic {{.TOPIC}}..."
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/subscriptions/{{.SUBSCRIPTION}}" \
+            -H "Content-Type: application/json" \
+            -d "{\"topic\": \"projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}\"}" || true
+        echo ""
+        echo "Topic and subscription created."
+
+  _setup:multi-sub-topics:
+    internal: true
+    desc: "Create topic-a/sub-a and topic-b/sub-b in the emulator"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+
+        for PAIR in "topic-a:sub-a" "topic-b:sub-b"; do
+          T="${PAIR%%:*}"
+          S="${PAIR##*:}"
+          echo "Creating topic $T..."
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/$T" \
+              -H "Content-Type: application/json" || true
+          echo ""
+          echo "Creating subscription $S on topic $T..."
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/subscriptions/$S" \
+              -H "Content-Type: application/json" \
+              -d "{\"topic\": \"projects/{{.PROJECT_ID}}/topics/$T\"}" || true
+          echo ""
+        done
+        echo "Multi-sub topics and subscriptions created."
+
+  _setup:multi-queue-topics:
+    internal: true
+    desc: "Create orders and notifications topics/subscriptions in the emulator"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+
+        for PAIR in "orders-topic:orders-sub" "notifications-topic:notifications-sub"; do
+          T="${PAIR%%:*}"
+          S="${PAIR##*:}"
+          echo "Creating topic $T..."
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/$T" \
+              -H "Content-Type: application/json" || true
+          echo ""
+          echo "Creating subscription $S on topic $T..."
+          kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+            curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/subscriptions/$S" \
+              -H "Content-Type: application/json" \
+              -d "{\"topic\": \"projects/{{.PROJECT_ID}}/topics/$T\"}" || true
+          echo ""
+        done
+        echo "Multi-queue topics and subscriptions created."

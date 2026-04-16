@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pubsub-emulator
+  namespace: pubsub-emulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pubsub-emulator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pubsub-emulator
+    spec:
+      containers:
+      - name: pubsub-emulator
+        image: gcr.io/google.com/cloudsdktool/cloud-sdk:emulators
+        command: ["gcloud", "beta", "emulators", "pubsub", "start", "--host-port=0.0.0.0:8085"]
+        ports:
+        - containerPort: 8085
+          name: pubsub
+        readinessProbe:
+          tcpSocket:
+            port: 8085
+          initialDelaySeconds: 10
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pubsub-emulator
+  namespace: pubsub-emulator
+spec:
+  selector:
+    app.kubernetes.io/name: pubsub-emulator
+  ports:
+  - port: 8085
+    targetPort: 8085
+    name: pubsub

@@ -1,0 +1,25 @@
+{
+  "target": {
+    "path": "deployment/sqs-multi-consumer",
+    "namespace": "test-multicluster"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "queue-a": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "type": "^premium$"
+        }
+      },
+      "*": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "type": ".*"
+        }
+      }
+    },
+    "env": true,
+    "fs": "local"
+  }
+}

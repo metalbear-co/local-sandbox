@@ -1,0 +1,11 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: pubsub-emulator-config
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: endpoint
+    value: "http://pubsub-emulator.pubsub-emulator.svc.cluster.local:8085"
+  - name: project_id
+    value: "test-project"

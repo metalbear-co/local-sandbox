@@ -1,5 +1,6 @@
 {
   "multi_cluster": false,
+  "key": "sc-test-key",
   "target": {
     "path": "pod/postgres-test",
     "namespace": "test-multicluster"
@@ -7,7 +8,7 @@
   "feature": {
     "db_branches": [
       {
-        "id": "pg-single-cluster-branch",
+        "id": "pg-sc-{{ key }}-run",
         "type": "pg",
         "version": "17",
         "name": "source_db",
