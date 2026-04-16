@@ -1,0 +1,33 @@
+{
+  "operator": true,
+  "target": {
+    "path": { "pod": "pg-server-literal-value" },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": { "incoming": "off", "outgoing": true },
+    "db_branches": [
+      {
+        "id": "pg-literal-value-test",
+        "name": "branch_db",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "type": "env",
+          "params": {
+            "host": "DB_HOST",
+            "port": "DB_PORT",
+            "user": "DB_USER",
+            "password": { "env_var_name": "DB_PASSWORD", "value": "postgres" },
+            "database": "DB_NAME"
+          }
+        },
+        "copy": { "mode": "all" }
+      }
+    ]
+  }
+}

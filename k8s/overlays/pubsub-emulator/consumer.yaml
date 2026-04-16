@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pubsub-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pubsub-consumer
+  template:
+    metadata:
+      labels:
+        app: pubsub-consumer
+    spec:
+      initContainers:
+      - name: wait-for-emulator
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for Pub/Sub emulator to be ready..."
+          until nc -z pubsub-emulator.pubsub-emulator.svc.cluster.local 8085 2>/dev/null; do
+            echo "Emulator not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "Pub/Sub emulator is ready!"
+      containers:
+      - name: consumer
+        image: pubsub-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: PUBSUB_PROJECT_ID
+          value: "test-project"
+        - name: PUBSUB_SUBSCRIPTION
+          value: "test-subscription"
+        - name: PUBSUB_EMULATOR_HOST
+          value: "pubsub-emulator.pubsub-emulator.svc.cluster.local:8085"

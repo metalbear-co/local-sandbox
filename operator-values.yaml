@@ -3,6 +3,7 @@ operator:
   sqsSplitting: true
   rmqSplitting: true
   kafkaSplitting: true
+  gcpPubsubSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true
@@ -25,6 +26,12 @@ operator:
     AWS_ACCESS_KEY_ID: "test"
     AWS_SECRET_ACCESS_KEY: "test"
     AWS_REGION: "us-east-1"
+  mysqlBranchConfig:
+    dbPod:
+      image:
+        registry: "mysql/mysql-server"
+      initImage:
+        registry: "mysql/mysql-server"
   # pgBranchConfig:
   #   dbPod:
   #     image:

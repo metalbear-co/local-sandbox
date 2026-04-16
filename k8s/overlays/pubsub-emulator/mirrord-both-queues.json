@@ -1,0 +1,23 @@
+{
+  "target": {
+    "path": "deployment/pubsub-multi-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "orders": {
+        "queue_type": "GcpPubSub",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      },
+      "notifications": {
+        "queue_type": "GcpPubSub",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

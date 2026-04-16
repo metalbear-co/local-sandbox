@@ -13,6 +13,16 @@ spec:
       env:
         - name: MYSQL_CONNECTION_URL
           value: mysql://root:examplepassword@mysql-test/user
+        - name: MYSQL_HOST
+          value: mysql-test
+        - name: MYSQL_PORT
+          value: "3306"
+        - name: MYSQL_USERNAME
+          value: root
+        - name: MYSQL_PASSWORD
+          value: examplepassword
+        - name: MYSQL_DATABASE
+          value: user
       ports:
         - containerPort: 80
 ---

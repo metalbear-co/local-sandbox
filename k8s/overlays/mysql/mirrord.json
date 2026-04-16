@@ -7,25 +7,23 @@
     "feature": {
         "db_branches": [
             {
-                "id": "mysql-dev-branch",
+                "id": "mysql-dev-branch-older",
                 "type": "mysql",
-                "version": "8.0",
-                "name": "user",
-                "ttl_secs": 600,
-                "creation_timeout_secs": 60,
+                "version": "5.7",
+                "name": "teladoc_eds",
+                "ttl_secs": 1200,
+                "creation_timeout_secs": 600,
                 "connection": {
-                    "url": {
-                        "type": "env",
-                        "variable": "MYSQL_CONNECTION_URL"
+                    "params": {
+                        "host": "MYSQL_HOST",
+                        "port": "MYSQL_PORT",
+                        "user": "MYSQL_USERNAME",
+                        "password": "MYSQL_PASSWORD",
+                        "database": "MYSQL_DATABASE"
                     }
                 },
                 "copy": {
-                    "mode": "schema",
-                    "tables": {
-                        "users": {
-                            "filter": "name = 'Alice'"
-                        }
-                    }
+                    "mode": "empty"
                 }
             }
         ]

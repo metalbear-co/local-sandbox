@@ -1,0 +1,30 @@
+# Registry with 3 queue IDs for wildcard seed testing.
+# Deployed to the operator namespace on the primary cluster.
+# The sync controller distributes it to all remote clusters.
+#
+# The mirrord config uses explicit queue-a + wildcard "*" to catch
+# queue-b and queue-c, testing seed-based deterministic naming in MC.
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordWorkloadQueueRegistry
+metadata:
+  name: sqs-multi-registry
+  namespace: mirrord
+  annotations:
+    mirrord.metalbear.co/target-namespace: test-multicluster
+spec:
+  queues:
+    queue-a:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_A
+    queue-b:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_B
+    queue-c:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_C
+  consumer:
+    name: sqs-multi-consumer
+    workloadType: Deployment

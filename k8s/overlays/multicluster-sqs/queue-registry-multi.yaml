@@ -1,0 +1,34 @@
+# Registry with 5 queue IDs for wildcard seed testing.
+# The target deployment only has env vars for queue-a, queue-b, queue-c.
+# queue-d and queue-e are defined here but won't be resolvable, so the
+# operator will only discover 3 actual queues from the target.
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordWorkloadQueueRegistry
+metadata:
+  name: sqs-multi-registry
+  namespace: test-multicluster
+spec:
+  queues:
+    queue-a:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_A
+    queue-b:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_B
+    queue-c:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_C
+    queue-d:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_D
+    queue-e:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_E
+  consumer:
+    name: sqs-multi-consumer
+    workloadType: Deployment

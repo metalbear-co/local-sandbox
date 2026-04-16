@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql-test
+  labels:
+    app: mysql-test
+spec:
+  containers:
+    - name: mysql
+      image: mysql/mysql-server:5.7
+      env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: examplepassword
+        - name: MYSQL_DATABASE
+          value: user
+      ports:
+        - containerPort: 3306
+      readinessProbe:
+        exec:
+          command: ["mysqladmin", "ping", "-h", "localhost"]
+        initialDelaySeconds: 10
+        periodSeconds: 5
+      volumeMounts:
+        - name: mysql-storage
+          mountPath: /var/lib/mysql
+  volumes:
+    - name: mysql-storage
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-test
+spec:
+  selector:
+    app: mysql-test
+  ports:
+    - port: 3306
+      targetPort: 3306

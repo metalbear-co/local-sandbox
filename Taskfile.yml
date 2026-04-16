@@ -30,6 +30,9 @@ includes:
   rmq:
     taskfile: ./tasks/Taskfile.rmq.yml
     dir: ./tasks
+  pubsub:
+    taskfile: ./tasks/Taskfile.pubsub.yml
+    dir: ./tasks
   eks:
     taskfile: ./tasks/Taskfile.eks.yml
     dir: ./tasks
@@ -43,7 +46,7 @@ vars:
   MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
   CHART_VERSION:
-    sh: grep "appVersion:" {{.CHARTS_DIR}}/Chart.yaml | awk '{print $2}' | tr -d '"'
+    sh: grep "appVersion:" "$(pwd)/../operator/public/charts/mirrord-operator/Chart.yaml" | awk '{print $2}' | tr -d '"'
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
@@ -417,6 +420,22 @@ tasks:
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator
 
+  operator:use:
+    desc: Pull a released operator image by version and deploy it
+    vars:
+      VERSION: '{{.VERSION | default ""}}'
+    preconditions:
+      - sh: test -n "{{.VERSION}}"
+        msg: "VERSION is required. Usage: task operator:use VERSION=3.152.0"
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} pull ghcr.io/metalbear-co/operator:{{.VERSION}}"
+      - "{{.CONTAINER_RUNTIME}} tag ghcr.io/metalbear-co/operator:{{.VERSION}} mirrord-operator:{{.CHART_VERSION}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
+      - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - task: _wait:operator
+
   operator:image:load:
     desc: Tag and load operator image into minikube
     cmds:
@@ -439,6 +458,123 @@ tasks:
       # Force pod restart to pick up any changes
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator
+
+  preview:deploy:echo-app:
+    desc: Build and deploy echo-app to bearkube for preview testing
+    cmds:
+      - cd {{.ROOT_DIR}}/apps/echo-app && {{.CONTAINER_RUNTIME}} build -t echo-app:latest .
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi echo-app:latest --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load echo-app:latest
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app
+          labels:
+            app: echo-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: echo-app
+          template:
+            metadata:
+              labels:
+                app: echo-app
+            spec:
+              containers:
+              - name: echo
+                image: echo-app:latest
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 8080
+                env:
+                - name: CLUSTER_ID
+                  value: "bearkube"
+                - name: PORT
+                  value: "8080"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: echo-app
+        spec:
+          selector:
+            app: echo-app
+          ports:
+          - port: 8080
+            targetPort: 8080
+        EOF
+      - kubectl wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=120s
+
+  preview:start:
+    desc: Start a preview environment on bearkube (single-cluster)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.ROOT_DIR}}/apps/echo-app/mirrord-preview-single.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:status:
+    desc: Show preview session status on bearkube
+    cmds:
+      - kubectl get previewsessions -n {{.NAMESPACE}} 2>/dev/null || echo "No preview sessions"
+      - kubectl get pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "No preview pods"
+
+  preview:stop:
+    desc: Stop a preview environment on bearkube
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+    cmds:
+      - "{{.MIRRORD_BIN}} preview stop -k \"{{.PREVIEW_KEY}}\" || true"
+
+  preview:test:traffic:
+    desc: Send traffic with preview header to echo-app on bearkube
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+    cmds:
+      - |
+        echo "Sending traffic WITH preview header (X-Preview: {{.PREVIEW_KEY}})"
+        echo "Press Ctrl+C to stop"
+        echo ""
+        i=1
+        while true; do
+          echo -n "Request $i: "
+          kubectl exec -n {{.NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-Preview: {{.PREVIEW_KEY}}" \
+            http://echo-app:8080/echo?from=preview 2>/dev/null | head -1 || echo "failed"
+          i=$((i + 1))
+          sleep 2
+        done
+
+  preview:clean:
+    desc: Remove echo-app deployment and service from bearkube
+    cmds:
+      - kubectl delete deploy/echo-app svc/echo-app -n {{.NAMESPACE}} --ignore-not-found=true
+
+  preview:test:traffic:no-header:
+    desc: Send traffic without preview header (should go to original pod)
+    cmds:
+      - |
+        echo "Sending traffic WITHOUT preview header"
+        echo "Press Ctrl+C to stop"
+        echo ""
+        i=1
+        while true; do
+          echo -n "Request $i: "
+          kubectl exec -n {{.NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- http://echo-app:8080/echo?from=normal 2>/dev/null | head -1 || echo "failed"
+          i=$((i + 1))
+          sleep 2
+        done
 
   test:mysql:
     desc: "Run MySQL test"
@@ -737,6 +873,30 @@ tasks:
       - task: license:create:secret
       - task: operator:install
       - task: sqs:deploy:aws
+
+  test:pubsub:
+    desc: "Deploy Pub/Sub emulator + consumer and install operator"
+    deps: [operator:install]
+    cmds:
+      - task: pubsub:deploy
+
+  test:pubsub:clean:
+    desc: "Clean cluster and deploy Pub/Sub from scratch"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: operator:install
+      - task: pubsub:deploy
+
+  test:pubsub:clean:nobuild:
+    desc: "Clean cluster and deploy Pub/Sub (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: pubsub:build
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: pubsub:deploy
 
   test:rmq:
     desc: "Deploy RabbitMQ Cluster Operator + cluster and install operator"

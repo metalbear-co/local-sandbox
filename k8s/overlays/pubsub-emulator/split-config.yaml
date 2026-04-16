@@ -1,0 +1,20 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: pubsub-test-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pubsub-consumer
+  clientConfigs:
+    googlePubSub: pubsub-emulator-config
+  queues:
+  - id: test-subscription
+    kind: googlePubSub
+    appConfig:
+      subscription:
+      - env: PUBSUB_SUBSCRIPTION
+      projectId:
+      - env: PUBSUB_PROJECT_ID

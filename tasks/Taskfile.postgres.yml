@@ -947,3 +947,99 @@ tasks:
         echo "Or debug branch pod:"
         echo "  task postgres:debug:branch-pod"
         echo "============================================"
+
+  test:literal-value:
+    desc: "Test literal value scenario: deploy target pod, run mirrord, verify secret"
+    cmds:
+      - task: deploy:base
+      - task: deploy:literal-value:pod
+      - echo ""
+      - echo "Environment ready. Run mirrord:"
+      - echo "  task postgres:run:local:literal-value"
+      - echo ""
+      - echo "After mirrord runs, verify:"
+      - echo "  task postgres:verify:literal-value:secret"
+      - echo ""
+      - echo "Test orphan cleanup:"
+      - echo "  task postgres:test:orphan-cleanup"
+
+  deploy:literal-value:pod:
+    desc: "Deploy target pod with individual DB env vars for literal value testing"
+    cmds:
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: pg-server-literal-value
+          labels:
+            test-scenario: literal-value
+        spec:
+          containers:
+          - name: app
+            image: busybox
+            command: ["sh", "-c", "sleep 3600"]
+            env:
+            - name: DB_HOST
+              value: "postgres-test"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              value: "postgres"
+            - name: DB_PASSWORD
+              value: "postgres"
+            - name: DB_NAME
+              value: "source_db"
+        EOF
+      - kubectl wait --for=condition=ready pod/pg-server-literal-value -n {{.NAMESPACE}} --timeout=60s
+
+  run:local:literal-value:
+    desc: "Run mirrord with literal value config"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    cmds:
+      - echo "Building PostgreSQL app..."
+      - go build -o /tmp/postgres-app main.go
+      - echo "Running with mirrord (literal value password)"
+      - '{{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-literal-value.json -- /tmp/postgres-app'
+
+  verify:literal-value:secret:
+    desc: "Verify credential secret has annotation, label, and ownerRef"
+    cmds:
+      - |
+        echo "=== Credential Secrets ==="
+        kubectl get secrets -n {{.NAMESPACE}} -l operator.metalbear.co/branch-credential=true \
+          -o custom-columns=NAME:.metadata.name,CLEANUP-AFTER:.metadata.annotations.operator\.metalbear\.co/cleanup-after,OWNERS:.metadata.ownerReferences[*].name
+        echo ""
+        echo "=== Full YAML ==="
+        kubectl get secrets -n {{.NAMESPACE}} -l operator.metalbear.co/branch-credential=true -o yaml
+
+  test:orphan-cleanup:
+    desc: "Simulate orphaned secret and watch it get cleaned up"
+    cmds:
+      - |
+        SECRET=$(kubectl get secrets -n {{.NAMESPACE}} -l operator.metalbear.co/branch-credential=true -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$SECRET" ]; then
+          echo "No credential secret found. Run 'task postgres:run:local:literal-value' first."
+          exit 1
+        fi
+        echo "Found credential secret: $SECRET"
+        echo ""
+        echo "1. Removing ownerReferences (simulating CLI crash)..."
+        kubectl patch secret $SECRET -n {{.NAMESPACE}} --type=json \
+          -p='[{"op":"remove","path":"/metadata/ownerReferences"}]' 2>/dev/null || \
+          echo "   (no ownerReferences to remove)"
+        echo ""
+        echo "2. Setting cleanup-after to a past timestamp..."
+        kubectl annotate secret $SECRET -n {{.NAMESPACE}} --overwrite \
+          operator.metalbear.co/cleanup-after="2020-01-01T00:00:00Z"
+        echo ""
+        echo "3. Watching for deletion (sweep runs every 5s)..."
+        echo "   Press Ctrl+C when done."
+        kubectl get secrets -n {{.NAMESPACE}} -l operator.metalbear.co/branch-credential=true -w
+
+  clean:literal-value:
+    desc: "Clean literal value test resources"
+    cmds:
+      - kubectl delete pod pg-server-literal-value -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete branchdatabase -l mirrord.metalbear.co/branch-id=pg-literal-value-test -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete secrets -l operator.metalbear.co/branch-credential=true -n {{.NAMESPACE}} --ignore-not-found=true
