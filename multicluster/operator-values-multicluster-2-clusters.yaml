@@ -9,6 +9,7 @@ operator:
   image: mirrord-operator
   sqsSplitting: true
   kafkaSplitting: true
+  gcpPubsubSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true

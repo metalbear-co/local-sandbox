@@ -1043,3 +1043,83 @@ tasks:
       - kubectl delete pod pg-server-literal-value -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete branchdatabase -l mirrord.metalbear.co/branch-id=pg-literal-value-test -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete secrets -l operator.metalbear.co/branch-credential=true -n {{.NAMESPACE}} --ignore-not-found=true
+
+  # literal-value WITHOUT password on the target pod.
+  # The target pod has no DB_PASSWORD env var. The mirrord config supplies
+  # the password as a literal value. The expectation is that mirrord/operator
+  # creates a credential Secret and exposes it to the local app (via
+  # secretKeyRef on the relevant pod, resolved by Kubernetes), so that the
+  # app's os.Getenv("DB_PASSWORD") returns "postgres" and the connection
+  # to the branch DB succeeds. If the app fails with
+  # `required env var DB_PASSWORD is not set`, the literal-value flow is
+  # broken end-to-end.
+
+  test:literal-value:no-pass:
+    desc: "Literal-value test where target pod has NO DB_PASSWORD"
+    cmds:
+      - task: deploy:base
+      - task: deploy:literal-value:no-pass:pod
+      - echo ""
+      - echo "Target pod is up WITHOUT DB_PASSWORD. Now run:"
+      - echo "  task postgres:run:local:literal-value:no-pass"
+      - echo ""
+      - echo "After it runs, check the credential Secret with:"
+      - echo "  task postgres:verify:literal-value:secret"
+
+  deploy:literal-value:no-pass:pod:
+    desc: "Deploy a target pod that exposes DB params except DB_PASSWORD. DB_USER is sourced from a user-managed Secret via secretKeyRef to verify the Env-via-secretKeyRef + literal-value combination works end-to-end."
+    cmds:
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: v1
+        kind: Secret
+        metadata:
+          name: pg-user-secret
+        type: Opaque
+        stringData:
+          username: "postgres"
+        EOF
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: pg-server-no-pass
+          labels:
+            test-scenario: literal-value-no-pass
+        spec:
+          containers:
+          - name: app
+            image: busybox
+            command: ["sh", "-c", "sleep 3600"]
+            env:
+            - name: DB_HOST
+              value: "postgres-test"
+            - name: DB_PORT
+              value: "5432"
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: pg-user-secret
+                  key: username
+            - name: DB_NAME
+              value: "source_db"
+        EOF
+      - kubectl wait --for=condition=ready pod/pg-server-no-pass -n {{.NAMESPACE}} --timeout=60s
+
+  run:local:literal-value:no-pass:
+    desc: "Run the params app via mirrord, expecting DB_PASSWORD from the literal value"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app-params'
+    cmds:
+      - echo "Building postgres-app-params..."
+      - go build -o /tmp/postgres-app-params main.go
+      - echo "Running with mirrord (literal-value, target pod has no DB_PASSWORD)"
+      - '{{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-literal-value-no-pass.json -- /tmp/postgres-app-params'
+
+  clean:literal-value:no-pass:
+    desc: "Clean literal-value-no-pass test resources"
+    cmds:
+      - kubectl delete pod pg-server-no-pass -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete secret pg-user-secret -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete branchdatabase -l mirrord.metalbear.co/branch-id=pg-literal-value-no-pass -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete secrets -l operator.metalbear.co/branch-credential=true -n {{.NAMESPACE}} --ignore-not-found=true

@@ -9,6 +9,7 @@ operator:
   image: mirrord-operator
   sqsSplitting: true
   kafkaSplitting: true
+  gcpPubsubSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true
@@ -18,7 +19,7 @@ operator:
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true
-  logLevel: "warn,operator=debug,operator_workload_patch=debug,operator_context=debug"
+  logLevel: "warn,operator=debug,mirrord=debug,operator_sqs_splitting::forwarder=trace"
   # Note: hostNetwork and hostAliases are patched via kubectl after helm install (not in chart)
   # AWS credentials for LocalStack (SQS splitting tests)
   # Note: AWS_ENDPOINT_URL is set via --set in the task (NodePort URL)
@@ -28,8 +29,8 @@ operator:
     AWS_REGION: "us-east-1"
   multiCluster:
     enabled: true
-    clusterName: "mirrord-primary"
-    defaultCluster: "mirrord-remote-1" # Default cluster for stateful ops
+    defaultCluster: "mirrord-remote-1"
+    clusterName: "mirrord-primary" # Default cluster for stateful ops
     managementOnly: true # Primary only runs Envoy
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700 # 45 minutes

@@ -1,0 +1,39 @@
+apiVersion: dbs.mirrord.metalbear.co/v1alpha1
+kind: PgBranchDatabase
+metadata:
+  name: pg-test-branch-pattern-composite
+  namespace: test-mirrord
+spec:
+  id: pattern-composite
+  ttlSecs: 3600
+  postgresVersion: "17"
+  databaseName: "bear_custom_db"
+  target:
+    pod: pg-server-pattern-composite
+    container: app
+  connectionSource:
+    params:
+      host:
+      - envPattern:
+          container: app
+          variable: DB_SERVER
+          valuePattern: "^(?P<host>[^:]+):(?P<port>\\d+)$"
+      port:
+      - envPattern:
+          container: app
+          variable: DB_SERVER
+          valuePattern: "^(?P<host>[^:]+):(?P<port>\\d+)$"
+      user:
+      - env:
+          container: app
+          variable: DB_USER
+      password:
+      - env:
+          container: app
+          variable: DB_PASSWORD
+      database:
+      - env:
+          container: app
+          variable: DB_NAME
+  copy:
+    mode: all

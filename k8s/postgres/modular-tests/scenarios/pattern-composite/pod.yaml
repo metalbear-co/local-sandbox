@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-server-pattern-composite
+  namespace: test-mirrord
+  labels:
+    test-scenario: pattern-composite
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres pattern-composite scenario running' && sleep 3600"]
+    env:
+    - name: DB_SERVER
+      value: "postgres-test:5432"
+    - name: DB_USER
+      value: "postgres"
+    - name: DB_PASSWORD
+      value: "postgres"
+    - name: DB_NAME
+      value: "source_db"

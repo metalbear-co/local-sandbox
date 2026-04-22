@@ -1,0 +1,33 @@
+{
+  "operator": true,
+  "target": {
+    "path": { "pod": "pg-server-pattern-composite" },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": { "incoming": "off", "outgoing": true },
+    "db_branches": [
+      {
+        "id": "pg-test-branch-pattern-composite",
+        "name": "bear_custom_db",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "type": "env",
+          "params": {
+            "host": { "env_var_name": "DB_SERVER", "value_pattern": "^(?P<host>[^:]+):(?P<port>\\d+)$" },
+            "port": { "env_var_name": "DB_SERVER", "value_pattern": "^(?P<host>[^:]+):(?P<port>\\d+)$" },
+            "user": "DB_USER",
+            "password": "DB_PASSWORD",
+            "database": "DB_NAME"
+          }
+        },
+        "copy": { "mode": "all" }
+      }
+    ]
+  }
+}
