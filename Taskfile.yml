@@ -1,5 +1,9 @@
 version: "3"
 
+shell:
+  - bash
+  - -c
+
 dotenv: [".env"]
 
 includes:
@@ -660,41 +664,6 @@ tasks:
       - task: operator:install:nobuild
       - task: postgres:test
 
-  test:postgres:ssl:setup:
-    desc: Generate SSL certificates for PostgreSQL SSL tests
-    cmds:
-      - chmod +x {{.ROOT_DIR}}/k8s/postgres/ssl-tests/generate-ssl-certs.sh
-      - cd {{.ROOT_DIR}}/k8s/postgres/ssl-tests && ./generate-ssl-certs.sh
-      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
-      - kubectl create secret generic postgres-ssl-certs -n {{.NAMESPACE}} --from-file=server.crt={{.ROOT_DIR}}/k8s/postgres/ssl-tests/certs/server.crt --from-file=server.key={{.ROOT_DIR}}/k8s/postgres/ssl-tests/certs/server.key --dry-run=client -o yaml | kubectl apply -f -
-
-  test:postgres:ssl:deploy:
-    desc: Deploy PostgreSQL with SSL
-    deps: [test:postgres:ssl:setup]
-    cmds:
-      - kubectl apply -f {{.ROOT_DIR}}/k8s/postgres/ssl-tests/postgres-ssl-test.yaml
-      - kubectl wait --for=condition=ready pod/postgres-ssl-test -n {{.NAMESPACE}} --timeout=120s
-      - kubectl wait --for=condition=ready pod/pg-ssl-server-env-val -n {{.NAMESPACE}} --timeout=60s
-
-  test:postgres:ssl:verify:
-    desc: Verify PostgreSQL SSL
-    cmds:
-      - echo "=== SSL Status ==="
-      - kubectl exec -n {{.NAMESPACE}} postgres-ssl-test -- psql -U postgres -d source_db -c "SHOW ssl;"
-      - echo ""
-      - echo "=== SSL Connection Test ==="
-      - kubectl exec -n {{.NAMESPACE}} postgres-ssl-test -- psql "postgresql://postgres:postgres@localhost:5432/source_db?sslmode=require" -c "SELECT 'SSL works!' as result;"
-
-  test:postgres:ssl:clean:
-    desc: "Clean cluster and run PostgreSQL SSL test"
-    cmds:
-      - task: cluster:delete
-      - task: cluster:create
-      - task: build:app:postgres
-      - task: operator:install
-      - task: test:postgres:ssl:deploy
-      - task: test:postgres:ssl:verify
-
   test:postgres:aws:
     desc: "Deploy AWS RDS target with operator"
     deps: [operator:install]
@@ -1137,16 +1106,6 @@ tasks:
       - |
         {{.MIRRORD_BIN | default "mirrord"}} exec -f {{.ROOT_DIR}}/k8s/overlays/sqs-localstack/copy-target-config.json -- sleep 600
 
-  test:tls:certs:
-    desc: Test TLS certificate configuration
-    cmds:
-      - "{{.SCRIPTS_DIR}}/test-tls-certificates.sh"
-
-  test:tls:quick:
-    desc: Quick TLS test
-    cmds:
-      - "{{.SCRIPTS_DIR}}/quick-tls-test.sh"
-
   clean:namespaces:
     desc: Delete all test namespaces
     cmds:
@@ -1426,6 +1385,426 @@ tasks:
       - kubectl delete -k {{.PLAYGROUND_DIR}}/base/ip-info --ignore-not-found=true
       - kubectl delete -k {{.PLAYGROUND_DIR}}/base/kafka --ignore-not-found=true
       - kubectl delete -k {{.PLAYGROUND_DIR}}/base/redis --ignore-not-found=true
+
+  check:
+    desc: Verify prerequisites and offer to install missing ones
+    interactive: true
+    cmds:
+      - |
+        MISSING=()
+
+        declare -A BREW_NAMES
+        BREW_NAMES[minikube]=minikube
+        BREW_NAMES[kubectl]=kubectl
+        BREW_NAMES[helm]=helm
+        BREW_NAMES[docker]=docker
+        BREW_NAMES[go-task]=go-task
+        BREW_NAMES[fzf]=fzf
+
+        echo "=== Prerequisites ==="
+        for tool in minikube kubectl helm docker fzf; do
+          if command -v "$tool" &>/dev/null; then
+            echo "  [ok] $tool ($(command -v $tool))"
+          else
+            echo "  [MISSING] $tool"
+            MISSING+=("$tool")
+          fi
+        done
+        if command -v task &>/dev/null; then
+          echo "  [ok] task ($(command -v task))"
+        else
+          echo "  [MISSING] task (go-task)"
+          MISSING+=("go-task")
+        fi
+        echo ""
+
+        if [ ${#MISSING[@]} -gt 0 ]; then
+          echo "Missing tools: ${MISSING[*]}"
+          echo ""
+          if command -v fzf &>/dev/null; then
+            ACTION=$(echo -e "Install all (brew install ${MISSING[*]})\nPick individually\nSkip" | \
+              fzf --height=6 --reverse --prompt="install? ")
+          else
+            echo "  1) Install all (brew install ${MISSING[*]})"
+            echo "  2) Pick individually"
+            echo "  3) Skip"
+            read -p "  Choice [1/2/3]: " choice
+            case "$choice" in
+              1) ACTION="Install all" ;;
+              2) ACTION="Pick" ;;
+              *) ACTION="Skip" ;;
+            esac
+          fi
+
+          if [[ "$ACTION" == Install* ]]; then
+            for pkg in "${MISSING[@]}"; do
+              BREW_PKG="${BREW_NAMES[$pkg]:-$pkg}"
+              echo "  brew install $BREW_PKG..."
+              brew install "$BREW_PKG"
+            done
+          elif [[ "$ACTION" == Pick* ]]; then
+            for pkg in "${MISSING[@]}"; do
+              BREW_PKG="${BREW_NAMES[$pkg]:-$pkg}"
+              read -p "  Install $pkg? (y/n) " yn
+              if [ "$yn" = "y" ]; then
+                brew install "$BREW_PKG"
+              fi
+            done
+          fi
+          echo ""
+        fi
+
+        echo "=== Cluster ==="
+        if minikube -p {{.CLUSTER_NAME}} status &>/dev/null; then
+          echo "  [ok] minikube profile '{{.CLUSTER_NAME}}' is running"
+        else
+          echo "  [warn] minikube profile '{{.CLUSTER_NAME}}' is not running"
+          echo "         Run 'task cluster:create' to start it"
+        fi
+        echo ""
+
+        echo "=== License ==="
+        if [ -f "{{.SCRIPTS_DIR}}/company-license.pem" ]; then
+          echo "  [ok] License file exists"
+        else
+          echo "  [MISSING] Run 'task license:generate'"
+        fi
+
+        echo "=== .env ==="
+        if [ -f .env ]; then
+          echo "  [ok] .env exists"
+        else
+          echo "  [MISSING] Run 'cp .env.example .env'"
+          read -p "  Create .env from .env.example now? (y/n) " yn
+          if [ "$yn" = "y" ]; then
+            cp .env.example .env
+            echo "  Created .env -- edit it with your settings"
+          fi
+        fi
+
+  up:
+    desc: "Interactive setup: pick a module, cluster mode, build mode -- all via fzf"
+    interactive: true
+    vars:
+      MODULE: '{{.MODULE | default ""}}'
+      FRESH: '{{.FRESH | default ""}}'
+      BUILD: '{{.BUILD | default ""}}'
+    cmds:
+      - |
+        set +e
+
+        _fzf_or_select() {
+          local label="$1" prompt="$2" height="$3"
+          if command -v fzf &>/dev/null; then
+            fzf --ansi --height="$height" --reverse --border \
+                --border-label=" $label " \
+                --prompt="$prompt> "
+          else
+            cat -n >&2
+            read -p "$prompt [number]: " choice </dev/tty
+            sed -n "${choice}p"
+          fi
+        }
+
+        # Auto-discover single-cluster modules from root test:<name> tasks
+        SC_MODULES=$(task --list-all 2>/dev/null | \
+          grep -E '^\* test:\w+: ' | \
+          grep -v ':clean\|:quick\|:nobuild\|:aws\|:gcp\|:ssl\|:local\|:setup\|:all\|:copy\|:default\|:multicluster' | \
+          sed 's/^\* test://;s/:  */\t/' | \
+          sort)
+
+        # Auto-discover multicluster setup variants (exclude :clean variants to avoid duplicates)
+        MC_SETUPS=$(task --list-all 2>/dev/null | \
+          grep -E '^\* multicluster:setup:all' | \
+          grep -v ':clean' | \
+          sed 's/^\* //' | \
+          awk '{name=$1; sub(/:$/,"",name); desc=""; for(i=2;i<=NF;i++) desc=desc (desc?" ":"") $i; print name "\t" desc}')
+
+        # EKS setup
+        EKS_SETUP=$(task --list-all 2>/dev/null | \
+          grep -E '^\* eks:setup:all: ' | head -1 | \
+          sed 's/^\* //' | \
+          awk '{name=$1; sub(/:$/,"",name); desc=""; for(i=2;i<=NF;i++) desc=desc (desc?" ":"") $i; print name "\t" desc}')
+
+        # Build the combined picker list with colored names + descriptions
+        OPTIONS=""
+        while IFS=$'\t' read -r name desc; do
+          [ -z "$name" ] && continue
+          OPTIONS="${OPTIONS}$(printf '\033[36m%-45s \033[90m%s\033[0m' "$name" "$desc")\n"
+        done <<< "$SC_MODULES"
+        if [ -n "$MC_SETUPS" ]; then
+          OPTIONS="${OPTIONS}\033[33m--- multi-cluster ---\033[0m\n"
+          while IFS=$'\t' read -r name desc; do
+            [ -z "$name" ] && continue
+            OPTIONS="${OPTIONS}$(printf '\033[36m%-45s \033[90m%s\033[0m' "$name" "$desc")\n"
+          done <<< "$MC_SETUPS"
+        fi
+        if [ -n "$EKS_SETUP" ]; then
+          IFS=$'\t' read -r ename edesc <<< "$EKS_SETUP"
+          OPTIONS="${OPTIONS}\033[33m--- eks ---\033[0m\n"
+          OPTIONS="${OPTIONS}$(printf '\033[36m%-45s \033[90m%s\033[0m' "$ename" "$edesc")\n"
+        fi
+
+        MOD="{{.MODULE}}"
+        if [ -z "$MOD" ]; then
+          SELECTED=$(printf "$OPTIONS" | _fzf_or_select "pick module" "module" 25)
+          [ -z "$SELECTED" ] && echo "Cancelled." && exit 0
+          MOD=$(echo "$SELECTED" | awk '{print $1}')
+          [ -z "$MOD" ] || [[ "$MOD" == ---* ]] && echo "Cancelled." && exit 0
+        fi
+        echo "Module: $MOD"
+
+        # Determine if this is a multicluster/eks task (has colons) or single-cluster module
+        IS_DIRECT=false
+        case "$MOD" in
+          *:*) IS_DIRECT=true ;;
+        esac
+
+        if $IS_DIRECT; then
+          # Multicluster / EKS: run the task directly
+          set -e
+          HIST="{{.ROOT_DIR}}/.task-history"
+          echo "$(date +%s)|$MOD" >> "$HIST"
+          tail -200 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+          echo ""
+          echo "==> $MOD"
+          echo ""
+          task "$MOD"
+        else
+          # Single-cluster module: ask about fresh/build
+          FRESH_VAL="{{.FRESH}}"
+          if [ -z "$FRESH_VAL" ]; then
+            FRESH_LINE=$(printf '%s\n' "no  (keep current cluster)" "yes (delete + recreate cluster)" | \
+              _fzf_or_select "fresh cluster?" "fresh" 10)
+            FRESH_VAL=$(echo "$FRESH_LINE" | awk '{print $1}')
+            [ -z "$FRESH_VAL" ] && echo "Cancelled." && exit 0
+          fi
+
+          BUILD_VAL="{{.BUILD}}"
+          if [ -z "$BUILD_VAL" ]; then
+            BUILD_LINE=$(printf '%s\n' "yes (rebuild operator)" "no  (skip build, use existing image)" | \
+              _fzf_or_select "build operator?" "build" 10)
+            BUILD_VAL=$(echo "$BUILD_LINE" | awk '{print $1}')
+            [ -z "$BUILD_VAL" ] && echo "Cancelled." && exit 0
+          fi
+
+          set -e
+
+          HIST="{{.ROOT_DIR}}/.task-history"
+          echo "$(date +%s)|up MODULE=$MOD FRESH=$FRESH_VAL BUILD=$BUILD_VAL" >> "$HIST"
+          tail -200 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+
+          echo ""
+          echo "==> module=$MOD  fresh=$FRESH_VAL  build=$BUILD_VAL"
+          echo ""
+
+          if [ "$FRESH_VAL" = "yes" ]; then
+            task cluster:delete
+            task cluster:create
+          fi
+
+          if [ "$BUILD_VAL" = "yes" ]; then
+            task operator:install
+          else
+            task operator:install:nobuild
+          fi
+
+          task "test:$MOD"
+        fi
+
+  dashboard:
+    desc: Full environment overview - cluster, operator, all mirrord CRDs (multi-cluster aware)
+    cmds:
+      - |
+        set +e
+        echo "========================================="
+        echo "  LOCAL SANDBOX STATUS"
+        echo "========================================="
+        echo ""
+
+        CURRENT_CTX=$(kubectl config current-context 2>/dev/null || echo 'none')
+        echo "--- Context ---"
+        echo "Current:   $CURRENT_CTX"
+        echo ""
+
+        echo "--- Minikube Profiles ---"
+        minikube profile list 2>/dev/null | head -15 || echo "No profiles"
+        echo ""
+
+        # Detect all mirrord-related contexts (multicluster profiles + single-cluster)
+        MC_CONTEXTS=$(kubectl config get-contexts -o name 2>/dev/null | grep -E '^mirrord-' | sort)
+        if [ -n "$MC_CONTEXTS" ]; then
+          CONTEXTS="$MC_CONTEXTS"
+        else
+          CONTEXTS="$CURRENT_CTX"
+        fi
+
+        _show_cluster_status() {
+          local ctx="$1"
+          local ns="$2"
+
+          echo "--- Operator ($ctx) ---"
+          OP_POD=$(kubectl --context "$ctx" get pod -n mirrord -l app=mirrord-operator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+          if [ -n "$OP_POD" ]; then
+            OP_IMAGE=$(kubectl --context "$ctx" get pod "$OP_POD" -n mirrord -o jsonpath='{.spec.containers[0].image}' 2>/dev/null)
+            OP_STATUS=$(kubectl --context "$ctx" get pod "$OP_POD" -n mirrord -o jsonpath='{.status.phase}' 2>/dev/null)
+            OP_RESTARTS=$(kubectl --context "$ctx" get pod "$OP_POD" -n mirrord -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null)
+            echo "  Pod:    $OP_POD ($OP_STATUS, restarts: $OP_RESTARTS)"
+            echo "  Image:  $OP_IMAGE"
+          else
+            echo "  Not installed"
+          fi
+          echo ""
+
+          # Find the test namespace (single-cluster uses test-mirrord, multicluster uses test-multicluster)
+          for try_ns in "$ns" test-multicluster test-mirrord; do
+            WL=$(kubectl --context "$ctx" get deploy,statefulset --no-headers -n "$try_ns" 2>/dev/null)
+            if [ -n "$WL" ]; then
+              echo "--- Workloads ($ctx / $try_ns) ---"
+              echo "$WL"
+              echo ""
+              NS_FOR_CRDS="$try_ns"
+              break
+            fi
+          done
+          NS_FOR_CRDS="${NS_FOR_CRDS:-$ns}"
+
+          echo "--- Mirrord CRDs ($ctx) ---"
+          CRDS=$(kubectl --context "$ctx" api-resources --api-group=mirrord.metalbear.co -o name 2>/dev/null; \
+                 kubectl --context "$ctx" api-resources --api-group=policies.mirrord.metalbear.co -o name 2>/dev/null; \
+                 kubectl --context "$ctx" api-resources --api-group=queues.mirrord.metalbear.co -o name 2>/dev/null; \
+                 kubectl --context "$ctx" api-resources --api-group=profiles.mirrord.metalbear.co -o name 2>/dev/null; \
+                 kubectl --context "$ctx" api-resources --api-group=dbs.mirrord.metalbear.co -o name 2>/dev/null; \
+                 kubectl --context "$ctx" api-resources --api-group=preview.mirrord.metalbear.co -o name 2>/dev/null)
+
+          if [ -z "$CRDS" ]; then
+            echo "  No mirrord CRDs found"
+          else
+            for CRD in $CRDS; do
+              ITEMS=$(kubectl --context "$ctx" get "$CRD" -n "$NS_FOR_CRDS" --no-headers 2>/dev/null)
+              if [ -z "$ITEMS" ]; then
+                ITEMS=$(kubectl --context "$ctx" get "$CRD" --all-namespaces --no-headers 2>/dev/null)
+              fi
+              SHORT=$(echo "$CRD" | cut -d. -f1)
+              COUNT=0
+              if [ -n "$ITEMS" ]; then
+                COUNT=$(echo "$ITEMS" | grep -c . 2>/dev/null || echo 0)
+              fi
+              if [ "$COUNT" -gt 0 ]; then
+                echo "  $SHORT ($COUNT):"
+                echo "$ITEMS" | sed 's/^/    /'
+              fi
+            done
+            echo ""
+          fi
+
+          PROBLEMS=$(kubectl --context "$ctx" get pods --all-namespaces --no-headers 2>/dev/null | grep -v "Running\|Completed")
+          if [ -n "$PROBLEMS" ]; then
+            echo "--- Problem Pods ($ctx) ---"
+            echo "$PROBLEMS"
+            echo ""
+          fi
+        }
+
+        for CTX in $CONTEXTS; do
+          echo "========================================="
+          echo "  CLUSTER: $CTX"
+          echo "========================================="
+          echo ""
+          _show_cluster_status "$CTX" "{{.NAMESPACE}}"
+        done
+
+        echo "--- Recent Warnings ($CURRENT_CTX) ---"
+        kubectl get events --all-namespaces --field-selector type!=Normal --sort-by='.lastTimestamp' 2>/dev/null | tail -5 || echo "  No warnings"
+
+  menu:
+    desc: Interactive task picker with colored descriptions (requires fzf)
+    interactive: true
+    cmds:
+      - |
+        SELECTED=$(task --list-all | tail -n +2 | \
+          sed 's/^\* //' | \
+          awk -F': +' '{printf "\033[36m%-45s \033[90m%s\033[0m\n", $1, $2}' | \
+          fzf --ansi --height=40% --reverse \
+              --border --border-label=" task menu " \
+              --header="Type to search by name or description. Enter to run, Esc to cancel." \
+              --prompt="task> " \
+              --preview-window=hidden | \
+          awk '{print $1}')
+        if [ -n "$SELECTED" ]; then
+          HIST="{{.ROOT_DIR}}/.task-history"
+          echo "$(date +%s)|$SELECTED" >> "$HIST"
+          tail -200 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+          echo "Running: task $SELECTED"
+          task "$SELECTED"
+        fi
+
+  menu:module:
+    desc: Pick a module, then pick a task within it
+    interactive: true
+    cmds:
+      - |
+        MODULE=$(echo "postgres mysql mssql mongodb sqs kafka redis rmq pubsub multicluster eks" | \
+          tr ' ' '\n' | \
+          fzf --height=20% --reverse --border \
+              --border-label=" pick module " \
+              --prompt="module> ")
+        if [ -n "$MODULE" ]; then
+          SELECTED=$(task --list-all | tail -n +2 | \
+            grep "$MODULE" | \
+            sed 's/^\* //' | \
+            awk -F': +' '{printf "\033[36m%-45s \033[90m%s\033[0m\n", $1, $2}' | \
+            fzf --ansi --height=40% --reverse \
+                --border --border-label=" $MODULE tasks " \
+                --header="Type to search. Enter to run, Esc to cancel." \
+                --prompt="$MODULE> " \
+                --preview-window=hidden | \
+            awk '{print $1}')
+          if [ -n "$SELECTED" ]; then
+            HIST="{{.ROOT_DIR}}/.task-history"
+            echo "$(date +%s)|$SELECTED" >> "$HIST"
+            tail -200 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
+            echo "Running: task $SELECTED"
+            task "$SELECTED"
+          fi
+        fi
+
+  recent:
+    desc: Re-run a recently used task (shows name + args + time)
+    interactive: true
+    cmds:
+      - |
+        HISTORY_FILE="{{.ROOT_DIR}}/.task-history"
+        if [ ! -f "$HISTORY_FILE" ]; then
+          echo "No history yet. Run 'task menu' or 'task up' first."
+          exit 0
+        fi
+
+        NOW=$(date +%s)
+        DISPLAY=$(tac "$HISTORY_FILE" | awk -F'|' '!seen[$2]++' | head -30 | while IFS='|' read -r ts cmd; do
+          DIFF=$(( NOW - ts ))
+          if [ "$DIFF" -lt 60 ]; then
+            AGE="${DIFF}s ago"
+          elif [ "$DIFF" -lt 3600 ]; then
+            AGE="$(( DIFF / 60 ))m ago"
+          elif [ "$DIFF" -lt 86400 ]; then
+            AGE="$(( DIFF / 3600 ))h ago"
+          else
+            AGE="$(( DIFF / 86400 ))d ago"
+          fi
+          printf "\033[90m%-9s\033[0m \033[36m%s\033[0m\n" "$AGE" "$cmd"
+        done)
+
+        SELECTED=$(echo "$DISPLAY" | \
+          fzf --ansi --height=25 --reverse --border \
+              --border-label=" recent tasks " \
+              --header="Pick a task to re-run. Esc to cancel." \
+              --prompt="recent> " | \
+          sed 's/^[^ ]* *//')
+        if [ -n "$SELECTED" ]; then
+          echo "Running: task $SELECTED"
+          task $SELECTED
+        fi
 
   _wait:operator:
     internal: true

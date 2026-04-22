@@ -2,6 +2,37 @@
 
 Local testing environment for mirrord operator features.
 
+## Quick Start
+
+### First Time
+
+```bash
+task check          # verify prerequisites, install missing tools
+task license:generate
+task cluster:create
+```
+
+### Day-to-Day
+
+| Command | What it does |
+|---------|-------------|
+| `task menu` | Fuzzy-search all tasks -- type fragments, pick with arrow keys |
+| `task menu:module` | Pick a module first (postgres, sqs, ...), then pick a task |
+| `task up` | Interactive test setup -- pick module, fresh cluster?, build? |
+| `task dashboard` | See everything: cluster, operator, all CRDs, problem pods |
+| `task recent` | Re-run a past task (shows name + args + "2h ago") |
+| `task check` | Validate env, offer to install missing tools |
+
+### Examples
+
+```bash
+task menu                              # forgot the command? fuzzy search
+task up                                # interactive: pick postgres, fresh=no, build=yes
+task up MODULE=postgres                # skip module picker
+task dashboard                         # what's running right now?
+task recent                            # re-run something from earlier
+```
+
 ## Prerequisites
 
 - minikube
