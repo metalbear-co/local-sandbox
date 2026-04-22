@@ -11,8 +11,8 @@
 #
 # ## Usage
 #
-#   task multicluster:setup:all                # 2 clusters (primary + 1 remote)
-#   NUM_CLUSTERS=3 task multicluster:setup:all # 3 clusters (primary + 2 remotes)
+#   task multicluster:setup:all                        # 2 clusters (primary + 1 remote)
+#   MC_NUM_CLUSTERS=3 task multicluster:setup:all      # 3 clusters (primary + 2 remotes)
 #
 #   task multicluster:test:generate:traffic    # Generate traffic
 #   task multicluster:test:steal:multi-cluster # Steal from all clusters
@@ -32,10 +32,10 @@
 #
 # ## Variables
 #
-#   NUM_CLUSTERS=2|3        - Number of clusters (default: 2)
-#   PRIMARY_CLUSTER         - Name of primary cluster (default: mirrord-primary)
-#   REMOTE_CLUSTER_1        - Name of first remote cluster (default: mirrord-remote-1)
-#   REMOTE_CLUSTER_2        - Name of second remote cluster (default: mirrord-remote-2)
+#   MC_NUM_CLUSTERS=2|3     - Number of clusters (default: 2)
+#   MC_PRIMARY              - Name of primary cluster (default: mirrord-primary)
+#   MC_REMOTE_1             - Name of first remote cluster (default: mirrord-remote-1)
+#   MC_REMOTE_2             - Name of second remote cluster (default: mirrord-remote-2)
 #
 # ## Architecture
 #
@@ -53,17 +53,23 @@ vars:
   APPS_DIR: "{{.ROOT_DIR}}/apps"
   K8S_DIR: "{{.ROOT_DIR}}/k8s"
 
-  PRIMARY_CLUSTER: '{{.PRIMARY_CLUSTER | default "mirrord-primary"}}'
-  REMOTE_CLUSTER_1: '{{.REMOTE_CLUSTER_1 | default "mirrord-remote-1"}}'
-  REMOTE_CLUSTER_2: '{{.REMOTE_CLUSTER_2 | default "mirrord-remote-2"}}'
+  # Cluster names default to the local minikube profiles. To override for a
+  # different environment (e.g. EKS), pass them as Task variables:
+  #   task multicluster:setup:all PRIMARY_CLUSTER=eks-primary REMOTE_CLUSTER_1=eks-remote-1
+  # Shell env vars with the same names (e.g. export REMOTE_CLUSTER_1=eks-remote-1)
+  # would silently override these defaults, so we read from MC_PRIMARY /
+  # MC_REMOTE_1 / MC_REMOTE_2 instead to avoid accidental leaks.
+  PRIMARY_CLUSTER: '{{.MC_PRIMARY | default "mirrord-primary"}}'
+  REMOTE_CLUSTER_1: '{{.MC_REMOTE_1 | default "mirrord-remote-1"}}'
+  REMOTE_CLUSTER_2: '{{.MC_REMOTE_2 | default "mirrord-remote-2"}}'
 
   # Number of clusters: 2 (primary + 1 remote) or 3 (primary + 2 remotes)
-  # Usage: NUM_CLUSTERS=3 task multicluster:setup
-  NUM_CLUSTERS: '{{.NUM_CLUSTERS | default "2"}}'
+  # Usage: MC_NUM_CLUSTERS=3 task multicluster:setup
+  NUM_CLUSTERS: '{{.MC_NUM_CLUSTERS | default "2"}}'
 
   # If true, primary cluster is management-only (no workloads, only Envoy)
-  # Usage: PRIMARY_MANAGEMENT_ONLY=true task multicluster:setup
-  PRIMARY_MANAGEMENT_ONLY: '{{.PRIMARY_MANAGEMENT_ONLY | default "false"}}'
+  # Usage: MC_MANAGEMENT_ONLY=true task multicluster:setup
+  PRIMARY_MANAGEMENT_ONLY: '{{.MC_MANAGEMENT_ONLY | default "false"}}'
 
   # Use MC_NAMESPACE to avoid collision with parent Taskfile's NAMESPACE
   MC_NAMESPACE: '{{.MC_NAMESPACE | default "test-multicluster"}}'
@@ -1116,6 +1122,39 @@ tasks:
       - task: databases:deploy
       - echo ""
       - echo "Databases also deployed! Use 'task multicluster:databases:status' to check"
+
+  setup:all:with-pubsub:clean:
+    desc: Clean setup with Pub/Sub emulator for queue splitting tests
+    cmds:
+      - task: teardown:all
+      - sleep 2
+      - task: setup:all:with-pubsub
+      - echo ""
+      - echo "=== Pub/Sub Setup Complete ==="
+      - echo ""
+      - echo "Single session:"
+      - echo "  task multicluster:pubsub:test:split"
+      - echo ""
+      - echo "Multi-session (print instructions then run in separate terminals):"
+      - echo "  task multicluster:pubsub:test:two-sessions"
+      - echo "  task multicluster:pubsub:test:three-sessions"
+      - echo "  task multicluster:pubsub:test:three-sessions:all-different"
+      - echo ""
+      - echo "Send messages:"
+      - echo "  task multicluster:pubsub:send:match"
+      - echo "  task multicluster:pubsub:send:nomatch"
+      - echo "  task multicluster:pubsub:send:beta"
+      - echo "  task multicluster:pubsub:send:gamma"
+      - echo "  task multicluster:pubsub:send:all-tenants"
+      - echo "  task multicluster:pubsub:send:flood COUNT=20"
+
+  setup:all:with-pubsub:
+    desc: Complete setup with Pub/Sub emulator for queue splitting tests
+    cmds:
+      - task: setup:all
+      - task: pubsub:setup
+      - echo ""
+      - echo "Pub/Sub setup complete! Use 'task multicluster:pubsub:status' to check"
 
   setup:all:with-sqs:clean:
     desc: Clean setup with SQS (LocalStack) for queue splitting tests
@@ -3527,6 +3566,474 @@ tasks:
           kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=sqs-consumer --tail=20 2>/dev/null || echo "No logs"
         fi
 
+  pubsub:setup:
+    desc: Deploy Pub/Sub emulator + consumer + CRDs for multi-cluster queue splitting
+    cmds:
+      - task: pubsub:deploy:emulator
+      - task: pubsub:wait:emulator
+      - task: pubsub:create:topic
+      - task: pubsub:deploy:consumer
+      - task: pubsub:deploy:crds
+      - echo ""
+      - echo "Pub/Sub multi-cluster setup complete."
+      - echo "Run 'task multicluster:pubsub:status' to check."
+
+  pubsub:deploy:emulator:
+    desc: Deploy Pub/Sub emulator to the default cluster (shared by all clusters via NodePort)
+    cmds:
+      - |
+        echo "Deploying Pub/Sub emulator to default cluster ({{.REMOTE_CLUSTER_1}})..."
+
+        echo "Connecting Docker networks for cross-cluster access..."
+        docker network connect {{.REMOTE_CLUSTER_1}} {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          docker network connect {{.REMOTE_CLUSTER_1}} {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
+        fi
+
+        kubectl --context {{.REMOTE_CLUSTER_1}} create namespace pubsub-emulator --dry-run=client -o yaml | kubectl --context {{.REMOTE_CLUSTER_1}} apply -f -
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -f {{.K8S_DIR}}/overlays/pubsub-emulator/namespace.yaml
+        kubectl --context {{.REMOTE_CLUSTER_1}} apply -f {{.K8S_DIR}}/overlays/pubsub-emulator/pubsub-emulator.yaml
+
+        echo "Patching emulator service to NodePort 31085..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} patch svc pubsub-emulator -n pubsub-emulator \
+          --type=merge -p '{"spec":{"type":"NodePort","ports":[{"port":8085,"targetPort":8085,"nodePort":31085,"name":"pubsub"}]}}'
+
+        EMULATOR_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        echo "Pub/Sub emulator deployed with NodePort at ${EMULATOR_IP}:31085"
+
+  pubsub:wait:emulator:
+    desc: Wait for the Pub/Sub emulator pod to be ready
+    cmds:
+      - kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n pubsub-emulator --timeout=120s
+
+  pubsub:create:topic:
+    desc: Create test topic and subscription in the emulator
+    cmds:
+      - |
+        POD=$(kubectl --context {{.REMOTE_CLUSTER_1}} get pod -n pubsub-emulator -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        echo "Creating topic test-topic..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n pubsub-emulator $POD -- \
+          curl -s -X PUT "http://localhost:8085/v1/projects/test-project/topics/test-topic" \
+            -H "Content-Type: application/json" || true
+        echo ""
+        echo "Creating subscription test-subscription..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n pubsub-emulator $POD -- \
+          curl -s -X PUT "http://localhost:8085/v1/projects/test-project/subscriptions/test-subscription" \
+            -H "Content-Type: application/json" \
+            -d '{"topic": "projects/test-project/topics/test-topic"}' || true
+        echo ""
+
+  pubsub:deploy:consumer:
+    desc: Deploy Pub/Sub consumer app on all workload clusters
+    cmds:
+      - |
+        echo "Building pubsub-consumer image..."
+        cd {{.ROOT_DIR}}/apps/pubsub-consumer && docker build -t pubsub-consumer:local .
+
+        EMULATOR_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        EMULATOR_PORT=$(kubectl --context {{.REMOTE_CLUSTER_1}} get svc -n pubsub-emulator pubsub-emulator -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
+
+        if [ -z "$EMULATOR_PORT" ]; then
+          EMULATOR_HOST="pubsub-emulator.pubsub-emulator.svc.cluster.local:8085"
+          echo "No NodePort found, using cluster-local DNS: $EMULATOR_HOST"
+        else
+          EMULATOR_HOST="${EMULATOR_IP}:${EMULATOR_PORT}"
+          echo "Using NodePort endpoint: $EMULATOR_HOST"
+        fi
+
+        for CLUSTER in {{.REMOTE_CLUSTER_1}} {{if eq .NUM_CLUSTERS "3"}}{{.REMOTE_CLUSTER_2}}{{end}}; do
+          echo "Loading image and deploying consumer on $CLUSTER..."
+          minikube -p $CLUSTER image load pubsub-consumer:local
+
+          cat <<EOF | kubectl --context $CLUSTER apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: pubsub-consumer
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: pubsub-consumer
+          template:
+            metadata:
+              labels:
+                app: pubsub-consumer
+            spec:
+              containers:
+              - name: consumer
+                image: pubsub-consumer:local
+                imagePullPolicy: Never
+                env:
+                - name: PUBSUB_PROJECT_ID
+                  value: "test-project"
+                - name: PUBSUB_SUBSCRIPTION
+                  value: "test-subscription"
+                - name: PUBSUB_EMULATOR_HOST
+                  value: "$EMULATOR_HOST"
+        EOF
+
+          echo "Waiting for consumer on $CLUSTER..."
+          kubectl --context $CLUSTER wait --for=condition=ready pod -l app=pubsub-consumer -n {{.MC_NAMESPACE}} --timeout=120s || true
+        done
+
+  pubsub:deploy:crds:
+    desc: Deploy MirrordSplitConfig and MirrordPropertyList on all workload clusters
+    cmds:
+      - |
+        for CLUSTER in {{.REMOTE_CLUSTER_1}} {{if eq .NUM_CLUSTERS "3"}}{{.REMOTE_CLUSTER_2}}{{end}}; do
+          echo "Deploying CRDs on $CLUSTER..."
+
+          EMULATOR_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+          EMULATOR_PORT=$(kubectl --context {{.REMOTE_CLUSTER_1}} get svc -n pubsub-emulator pubsub-emulator -o jsonpath='{.spec.ports[0].nodePort}' 2>/dev/null || echo "")
+
+          if [ -z "$EMULATOR_PORT" ]; then
+            EMULATOR_ENDPOINT="http://pubsub-emulator.pubsub-emulator.svc.cluster.local:8085"
+          else
+            EMULATOR_ENDPOINT="http://${EMULATOR_IP}:${EMULATOR_PORT}"
+          fi
+
+          cat <<EOF | kubectl --context $CLUSTER apply -f -
+        apiVersion: mirrord.metalbear.co/v1
+        kind: MirrordPropertyList
+        metadata:
+          name: pubsub-emulator-config
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          properties:
+          - name: endpoint
+            value: "$EMULATOR_ENDPOINT"
+          - name: project_id
+            value: "test-project"
+        EOF
+
+          cat <<EOF | kubectl --context $CLUSTER apply -f -
+        apiVersion: queues.mirrord.metalbear.co/v1
+        kind: MirrordSplitConfig
+        metadata:
+          name: pubsub-test-config
+          namespace: {{.MC_NAMESPACE}}
+        spec:
+          targetRef:
+            apiVersion: apps/v1
+            kind: Deployment
+            name: pubsub-consumer
+          clientConfigs:
+            googlePubSub: pubsub-emulator-config
+          queues:
+          - id: test-subscription
+            kind: googlePubSub
+            appConfig:
+              subscription:
+              - env: PUBSUB_SUBSCRIPTION
+              projectId:
+              - env: PUBSUB_PROJECT_ID
+        EOF
+        done
+
+  pubsub:send:
+    desc: "Publish a test message: task multicluster:pubsub:send TENANT=test-user"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+    cmds:
+      - |
+        POD=$(kubectl --context {{.REMOTE_CLUSTER_1}} get pod -n pubsub-emulator -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        BODY=$(echo -n "{\"tenant\":\"{{.TENANT}}\",\"msg\":\"hello\"}" | base64)
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n pubsub-emulator $POD -- \
+          curl -s -X POST \
+            "http://localhost:8085/v1/projects/test-project/topics/test-topic:publish" \
+            -H "Content-Type: application/json" \
+            -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"{{.TENANT}}\"}}]}"
+        echo ""
+        echo "Published with tenant={{.TENANT}}"
+
+  pubsub:send:match:
+    desc: Publish a message matching the default filter (tenant=test-user)
+    cmds:
+      - task: pubsub:send
+        vars: { TENANT: "test-user" }
+
+  pubsub:send:nomatch:
+    desc: Publish a message not matching any filter (tenant=other)
+    cmds:
+      - task: pubsub:send
+        vars: { TENANT: "other" }
+
+  pubsub:send:beta:
+    desc: Publish a message for session B (tenant=beta)
+    cmds:
+      - task: pubsub:send
+        vars: { TENANT: "beta" }
+
+  pubsub:send:gamma:
+    desc: Publish a message for session C (tenant=gamma)
+    cmds:
+      - task: pubsub:send
+        vars: { TENANT: "gamma" }
+
+  pubsub:send:all-tenants:
+    desc: Send one message per tenant (test-user, beta, gamma, other)
+    cmds:
+      - task: pubsub:send
+        vars: { TENANT: "test-user" }
+      - task: pubsub:send
+        vars: { TENANT: "beta" }
+      - task: pubsub:send
+        vars: { TENANT: "gamma" }
+      - task: pubsub:send
+        vars: { TENANT: "other" }
+
+  pubsub:send:flood:
+    desc: "Send many messages with random tenants: task multicluster:pubsub:send:flood COUNT=20"
+    vars:
+      COUNT: '{{.COUNT | default "20"}}'
+    cmds:
+      - |
+        TENANTS=("test-user" "beta" "gamma" "other" "unknown")
+        POD=$(kubectl --context {{.REMOTE_CLUSTER_1}} get pod -n pubsub-emulator -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+
+        for i in $(seq 1 {{.COUNT}}); do
+          T=${TENANTS[$((RANDOM % ${#TENANTS[@]}))]}
+          BODY=$(echo -n "{\"tenant\":\"$T\",\"msg\":\"flood-$i\"}" | base64)
+          kubectl --context {{.REMOTE_CLUSTER_1}} exec -n pubsub-emulator $POD -- \
+            curl -s -X POST \
+              "http://localhost:8085/v1/projects/test-project/topics/test-topic:publish" \
+              -H "Content-Type: application/json" \
+              -d "{\"messages\":[{\"data\":\"$BODY\",\"attributes\":{\"tenant\":\"$T\"}}]}" >/dev/null
+          echo "$i: tenant=$T"
+        done
+        echo ""
+        echo "Sent {{.COUNT}} messages."
+
+  pubsub:status:
+    desc: Show Pub/Sub multi-cluster status
+    cmds:
+      - |
+        echo "=== Pub/Sub Multi-Cluster Status ==="
+        echo ""
+        for CLUSTER in {{.REMOTE_CLUSTER_1}} {{if eq .NUM_CLUSTERS "3"}}{{.REMOTE_CLUSTER_2}}{{end}}; do
+          echo "--- $CLUSTER ---"
+          echo "Consumer:"
+          kubectl --context $CLUSTER get pods -n {{.MC_NAMESPACE}} -l app=pubsub-consumer 2>/dev/null || echo "  Not deployed"
+          echo "Split Sessions:"
+          kubectl --context $CLUSTER get mirrordclustersplitsessions -A 2>/dev/null || echo "  (none)"
+          echo "Split Config:"
+          kubectl --context $CLUSTER get mirrordsplitconfigs -n {{.MC_NAMESPACE}} 2>/dev/null || echo "  (none)"
+          echo ""
+        done
+
+        echo "--- Emulator ({{.REMOTE_CLUSTER_1}}) ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} get pods -n pubsub-emulator -l app.kubernetes.io/name=pubsub-emulator 2>/dev/null || echo "  Not deployed"
+
+  pubsub:logs:
+    desc: Show Pub/Sub consumer logs from workload clusters
+    cmds:
+      - |
+        echo "=== Pub/Sub Consumer Logs ==="
+        echo ""
+        echo "--- {{.REMOTE_CLUSTER_1}} ---"
+        kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer --tail=20 2>/dev/null || echo "No logs"
+
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          echo ""
+          echo "--- {{.REMOTE_CLUSTER_2}} ---"
+          kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer --tail=20 2>/dev/null || echo "No logs"
+        fi
+
+  pubsub:clean:
+    desc: Remove all Pub/Sub multi-cluster resources
+    cmds:
+      - |
+        for CLUSTER in {{.REMOTE_CLUSTER_1}} {{if eq .NUM_CLUSTERS "3"}}{{.REMOTE_CLUSTER_2}}{{end}}; do
+          echo "Cleaning Pub/Sub resources on $CLUSTER..."
+          kubectl --context $CLUSTER delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+          kubectl --context $CLUSTER delete mirrordclusterexternalresources --all -A 2>/dev/null || true
+          kubectl --context $CLUSTER delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+          kubectl --context $CLUSTER delete mirrordsplitconfig pubsub-test-config -n {{.MC_NAMESPACE}} 2>/dev/null || true
+          kubectl --context $CLUSTER delete mirrordpropertylist pubsub-emulator-config -n {{.MC_NAMESPACE}} 2>/dev/null || true
+          kubectl --context $CLUSTER delete deploy pubsub-consumer -n {{.MC_NAMESPACE}} 2>/dev/null || true
+        done
+
+        echo "Cleaning emulator on {{.REMOTE_CLUSTER_1}}..."
+        kubectl --context {{.REMOTE_CLUSTER_1}} delete -f {{.K8S_DIR}}/overlays/pubsub-emulator/pubsub-emulator.yaml --ignore-not-found=true 2>/dev/null || true
+        kubectl --context {{.REMOTE_CLUSTER_1}} delete namespace pubsub-emulator --ignore-not-found=true 2>/dev/null || true
+        echo "Done."
+
+  pubsub:test:split:
+    desc: Run multi-cluster Pub/Sub split test with mirrord exec
+    cmds:
+      - |
+        echo "=== Multi-Cluster Pub/Sub Split Test ==="
+        echo ""
+        echo "Starting mirrord exec with GcpPubSub split filter (tenant=^test)..."
+        echo ""
+
+        cd {{.ROOT_DIR}}/apps/pubsub-consumer && go build -o /tmp/pubsub-consumer-mc main.go
+
+        MIRRORD_CONFIG=$(mktemp /tmp/mirrord-mc-pubsub-XXXXX.json)
+        cat > $MIRRORD_CONFIG <<'MIRRORD_EOF'
+        {
+          "operator": true,
+          "target": "deploy/pubsub-consumer",
+          "feature": {
+            "split_queues": {
+              "test-subscription": {
+                "queue_type": "GcpPubSub",
+                "message_filter": {
+                  "tenant": "^test"
+                }
+              }
+            }
+          }
+        }
+        MIRRORD_EOF
+
+        echo "Config: $MIRRORD_CONFIG"
+        echo ""
+        echo "Starting session (Ctrl+C to stop)..."
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY_CLUSTER}} {{.MIRRORD_BIN}} exec \
+          -f $MIRRORD_CONFIG \
+          -n {{.MC_NAMESPACE}} \
+          -- /tmp/pubsub-consumer-mc
+
+  pubsub:test:split:session:
+    desc: "Run a single MC Pub/Sub session with a custom tenant filter"
+    vars:
+      TENANT_FILTER: '{{.TENANT_FILTER | default "^test"}}'
+      SESSION_LABEL: '{{.SESSION_LABEL | default "session"}}'
+    cmds:
+      - |
+        cd {{.ROOT_DIR}}/apps/pubsub-consumer && go build -o /tmp/pubsub-consumer-mc-{{.SESSION_LABEL}} main.go
+
+        MIRRORD_CONFIG="/tmp/mirrord-mc-{{.SESSION_LABEL}}.json"
+        cat > "$MIRRORD_CONFIG" <<EOF
+        {
+          "operator": true,
+          "target": "deploy/pubsub-consumer",
+          "feature": {
+            "split_queues": {
+              "test-subscription": {
+                "queue_type": "GcpPubSub",
+                "message_filter": {
+                  "tenant": "{{.TENANT_FILTER}}"
+                }
+              }
+            }
+          }
+        }
+        EOF
+
+        echo "Starting {{.SESSION_LABEL}} (filter: tenant={{.TENANT_FILTER}})..."
+        echo "Config: $MIRRORD_CONFIG"
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY_CLUSTER}} {{.MIRRORD_BIN}} exec \
+          -f "$MIRRORD_CONFIG" \
+          -n {{.MC_NAMESPACE}} \
+          -- /tmp/pubsub-consumer-mc-{{.SESSION_LABEL}}
+
+  pubsub:test:two-sessions:
+    desc: "Instructions to run 2 concurrent sessions with different filters"
+    cmds:
+      - |
+        echo ""
+        echo "Two-Session Multi-Cluster Pub/Sub Test"
+        echo ""
+        echo "Both sessions target the same deployment but filter different tenants."
+        echo "Unmatched messages (tenant=other) go to the original app."
+        echo ""
+        echo "  Terminal 1 - Session A (tenant=^test):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a"
+        echo ""
+        echo "  Terminal 2 - Session B (tenant=^beta):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b"
+        echo ""
+        echo "  Terminal 3 - Send messages and observe:"
+        echo "    task multicluster:pubsub:send:all-tenants"
+        echo ""
+        echo "  Terminal 4 - Consumer logs on each cluster:"
+        echo "    kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer -f"
+        echo "    kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer -f"
+        echo ""
+        echo "  Expected:"
+        echo "    Session A receives messages with tenant=test-user"
+        echo "    Session B receives messages with tenant=beta"
+        echo "    Original app receives messages with tenant=gamma, other, unknown"
+        echo ""
+        echo "  Inspect state:"
+        echo "    task multicluster:pubsub:status"
+
+  pubsub:test:three-sessions:
+    desc: "Instructions to run 3 concurrent sessions (2 different filters + 1 duplicate)"
+    cmds:
+      - |
+        echo ""
+        echo "Three-Session Multi-Cluster Pub/Sub Test"
+        echo ""
+        echo "Sessions A and C use the same filter, so they compete for the same"
+        echo "messages (GCP Pub/Sub delivers each message to exactly one consumer)."
+        echo "Session B uses a different filter."
+        echo ""
+        echo "  Terminal 1 - Session A (tenant=^test):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a"
+        echo ""
+        echo "  Terminal 2 - Session B (tenant=^beta):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b"
+        echo ""
+        echo "  Terminal 3 - Session C (tenant=^test - same as A):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-c"
+        echo ""
+        echo "  Terminal 4 - Send messages and observe:"
+        echo "    task multicluster:pubsub:send:all-tenants"
+        echo "    task multicluster:pubsub:send:flood COUNT=30"
+        echo ""
+        echo "  Terminal 5 - Consumer logs:"
+        echo "    kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer -f"
+        echo "    kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer -f"
+        echo ""
+        echo "  Expected:"
+        echo "    Session A and C share tenant=test-user messages (each gets some)"
+        echo "    Session B receives messages with tenant=beta"
+        echo "    Original app receives messages with tenant=gamma, other, unknown"
+        echo ""
+        echo "  Inspect state:"
+        echo "    task multicluster:pubsub:status"
+
+  pubsub:test:three-sessions:all-different:
+    desc: "Instructions to run 3 concurrent sessions with all different filters"
+    cmds:
+      - |
+        echo ""
+        echo "Three-Session Multi-Cluster Pub/Sub Test (All Different Filters)"
+        echo ""
+        echo "Each session filters a unique tenant. Messages not matching any"
+        echo "session filter go to the original app."
+        echo ""
+        echo "  Terminal 1 - Session A (tenant=^test):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a"
+        echo ""
+        echo "  Terminal 2 - Session B (tenant=^beta):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b"
+        echo ""
+        echo "  Terminal 3 - Session C (tenant=^gamma):"
+        echo "    cd local-sandbox && task multicluster:pubsub:test:split:session TENANT_FILTER='^gamma' SESSION_LABEL=session-c"
+        echo ""
+        echo "  Terminal 4 - Send messages:"
+        echo "    task multicluster:pubsub:send:all-tenants"
+        echo "    task multicluster:pubsub:send:flood COUNT=30"
+        echo ""
+        echo "  Terminal 5 - Consumer logs:"
+        echo "    kubectl --context {{.REMOTE_CLUSTER_1}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer -f"
+        echo "    kubectl --context {{.REMOTE_CLUSTER_2}} logs -n {{.MC_NAMESPACE}} -l app=pubsub-consumer -f"
+        echo ""
+        echo "  Expected:"
+        echo "    Session A receives messages with tenant=test-user"
+        echo "    Session B receives messages with tenant=beta"
+        echo "    Session C receives messages with tenant=gamma"
+        echo "    Original app receives messages with tenant=other, unknown"
+        echo ""
+        echo "  Inspect state:"
+        echo "    task multicluster:pubsub:status"
+
   preview:start:
     desc: Start a preview environment (multi-cluster, via primary)
     vars:
@@ -3946,10 +4453,10 @@ tasks:
         echo "Target will only have env vars for queue-a, queue-b, queue-c"
         echo ""
 
-        # Build consumer
-        echo "Building SQS consumer..."
-        cd {{.APPS_DIR}}/sqs-consumer
-        docker build -t sqs-consumer:latest . 2>/dev/null
+        # Build the multi-consumer image (reads QUEUE_A, not QUEUE_NAME)
+        echo "Building SQS multi-consumer..."
+        cd {{.APPS_DIR}}/sqs-multi-consumer
+        docker build -t sqs-multi-consumer:latest . 2>/dev/null
 
         # All clusters share LocalStack on remote-1 via NodePort
         LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
@@ -3965,7 +4472,7 @@ tasks:
 
         # Load and deploy to each cluster
         for CLUSTER in $CLUSTERS; do
-          minikube -p $CLUSTER image load sqs-consumer:latest 2>/dev/null || true
+          minikube -p $CLUSTER image load sqs-multi-consumer:latest 2>/dev/null || true
 
           echo "Deploying sqs-multi-consumer to $CLUSTER..."
           cat <<EOF | kubectl --context $CLUSTER apply -f -
@@ -3986,7 +4493,7 @@ tasks:
             spec:
               containers:
               - name: consumer
-                image: sqs-consumer:latest
+                image: sqs-multi-consumer:latest
                 imagePullPolicy: Never
                 env:
                 - name: QUEUE_A
@@ -3995,8 +4502,6 @@ tasks:
                   value: "queue-b"
                 - name: QUEUE_C
                   value: "queue-c"
-                - name: QUEUE_NAME
-                  value: "queue-a"
                 - name: AWS_ACCESS_KEY_ID
                   value: "test"
                 - name: AWS_SECRET_ACCESS_KEY
@@ -4038,13 +4543,12 @@ tasks:
         echo "In MC mode, all queue names are generated deterministically using session_id as seed"
         echo ""
 
-        cd {{.APPS_DIR}}/sqs-consumer
-        go build -o /tmp/sqs-consumer main.go 2>/dev/null || echo "Build may have failed"
+        cd {{.APPS_DIR}}/sqs-multi-consumer
+        go build -o /tmp/sqs-multi-consumer main.go 2>/dev/null || echo "Build may have failed"
 
         export AWS_ACCESS_KEY_ID=test
         export AWS_SECRET_ACCESS_KEY=test
         export AWS_REGION=us-east-1
-        export QUEUE_NAME=queue-a
 
         echo "Starting mirrord session with wildcard seed config..."
         echo "Send messages with: task multicluster:test:sqs:wildcard-seed:send"
@@ -4053,7 +4557,7 @@ tasks:
         {{.MIRRORD_BIN}} exec \
           --context {{.PRIMARY_CLUSTER}} \
           -f {{.K8S_DIR}}/overlays/multicluster-sqs/mirrord-wildcard-seed.json \
-          -- /tmp/sqs-consumer
+          -- /tmp/sqs-multi-consumer
 
   test:sqs:wildcard-seed:send:
     desc: Send test messages to all 3 queues with different type attributes
@@ -4089,23 +4593,43 @@ tasks:
     desc: Show status of the wildcard seed test sessions and queues
     cmds:
       - |
+        CLUSTERS="{{.REMOTE_CLUSTER_1}}"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          CLUSTERS="$CLUSTERS {{.REMOTE_CLUSTER_2}}"
+        fi
+
+        echo "=== MC Sessions ==="
+        kubectl --context {{.PRIMARY_CLUSTER}} get mirrordmulticlustersessions -n {{.MC_NAMESPACE}} -o wide 2>/dev/null || echo "No MC sessions"
+        echo ""
+
         echo "=== SQS Sessions ==="
-        kubectl --context {{.PRIMARY_CLUSTER}} get mirrorsqssessions -n {{.MC_NAMESPACE}} -o wide 2>/dev/null || echo "No sessions"
-        echo ""
-        kubectl --context {{.REMOTE_CLUSTER_1}} get mirrorsqssessions -n {{.MC_NAMESPACE}} -o wide 2>/dev/null || echo "No sessions"
-        echo ""
-
-        echo "=== Queue Registries ==="
-        kubectl --context {{.PRIMARY_CLUSTER}} get mirrordworkloadqueueregistries -n {{.MC_NAMESPACE}} -o wide 2>/dev/null || echo "None"
-        echo ""
-
-        echo "=== Queues on LocalStack ==="
-        for CLUSTER in {{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_1}}; do
+        for CLUSTER in $CLUSTERS; do
           echo "$CLUSTER:"
-          kubectl --context $CLUSTER exec -n localstack deploy/localstack -- \
-            awslocal sqs list-queues 2>/dev/null || echo "LocalStack not available"
+          kubectl --context $CLUSTER get mirrordsqssessions -n {{.MC_NAMESPACE}} -o wide 2>/dev/null || echo "  No sessions"
           echo ""
         done
+
+        echo "=== Queue Registries ==="
+        kubectl --context {{.PRIMARY_CLUSTER}} get mirrordworkloadqueueregistries -n mirrord -o wide 2>/dev/null || echo "None"
+        echo ""
+
+        echo "=== Workload Patch Requests ==="
+        for CLUSTER in $CLUSTERS; do
+          echo "$CLUSTER:"
+          kubectl --context $CLUSTER get mirrordclusterworkloadpatchrequests -n {{.MC_NAMESPACE}} -o wide 2>/dev/null || echo "  None"
+          echo ""
+        done
+
+        echo "=== Consumer Pods ==="
+        for CLUSTER in {{.PRIMARY_CLUSTER}} $CLUSTERS; do
+          echo "$CLUSTER:"
+          kubectl --context $CLUSTER get pods -n {{.MC_NAMESPACE}} -l app=sqs-multi-consumer -o wide 2>/dev/null || echo "  None"
+          echo ""
+        done
+
+        echo "=== Queues on LocalStack ==="
+        kubectl --context {{.REMOTE_CLUSTER_1}} exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues 2>/dev/null || echo "LocalStack not available"
 
   test:sqs:wildcard-seed:clean:
     desc: Clean up wildcard seed test resources

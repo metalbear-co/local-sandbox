@@ -7,6 +7,7 @@ operator:
   image: mirrord-operator
   sqsSplitting: true
   kafkaSplitting: true
+  gcpPubsubSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true
@@ -16,7 +17,7 @@ operator:
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true
-  logLevel: "warn,operator=debug,mirrord=debug"
+  logLevel: "warn,operator=debug,mirrord=debug,operator_sqs_splitting::forwarder=trace"
   # Note: hostNetwork is patched via kubectl after helm install (not in chart)
   # AWS credentials for LocalStack - use NodePort URL (set via --set in task)
   extraEnv:

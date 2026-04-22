@@ -475,6 +475,172 @@ task pubsub:test:reconnect
 task pubsub:send:flood COUNT=50
 ```
 
+### Multi-Cluster GCP Pub/Sub Queue Splitting
+
+Multi-cluster Pub/Sub splitting runs across a primary (management) cluster and one or two
+workload clusters. The developer connects to the primary cluster, which orchestrates
+the split on all workload clusters. A single GCP Pub/Sub emulator is shared by all clusters
+via NodePort.
+
+#### Setup
+
+```bash
+# Clean setup from scratch (creates clusters, installs operators, deploys emulator + consumer + CRDs)
+task multicluster:setup:all:with-pubsub:clean
+
+# Or add pubsub to an existing multi-cluster setup
+task multicluster:pubsub:setup
+```
+
+#### Single Session
+
+```bash
+task multicluster:pubsub:test:split
+```
+
+This runs a single `mirrord exec` session targeting `deploy/pubsub-consumer` on all workload
+clusters with a `tenant=^test$` filter. The mirrord config looks like:
+
+```json
+{
+  "operator": true,
+  "target": "deploy/pubsub-consumer",
+  "feature": {
+    "split_queues": {
+      "test-subscription": {
+        "queue_type": "GcpPubSub",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}
+```
+
+`test-subscription` is the queue ID matching the `MirrordSplitConfig` on each cluster.
+`message_filter` tells the forwarder to route messages whose `tenant` attribute matches
+`^test` to this session's temporary subscription. Everything else goes to the original app.
+
+#### Running Multiple Sessions
+
+Each session needs its own terminal because `mirrord exec` is a long-running process.
+The test tasks below print instructions showing which command to run in each terminal.
+
+```bash
+# Print instructions for 2 sessions with different filters
+task multicluster:pubsub:test:two-sessions
+
+# Print instructions for 3 sessions (2 share the same filter, 1 different)
+task multicluster:pubsub:test:three-sessions
+
+# Print instructions for 3 sessions with all different filters
+task multicluster:pubsub:test:three-sessions:all-different
+```
+
+You can also launch individual sessions directly with any filter:
+
+```bash
+# Terminal 1
+task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a
+
+# Terminal 2
+task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b
+
+# Terminal 3 (same filter as session-a - they compete for matching messages)
+task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-c
+```
+
+When two sessions share the same filter, GCP Pub/Sub delivers each matching message to
+exactly one of them (load-balanced). This is expected behavior.
+
+#### Sending Messages
+
+Messages are published to the shared topic with a `tenant` attribute. The forwarder on
+each cluster matches this attribute against each session's filter regex and routes accordingly.
+
+```bash
+# Target a specific session by matching its filter
+task multicluster:pubsub:send TENANT=test-user   # matches ^test -> session-a
+task multicluster:pubsub:send TENANT=beta         # matches ^beta -> session-b
+task multicluster:pubsub:send TENANT=gamma        # matches ^gamma -> session-c (if running)
+task multicluster:pubsub:send TENANT=other        # no match -> original app
+
+# Shortcuts
+task multicluster:pubsub:send:match       # tenant=test-user
+task multicluster:pubsub:send:nomatch     # tenant=other
+task multicluster:pubsub:send:beta        # tenant=beta
+task multicluster:pubsub:send:gamma       # tenant=gamma
+
+# Send one message per tenant
+task multicluster:pubsub:send:all-tenants
+
+# Random flood
+task multicluster:pubsub:send:flood COUNT=30
+```
+
+#### Logs and Status
+
+```bash
+# Consumer logs per cluster
+kubectl --context mirrord-remote-1 logs -n test-multicluster -l app=pubsub-consumer -f
+kubectl --context mirrord-remote-2 logs -n test-multicluster -l app=pubsub-consumer -f
+
+# Split sessions, CRDs, external resources
+task multicluster:pubsub:status
+
+# Operator logs
+task multicluster:logs:operator
+```
+
+#### Interactive Testing Scenarios
+
+All scenarios assume `task multicluster:setup:all:with-pubsub` (or the `:clean` variant)
+has been run. Open a separate terminal window for each step.
+
+**Scenario 1: Two sessions, different filters**
+
+| Terminal | Command | Receives |
+|----------|---------|----------|
+| 1 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a` | tenant=test-user |
+| 2 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b` | tenant=beta |
+| 3 | `task multicluster:pubsub:send:all-tenants` | - |
+
+Original app receives tenant=gamma, other, unknown.
+
+**Scenario 2: Three sessions, all different filters**
+
+| Terminal | Command | Receives |
+|----------|---------|----------|
+| 1 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a` | tenant=test-user |
+| 2 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b` | tenant=beta |
+| 3 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^gamma' SESSION_LABEL=session-c` | tenant=gamma |
+| 4 | `task multicluster:pubsub:send:all-tenants` | - |
+
+Original app receives tenant=other, unknown.
+
+**Scenario 3: Three sessions, two share the same filter**
+
+| Terminal | Command | Receives |
+|----------|---------|----------|
+| 1 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-a` | some tenant=test-user |
+| 2 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^beta' SESSION_LABEL=session-b` | tenant=beta |
+| 3 | `task multicluster:pubsub:test:split:session TENANT_FILTER='^test' SESSION_LABEL=session-c` | some tenant=test-user |
+| 4 | `task multicluster:pubsub:send:flood COUNT=30` | - |
+
+Sessions A and C compete for `tenant=test-user` messages. Each gets some but not all
+(GCP Pub/Sub load-balances across consumers on the same subscription).
+
+#### Cleanup
+
+```bash
+# Remove split sessions and temp resources only
+task multicluster:pubsub:clean
+
+# Full teardown (clusters and all)
+task multicluster:teardown:all
+```
+
 ### SQS/Kafka
 
 ```bash

@@ -4,9 +4,5 @@ kind: Kustomization
 namespace: test-mirrord
 
 resources:
-- base
-- scenarios/env-val
-- scenarios/secret-ref
-- scenarios/echo
-- scenarios/pattern-composite
-
+- pod.yaml
+- branch.yaml

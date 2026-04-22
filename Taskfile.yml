@@ -416,6 +416,7 @@ tasks:
     desc: Rebuild and upgrade operator
     cmds:
       - task: build:operator
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - task: _wait:operator

@@ -9,7 +9,7 @@
       "test-subscription": {
         "queue_type": "GcpPubSub",
         "message_filter": {
-          "tenant": "^beta"
+          "tenant": "^gamma"
         }
       }
     }
