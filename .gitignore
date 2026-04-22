@@ -22,5 +22,8 @@ bin/
 *.task
 .task/
 
+# Task history (logged by task menu/up)
+.task-history
+
 # Multi-cluster testing
 multi-cluster-kubeconfig.yaml
