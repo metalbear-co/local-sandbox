@@ -1718,56 +1718,75 @@ tasks:
         kubectl get events --all-namespaces --field-selector type!=Normal --sort-by='.lastTimestamp' 2>/dev/null | tail -5 || echo "  No warnings"
 
   menu:
-    desc: Interactive task picker with colored descriptions (requires fzf)
+    desc: Interactive task picker -- loops back after task completes (Ctrl-C to exit)
     interactive: true
     cmds:
       - |
-        SELECTED=$(task --list-all | tail -n +2 | \
+        set +e
+        TASK_LIST=$(task --list-all | tail -n +2 | \
           sed 's/^\* //' | \
-          awk -F': +' '{printf "\033[36m%-45s \033[90m%s\033[0m\n", $1, $2}' | \
-          fzf --ansi --height=40% --reverse \
-              --border --border-label=" task menu " \
-              --header="Type to search by name or description. Enter to run, Esc to cancel." \
-              --prompt="task> " \
-              --preview-window=hidden | \
-          awk '{print $1}')
-        if [ -n "$SELECTED" ]; then
+          awk -F': +' '{printf "\033[36m%-45s \033[90m%s\033[0m\n", $1, $2}')
+
+        while true; do
+          SELECTED=$(echo "$TASK_LIST" | \
+            fzf --ansi --height=40% --reverse \
+                --border --border-label=" task menu " \
+                --header="Enter=run, Esc=exit. Menu returns after task completes." \
+                --prompt="task> " \
+                --preview-window=hidden | \
+            awk '{print $1}')
+          [ -z "$SELECTED" ] && break
           HIST="{{.ROOT_DIR}}/.task-history"
           echo "$(date +%s)|$SELECTED" >> "$HIST"
           tail -200 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
-          echo "Running: task $SELECTED"
+          echo ""
+          echo "==> task $SELECTED"
+          echo ""
           task "$SELECTED"
-        fi
+          echo ""
+          echo "(Press Enter to pick another task, or Ctrl-C to exit)"
+          read -r
+        done
 
   menu:module:
-    desc: Pick a module, then pick a task within it
+    desc: Pick a module, then pick a task -- loops back to module picker (Ctrl-C to exit)
     interactive: true
     cmds:
       - |
-        MODULE=$(echo "postgres mysql mssql mongodb sqs kafka redis rmq pubsub multicluster eks" | \
-          tr ' ' '\n' | \
-          fzf --height=20% --reverse --border \
-              --border-label=" pick module " \
-              --prompt="module> ")
-        if [ -n "$MODULE" ]; then
-          SELECTED=$(task --list-all | tail -n +2 | \
-            grep "$MODULE" | \
-            sed 's/^\* //' | \
-            awk -F': +' '{printf "\033[36m%-45s \033[90m%s\033[0m\n", $1, $2}' | \
-            fzf --ansi --height=40% --reverse \
-                --border --border-label=" $MODULE tasks " \
-                --header="Type to search. Enter to run, Esc to cancel." \
-                --prompt="$MODULE> " \
-                --preview-window=hidden | \
-            awk '{print $1}')
-          if [ -n "$SELECTED" ]; then
+        set +e
+        while true; do
+          MODULE=$(echo "postgres mysql mssql mongodb sqs kafka redis rmq pubsub multicluster eks" | \
+            tr ' ' '\n' | \
+            fzf --height=20% --reverse --border \
+                --border-label=" pick module " \
+                --header="Esc=exit" \
+                --prompt="module> ")
+          [ -z "$MODULE" ] && break
+
+          while true; do
+            SELECTED=$(task --list-all | tail -n +2 | \
+              grep "$MODULE" | \
+              sed 's/^\* //' | \
+              awk -F': +' '{printf "\033[36m%-45s \033[90m%s\033[0m\n", $1, $2}' | \
+              fzf --ansi --height=40% --reverse \
+                  --border --border-label=" $MODULE tasks " \
+                  --header="Enter=run, Esc=back to modules" \
+                  --prompt="$MODULE> " \
+                  --preview-window=hidden | \
+              awk '{print $1}')
+            [ -z "$SELECTED" ] && break
             HIST="{{.ROOT_DIR}}/.task-history"
             echo "$(date +%s)|$SELECTED" >> "$HIST"
             tail -200 "$HIST" > "$HIST.tmp" && mv "$HIST.tmp" "$HIST"
-            echo "Running: task $SELECTED"
+            echo ""
+            echo "==> task $SELECTED"
+            echo ""
             task "$SELECTED"
-          fi
-        fi
+            echo ""
+            echo "(Press Enter to pick another $MODULE task, or Ctrl-C to exit)"
+            read -r
+          done
+        done
 
   recent:
     desc: Re-run a recently used task (shows name + args + time)
