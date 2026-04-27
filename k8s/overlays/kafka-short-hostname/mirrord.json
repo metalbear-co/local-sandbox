@@ -1,0 +1,17 @@
+{
+    "operator": true,
+    "target": {
+        "path": "deployment/kafka-consumer",
+        "namespace": "test-mirrord"
+    },
+    "feature": {
+        "split_queues": {
+            "test-topic": {
+                "queue_type": "Kafka",
+                "message_filter": {
+                    "user_id": "test-user"
+                }
+            }
+        }
+    }
+}

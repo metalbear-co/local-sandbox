@@ -7,13 +7,13 @@
   "feature": {
     "split_queues": {
       "orders": {
-        "queue_type": "GcpPubSub",
+        "queue_type": "GCPPubSub",
         "message_filter": {
           "tenant": "^test"
         }
       },
       "notifications": {
-        "queue_type": "GcpPubSub",
+        "queue_type": "GCPPubSub",
         "message_filter": {
           "tenant": "^test"
         }

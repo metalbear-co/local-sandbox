@@ -685,7 +685,7 @@ tasks:
     internal: true
     cmds:
       - echo "Waiting for Pub/Sub emulator..."
-      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=300s
 
   _wait:consumer:
     internal: true

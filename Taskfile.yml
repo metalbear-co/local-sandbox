@@ -54,6 +54,10 @@ vars:
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  VERSIONS_DIR: '{{.ROOT_DIR}}/.versions'
+  CARGO_CONFIG: '{{.ROOT_DIR}}/../.cargo/config.toml'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  RELEASE_LICENSE_KEY: '{{.RELEASE_LICENSE_KEY | default ""}}'
 
 tasks:
   license:generate:
@@ -379,8 +383,8 @@ tasks:
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
       - task: license:create:secret
-      # Force pod restart to pick up the new image
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
 
   operator:install:nocache:
@@ -389,8 +393,8 @@ tasks:
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
       - task: license:create:secret
-      # Force pod restart to pick up the new image
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
 
   operator:install:nobuild:
@@ -400,8 +404,8 @@ tasks:
       - task: operator:image:load
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord --create-namespace -f {{.ROOT_DIR}}/operator-values.yaml
       - task: license:create:secret
-      # Force pod restart to pick up the new image
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
 
   operator:install:new:license:
@@ -417,28 +421,104 @@ tasks:
       - kubectl delete namespace mirrord --ignore-not-found=true
 
   operator:update:
-    desc: Rebuild and upgrade operator
+    desc: Rebuild and upgrade operator (auto-saves image tagged by current branch)
     cmds:
       - task: build:operator
+      - task: operator:save
       - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
 
+  operator:download:
+    desc: Download and cache a released operator image + helm chart
+    vars:
+      VERSION: '{{.VERSION | default ""}}'
+    preconditions:
+      - sh: test -n "{{.VERSION}}"
+        msg: "VERSION is required. Usage: task operator:download VERSION=3.152.0"
+    cmds:
+      - mkdir -p {{.VERSIONS_DIR}}/operator
+      - |
+        if [ -f "{{.VERSIONS_DIR}}/operator/{{.VERSION}}.tar" ] && [ -f "{{.VERSIONS_DIR}}/operator/{{.VERSION}}-chart.tgz" ]; then
+          echo "Operator {{.VERSION}} already cached"
+          exit 0
+        fi
+        echo "Downloading operator image {{.VERSION}}..."
+        {{.CONTAINER_RUNTIME}} pull ghcr.io/metalbear-co/operator:{{.VERSION}}
+        {{.CONTAINER_RUNTIME}} save ghcr.io/metalbear-co/operator:{{.VERSION}} -o {{.VERSIONS_DIR}}/operator/{{.VERSION}}.tar
+        echo "Downloading helm chart {{.VERSION}}..."
+        helm repo add metalbear https://metalbear-co.github.io/charts 2>/dev/null || true
+        helm repo update metalbear
+        helm pull metalbear/mirrord-operator --version {{.VERSION}} -d {{.VERSIONS_DIR}}/operator
+        mv {{.VERSIONS_DIR}}/operator/mirrord-operator-{{.VERSION}}.tgz {{.VERSIONS_DIR}}/operator/{{.VERSION}}-chart.tgz
+        echo "Cached operator {{.VERSION}} at {{.VERSIONS_DIR}}/operator/"
+
   operator:use:
-    desc: Pull a released operator image by version and deploy it
+    desc: Deploy a released operator version (downloads if not cached)
     vars:
       VERSION: '{{.VERSION | default ""}}'
     preconditions:
       - sh: test -n "{{.VERSION}}"
         msg: "VERSION is required. Usage: task operator:use VERSION=3.152.0"
+      - sh: test -n "{{.RELEASE_LICENSE_KEY}}"
+        msg: "RELEASE_LICENSE_KEY is required for released operators. Set it in .env"
     cmds:
-      - "{{.CONTAINER_RUNTIME}} pull ghcr.io/metalbear-co/operator:{{.VERSION}}"
-      - "{{.CONTAINER_RUNTIME}} tag ghcr.io/metalbear-co/operator:{{.VERSION}} mirrord-operator:{{.CHART_VERSION}}"
+      - task: operator:download
+        vars:
+          VERSION: "{{.VERSION}}"
+      - |
+        echo "Loading operator image {{.VERSION}} into minikube..."
+        {{.CONTAINER_RUNTIME}} load -i {{.VERSIONS_DIR}}/operator/{{.VERSION}}.tar 2>/dev/null || true
+        minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi ghcr.io/metalbear-co/operator:{{.VERSION}} --force" || true
+        minikube -p {{.CLUSTER_NAME}} image load ghcr.io/metalbear-co/operator:{{.VERSION}}
+      - |
+        echo "Installing helm chart {{.VERSION}}..."
+        helm upgrade --install mirrord-operator {{.VERSIONS_DIR}}/operator/{{.VERSION}}-chart.tgz \
+          --namespace mirrord --create-namespace \
+          -f {{.ROOT_DIR}}/operator-values.yaml \
+          --set operator.image=ghcr.io/metalbear-co/operator \
+          --set operator.imageTag={{.VERSION}} \
+          --set image.pullPolicy=IfNotPresent \
+          --set license.key="{{.RELEASE_LICENSE_KEY}}" \
+          --set license.pemRef=""
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      - task: _wait:operator
+      - echo "Operator {{.VERSION}} is running (using release license key)"
+
+  operator:images:
+    desc: List saved operator images with creation dates
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} images mirrord-operator --format "table {{`{{.Tag}}`}}\t{{`{{.ID}}`}}\t{{`{{.CreatedAt}}`}}\t{{`{{.Size}}`}}"'
+
+  operator:save:
+    desc: Save current operator image under a tag (defaults to current git branch)
+    vars:
+      TAG:
+        sh: cd {{.OPERATOR_DIR}} && git rev-parse --abbrev-ref HEAD | tr '/' '-'
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.TAG}}'
+      - echo "Saved operator image as mirrord-operator:{{.TAG}}"
+
+  operator:load:
+    desc: Load a previously saved operator image and deploy it
+    vars:
+      TAG: '{{.TAG | default ""}}'
+    preconditions:
+      - sh: test -n "{{.TAG}}"
+        msg: "TAG is required. Usage: task operator:load TAG=my-branch"
+      - sh: '{{.CONTAINER_RUNTIME}} image inspect mirrord-operator:{{.TAG}} >/dev/null 2>&1'
+        msg: "Image mirrord-operator:{{.TAG}} not found. Run 'task operator:save' first."
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} tag mirrord-operator:{{.TAG}} mirrord-operator:{{.CHART_VERSION}}"
       - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
 
   operator:image:load:
@@ -460,9 +540,172 @@ tasks:
     desc: Update helm chart only
     cmds:
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
-      # Force pod restart to pick up any changes
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
+
+  mirrord:download:
+    desc: Download and cache a released mirrord CLI binary
+    vars:
+      VERSION: '{{.VERSION | default ""}}'
+    preconditions:
+      - sh: test -n "{{.VERSION}}"
+        msg: "VERSION is required. Usage: task mirrord:download VERSION=3.200.0"
+    cmds:
+      - |
+        DEST="{{.VERSIONS_DIR}}/mirrord/{{.VERSION}}"
+        if [ -x "$DEST/mirrord" ]; then
+          echo "mirrord {{.VERSION}} already cached"
+          exit 0
+        fi
+        mkdir -p "$DEST"
+        OS=""; ARCH=""
+        case "$(uname -s)" in
+          Darwin) OS="mac"; ARCH="universal" ;;
+          Linux)
+            OS="linux"
+            case "$(uname -m)" in
+              x86_64)  ARCH="x86_64" ;;
+              aarch64) ARCH="aarch64" ;;
+              *) echo "Unsupported arch: $(uname -m)"; exit 1 ;;
+            esac ;;
+          *) echo "Unsupported OS: $(uname -s)"; exit 1 ;;
+        esac
+        URL="https://github.com/metalbear-co/mirrord/releases/download/{{.VERSION}}/mirrord_${OS}_${ARCH}"
+        echo "Downloading mirrord {{.VERSION}} from $URL..."
+        curl -fsSL -o "$DEST/mirrord" "$URL"
+        chmod +x "$DEST/mirrord"
+        echo "Cached mirrord {{.VERSION}} at $DEST/mirrord"
+
+  mirrord:use:
+    desc: Switch to a released mirrord CLI version (downloads if not cached)
+    vars:
+      VERSION: '{{.VERSION | default ""}}'
+    preconditions:
+      - sh: test -n "{{.VERSION}}"
+        msg: "VERSION is required. Usage: task mirrord:use VERSION=3.200.0"
+    cmds:
+      - task: mirrord:download
+        vars:
+          VERSION: "{{.VERSION}}"
+      - |
+        BIN_PATH="{{.VERSIONS_DIR}}/mirrord/{{.VERSION}}/mirrord"
+        echo "Setting MIRRORD_BIN=$BIN_PATH in .env"
+        if [ -f "{{.ROOT_DIR}}/.env" ]; then
+          sed -i.bak '/^MIRRORD_BIN=/d; /^# MIRRORD_BIN .*(managed)/d' "{{.ROOT_DIR}}/.env"
+          rm -f "{{.ROOT_DIR}}/.env.bak"
+        fi
+        echo "# MIRRORD_BIN set by 'task mirrord:use VERSION={{.VERSION}}' (managed)" >> "{{.ROOT_DIR}}/.env"
+        echo "MIRRORD_BIN=$BIN_PATH" >> "{{.ROOT_DIR}}/.env"
+      - |
+        CARGO_CFG="{{.CARGO_CONFIG}}"
+        if [ ! -f "$CARGO_CFG" ]; then
+          echo "No .cargo/config.toml found, skipping"
+          exit 0
+        fi
+        BIN_PATH="{{.VERSIONS_DIR}}/mirrord/{{.VERSION}}/mirrord"
+
+        sed -i.bak '/^# mirrord-version-active:/d' "$CARGO_CFG"
+        rm -f "${CARGO_CFG}.bak"
+        sed -i.bak '/^MIRRORD_TESTS_USE_BINARY.*\.versions\/mirrord/d' "$CARGO_CFG"
+        rm -f "${CARGO_CFG}.bak"
+
+        if grep -q '^MIRRORD_TESTS_USE_BINARY' "$CARGO_CFG" && ! grep -q '# mirrord-version-saved:' "$CARGO_CFG"; then
+          ORIG=$(grep '^MIRRORD_TESTS_USE_BINARY' "$CARGO_CFG")
+          sed -i.bak "s|^MIRRORD_TESTS_USE_BINARY.*|# mirrord-version-saved: $ORIG|" "$CARGO_CFG"
+          rm -f "${CARGO_CFG}.bak"
+        fi
+
+        TMP=$(mktemp)
+        while IFS= read -r line; do
+          echo "$line" >> "$TMP"
+          if echo "$line" | grep -q '# mirrord-version-saved:'; then
+            echo "# mirrord-version-active: managed by task mirrord:use" >> "$TMP"
+            echo "MIRRORD_TESTS_USE_BINARY=\"$BIN_PATH\"" >> "$TMP"
+          fi
+        done < "$CARGO_CFG"
+        mv "$TMP" "$CARGO_CFG"
+        echo "Updated .cargo/config.toml MIRRORD_TESTS_USE_BINARY -> {{.VERSION}}"
+      - |
+        echo ""
+        echo "Switched to mirrord {{.VERSION}}"
+        echo "  CLI: {{.VERSIONS_DIR}}/mirrord/{{.VERSION}}/mirrord"
+        {{.VERSIONS_DIR}}/mirrord/{{.VERSION}}/mirrord --version 2>/dev/null || true
+
+  mirrord:use:local:
+    desc: Switch back to locally-built mirrord CLI
+    cmds:
+      - |
+        echo "Clearing MIRRORD_BIN from .env"
+        if [ -f "{{.ROOT_DIR}}/.env" ]; then
+          sed -i.bak '/^MIRRORD_BIN=/d; /^# MIRRORD_BIN .*(managed)/d' "{{.ROOT_DIR}}/.env"
+          rm -f "{{.ROOT_DIR}}/.env.bak"
+        fi
+      - |
+        CARGO_CFG="{{.CARGO_CONFIG}}"
+        if [ ! -f "$CARGO_CFG" ]; then
+          echo "No .cargo/config.toml found, skipping"
+          exit 0
+        fi
+        if grep -q '# mirrord-version-saved:' "$CARGO_CFG"; then
+          ORIG=$(grep '# mirrord-version-saved:' "$CARGO_CFG" | sed 's/^# mirrord-version-saved: //')
+          sed -i.bak '/# mirrord-version-active:/d' "$CARGO_CFG"
+          rm -f "${CARGO_CFG}.bak"
+          sed -i.bak '/^MIRRORD_TESTS_USE_BINARY/d' "$CARGO_CFG"
+          rm -f "${CARGO_CFG}.bak"
+          sed -i.bak "s|^# mirrord-version-saved: .*|$ORIG|" "$CARGO_CFG"
+          rm -f "${CARGO_CFG}.bak"
+          echo "Restored original MIRRORD_TESTS_USE_BINARY in .cargo/config.toml"
+        else
+          echo "No saved version found in .cargo/config.toml, nothing to restore"
+        fi
+      - |
+        echo ""
+        echo "Switched to local mirrord build"
+        echo "  MIRRORD_BIN defaults to 'mirrord' on PATH (or set in .env)"
+
+  versions:list:
+    desc: List all cached operator and mirrord versions
+    cmds:
+      - |
+        echo "=== Cached Operator Versions ==="
+        if [ -d "{{.VERSIONS_DIR}}/operator" ]; then
+          for f in {{.VERSIONS_DIR}}/operator/*.tar; do
+            [ -f "$f" ] || continue
+            VER=$(basename "$f" .tar)
+            CHART=""
+            if [ -f "{{.VERSIONS_DIR}}/operator/${VER}-chart.tgz" ]; then
+              CHART=" (+ chart)"
+            fi
+            echo "  $VER$CHART"
+          done
+        else
+          echo "  (none)"
+        fi
+        echo ""
+        DEPLOYED=$(kubectl get deploy mirrord-operator -n mirrord -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo "not deployed")
+        echo "Currently deployed: $DEPLOYED"
+      - |
+        echo ""
+        echo "=== Cached mirrord CLI Versions ==="
+        if [ -d "{{.VERSIONS_DIR}}/mirrord" ]; then
+          for d in {{.VERSIONS_DIR}}/mirrord/*/; do
+            [ -d "$d" ] || continue
+            VER=$(basename "$d")
+            VERSTR=$("$d/mirrord" --version 2>/dev/null || echo "$VER")
+            echo "  $VERSTR"
+          done
+        else
+          echo "  (none)"
+        fi
+        echo ""
+        ACTIVE_BIN="{{.MIRRORD_BIN}}"
+        if [ "$ACTIVE_BIN" = "mirrord" ]; then
+          echo "Active CLI: mirrord on PATH ($(which mirrord 2>/dev/null || echo 'not found'))"
+        else
+          echo "Active CLI: $ACTIVE_BIN"
+        fi
+        $ACTIVE_BIN --version 2>/dev/null || true
 
   preview:deploy:echo-app:
     desc: Build and deploy echo-app to bearkube for preview testing
@@ -914,6 +1157,74 @@ tasks:
       - task: license:create:secret
       - task: operator:install:nobuild
       - task: kafka:test
+
+  test:kafka:short-hostname:
+    desc: "Kafka short-hostname repro (broker advertises cp-kafka:9092 -- triggers DNS failure)"
+    deps: [build:app:kafka, operator:install]
+    cmds:
+      - task: kafka:short-hostname:test
+
+  test:kafka:short-hostname:clean:
+    desc: "Clean cluster and run Kafka short-hostname repro"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:kafka:short-hostname
+
+  test:kafka:short-hostname:clean:nobuild:
+    desc: "Clean cluster and run Kafka short-hostname repro (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: build:app:kafka
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: kafka:short-hostname:test
+
+  repro:kafka:dns-crash:
+    desc: "Reproduce libuv EAI_* assertion crash (requires Kafka env deployed)"
+    cmds:
+      - task: kafka:repro:dns-crash
+
+  repro:kafka:dns-crash:clean:
+    desc: "Clean cluster, deploy Kafka, then reproduce libuv EAI_* crash"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: test:kafka
+      - task: kafka:repro:dns-crash
+
+  repro:kafka:multi-conn:
+    desc: "Reproduce Kafka multi-connection issue (requires Kafka env deployed)"
+    cmds:
+      - task: kafka:repro:multi-conn
+
+  repro:kafka:multi-conn:direct:
+    desc: "Run Kafka multi-conn test WITHOUT mirrord (baseline comparison)"
+    cmds:
+      - task: kafka:repro:multi-conn:direct
+
+  repro:kafka:sasl:
+    desc: "Reproduce Kafka SASL issue through mirrord (requires kafka-sasl deployed)"
+    cmds:
+      - task: kafka:repro:sasl
+
+  repro:kafka:sasl:deploy:
+    desc: "Deploy Kafka with SASL and run SASL repro through mirrord"
+    cmds:
+      - task: kafka:repro:sasl:deploy
+      - task: kafka:repro:sasl
+
+  repro:kafka:sasl-ssl:
+    desc: "Reproduce Kafka SASL_SSL issue through mirrord (requires kafka-sasl-ssl deployed)"
+    cmds:
+      - task: kafka:repro:sasl-ssl
+
+  repro:kafka:sasl-ssl:deploy:
+    desc: "Deploy Kafka with SASL_SSL and run repro through mirrord"
+    cmds:
+      - task: kafka:repro:sasl-ssl:deploy
+      - task: kafka:repro:sasl-ssl
 
   test:redis:
     desc: "Run Redis test"
@@ -1828,4 +2139,4 @@ tasks:
   _wait:operator:
     internal: true
     cmds:
-      - kubectl wait --for=condition=ready pod -l app=mirrord-operator -n mirrord --timeout=300s
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=300s

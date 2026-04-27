@@ -129,6 +129,212 @@ tasks:
     cmds:
       - kubectl describe pod -n {{.NAMESPACE}} -l app=kafka-cluster
 
+  short-hostname:deploy:
+    desc: "Deploy Kafka with short advertised hostname (reproduces prospect DNS issue)"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-short-hostname
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/overlays/kafka-short-hostname/kafka-client-config.yaml
+      - task: _wait:kafka:short-hostname
+      - task: _wait:consumer
+
+  short-hostname:test:
+    desc: "Full short-hostname Kafka test (deploy + trigger split to see resolution failure)"
+    cmds:
+      - task: short-hostname:deploy
+      - task: short-hostname:send
+      - echo ""
+      - echo "Now trigger a split session to reproduce the Host resolution failure:"
+      - echo "  task kafka:short-hostname:split"
+      - echo ""
+      - echo "Or check operator logs for the error:"
+      - echo "  kubectl logs -n mirrord -l app=mirrord-operator --tail=50"
+
+  short-hostname:send:
+    desc: "Send test message to cp-kafka broker"
+    vars:
+      MESSAGE: '{{.MESSAGE | default "Test message short-hostname"}}'
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      USER_ID: '{{.USER_ID | default ""}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=cp-kafka -o jsonpath='{.items[0].metadata.name}')
+        if [ -n "{{.USER_ID}}" ]; then
+          echo "Sending message with header user_id={{.USER_ID}} to topic {{.TOPIC}}..."
+          printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --property 'parse.headers=true' --property 'headers.delimiter=|'
+          echo "Message sent with header user_id={{.USER_ID}}"
+        else
+          echo "Sending message without headers to topic {{.TOPIC}}..."
+          printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}}
+          echo "Message sent"
+        fi
+
+  short-hostname:split:
+    desc: "Run mirrord with split_queues against the short-hostname Kafka setup"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka-short-hostname/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  short-hostname:logs:
+    desc: "Show operator logs (look for Host resolution failure)"
+    cmds:
+      - echo "=== Operator logs (last 80 lines) ==="
+      - kubectl logs -n mirrord -l app=mirrord-operator --tail=80
+      - echo ""
+      - echo "=== Consumer logs ==="
+      - kubectl logs -n {{.NAMESPACE}} -l app=kafka-consumer --tail=30
+
+  short-hostname:status:
+    desc: "Show short-hostname Kafka test environment status"
+    cmds:
+      - echo "=== cp-kafka Broker ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=cp-kafka 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Kafka Consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== MirrordKafkaClientConfig ==="
+      - kubectl get mirrordkafkaclientconfigs -n mirrord 2>/dev/null || echo "No configs"
+      - echo ""
+      - echo "=== MirrordKafkaTopicsConsumer ==="
+      - kubectl get mirrordkafkatopicsconsumers -n {{.NAMESPACE}} 2>/dev/null || echo "No consumers"
+      - echo ""
+      - echo "=== Broker advertised.listeners (should be short hostname) ==="
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=cp-kafka -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- env | grep -i KAFKA_ADVERTISED || echo "  (not found)"
+        else
+          echo "  Broker not running"
+        fi
+
+  short-hostname:clean:
+    desc: "Clean short-hostname Kafka test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/kafka-short-hostname --ignore-not-found=true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/overlays/kafka-short-hostname/kafka-client-config.yaml --ignore-not-found=true
+
+  repro:dns-crash:
+    desc: "Reproduce libuv EAI_* assertion crash (Node.js + mirrord remote DNS on macOS)"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/apps/node-dns-repro/mirrord.json")}}'
+    cmds:
+      - echo "Reproducing libuv EAI_* assertion crash..."
+      - echo "This runs a Node.js script under mirrord with remote DNS resolution."
+      - echo "On macOS, a DNS lookup failure should trigger the assertion."
+      - echo ""
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- node {{.ROOT_DIR}}/apps/node-dns-repro/repro.js"
+
+  repro:multi-conn:
+    desc: "Reproduce Kafka multi-connection issue (Node.js producers+consumers through mirrord outgoing proxy)"
+    dir: "{{.ROOT_DIR}}/apps/node-kafka-repro"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/apps/node-kafka-repro/mirrord.json")}}'
+      NUM_PRODUCERS: '{{.NUM_PRODUCERS | default "4"}}'
+      NUM_CONSUMERS: '{{.NUM_CONSUMERS | default "3"}}'
+    cmds:
+      - echo "Reproducing Kafka multi-connection issue..."
+      - echo "Starting {{.NUM_PRODUCERS}} producers + {{.NUM_CONSUMERS}} consumers through mirrord outgoing proxy."
+      - echo ""
+      - "NUM_PRODUCERS={{.NUM_PRODUCERS}} NUM_CONSUMERS={{.NUM_CONSUMERS}} {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- node repro.js"
+
+  repro:multi-conn:direct:
+    desc: "Run the same Kafka multi-connection test WITHOUT mirrord (baseline comparison)"
+    dir: "{{.ROOT_DIR}}/apps/node-kafka-repro"
+    vars:
+      NUM_PRODUCERS: '{{.NUM_PRODUCERS | default "4"}}'
+      NUM_CONSUMERS: '{{.NUM_CONSUMERS | default "3"}}'
+    cmds:
+      - echo "Running baseline (no mirrord) -- use kubectl port-forward first:"
+      - echo "  kubectl port-forward -n test-mirrord svc/kafka-cluster 9092:9092"
+      - echo ""
+      - "KAFKA_BOOTSTRAP_SERVERS=localhost:9092 NUM_PRODUCERS={{.NUM_PRODUCERS}} NUM_CONSUMERS={{.NUM_CONSUMERS}} node repro.js"
+
+  repro:sasl:deploy:
+    desc: "Deploy Kafka with SASL_PLAINTEXT (PLAIN mechanism)"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-sasl
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer
+      - 'echo "SASL Kafka ready. SASL port is 9094, PLAIN mechanism, user: testuser."'
+
+  repro:sasl:
+    desc: "Reproduce Kafka SASL multi-connection issue through mirrord outgoing proxy"
+    dir: "{{.ROOT_DIR}}/apps/node-kafka-repro"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/apps/node-kafka-repro/mirrord-sasl.json")}}'
+      NUM_PRODUCERS: '{{.NUM_PRODUCERS | default "4"}}'
+      NUM_CONSUMERS: '{{.NUM_CONSUMERS | default "3"}}'
+    cmds:
+      - echo "Reproducing Kafka SASL multi-connection issue..."
+      - echo "Connecting to SASL_PLAINTEXT port 9094 with SCRAM-SHA-512"
+      - echo ""
+      - "NUM_PRODUCERS={{.NUM_PRODUCERS}} NUM_CONSUMERS={{.NUM_CONSUMERS}} {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- node repro.js"
+
+  repro:sasl:direct:
+    desc: "Run SASL test WITHOUT mirrord (baseline - needs port-forward to 9094)"
+    dir: "{{.ROOT_DIR}}/apps/node-kafka-repro"
+    vars:
+      NUM_PRODUCERS: '{{.NUM_PRODUCERS | default "4"}}'
+      NUM_CONSUMERS: '{{.NUM_CONSUMERS | default "3"}}'
+    cmds:
+      - echo "Running SASL baseline (no mirrord) -- use kubectl port-forward first:"
+      - echo "  kubectl port-forward -n test-mirrord svc/kafka-cluster 9094:9094"
+      - echo ""
+      - |
+        KAFKA_BOOTSTRAP_SERVERS=localhost:9094 \
+        KAFKA_SASL_USERNAME=testuser \
+        KAFKA_SASL_PASSWORD=testpassword \
+        KAFKA_SASL_MECHANISM=plain \
+        NUM_PRODUCERS={{.NUM_PRODUCERS}} \
+        NUM_CONSUMERS={{.NUM_CONSUMERS}} \
+        node repro.js
+
+  repro:sasl-ssl:deploy:
+    desc: "Deploy Kafka with SASL_SSL listener"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-sasl-ssl
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer
+      - echo "SASL_SSL Kafka ready on port 9095."
+
+  repro:sasl-ssl:
+    desc: "Reproduce Kafka SASL_SSL multi-connection issue through mirrord outgoing proxy"
+    dir: "{{.ROOT_DIR}}/apps/node-kafka-repro"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/apps/node-kafka-repro/mirrord-sasl-ssl.json")}}'
+      NUM_PRODUCERS: '{{.NUM_PRODUCERS | default "4"}}'
+      NUM_CONSUMERS: '{{.NUM_CONSUMERS | default "3"}}'
+    cmds:
+      - echo "Reproducing Kafka SASL_SSL multi-connection issue..."
+      - echo "Connecting to SASL_SSL port 9095 with TLS + SASL PLAIN"
+      - echo ""
+      - "NUM_PRODUCERS={{.NUM_PRODUCERS}} NUM_CONSUMERS={{.NUM_CONSUMERS}} {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- node repro.js"
+
+  repro:sasl-ssl:direct:
+    desc: "Run SASL_SSL test WITHOUT mirrord (baseline - needs port-forward to 9095)"
+    dir: "{{.ROOT_DIR}}/apps/node-kafka-repro"
+    vars:
+      NUM_PRODUCERS: '{{.NUM_PRODUCERS | default "4"}}'
+      NUM_CONSUMERS: '{{.NUM_CONSUMERS | default "3"}}'
+    cmds:
+      - echo "Running SASL_SSL baseline (no mirrord) -- use kubectl port-forward first:"
+      - echo "  kubectl port-forward -n test-mirrord svc/kafka-cluster 9095:9095"
+      - echo ""
+      - |
+        KAFKA_BOOTSTRAP_SERVERS=localhost:9095 \
+        KAFKA_SASL_USERNAME=testuser \
+        KAFKA_SASL_PASSWORD=testpassword \
+        KAFKA_SASL_MECHANISM=plain \
+        KAFKA_SSL=true \
+        NUM_PRODUCERS={{.NUM_PRODUCERS}} \
+        NUM_CONSUMERS={{.NUM_CONSUMERS}} \
+        node repro.js
+
   clean:
     desc: "Clean Kafka test resources"
     cmds:
@@ -140,6 +346,12 @@ tasks:
     cmds:
       - echo "Waiting for Kafka cluster..."
       - kubectl wait --for=condition=ready pod -l app=kafka-cluster -n {{.NAMESPACE}} --timeout=300s
+
+  _wait:kafka:short-hostname:
+    internal: true
+    cmds:
+      - echo "Waiting for cp-kafka broker..."
+      - kubectl wait --for=condition=ready pod -l app=cp-kafka -n {{.NAMESPACE}} --timeout=300s
 
   _wait:consumer:
     internal: true

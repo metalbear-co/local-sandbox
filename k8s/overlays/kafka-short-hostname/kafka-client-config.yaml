@@ -1,0 +1,14 @@
+---
+# MirrordKafkaClientConfig for short-hostname reproduction.
+# bootstrap.servers uses FQDN so the initial connection works, but the broker
+# advertises "cp-kafka:9092" (short name) in its metadata response. The operator
+# pod in the mirrord namespace cannot resolve "cp-kafka" -> Host resolution failure.
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordKafkaClientConfig
+metadata:
+  name: kafka-short-hostname-config
+  namespace: mirrord
+spec:
+  properties:
+  - name: bootstrap.servers
+    value: cp-kafka.test-mirrord.svc.cluster.local:9092

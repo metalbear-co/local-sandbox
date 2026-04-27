@@ -1,0 +1,31 @@
+{
+    "operator": true,
+    "target": {
+        "path": "deployment/kafka-consumer",
+        "namespace": "test-mirrord"
+    },
+    "feature": {
+        "env": {
+            "override": {
+                "KAFKA_BOOTSTRAP_SERVERS": "kafka-cluster.test-mirrord.svc.cluster.local:9094",
+                "KAFKA_SASL_USERNAME": "testuser",
+                "KAFKA_SASL_PASSWORD": "testpassword",
+                "KAFKA_SASL_MECHANISM": "plain",
+                "MONDAY_MIRROR": "true",
+                "MIRRORD_ROUTING_KEY": "test-user"
+            }
+        },
+        "network": {
+            "dns": {
+                "enabled": true
+            },
+            "incoming": {
+                "mode": "steal"
+            },
+            "outgoing": true
+        }
+    },
+    "experimental": {
+        "non_blocking_tcp_connect": true
+    }
+}
