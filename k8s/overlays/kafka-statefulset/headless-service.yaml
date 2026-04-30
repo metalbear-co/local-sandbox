@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-consumer
+  namespace: test-mirrord
+spec:
+  clusterIP: None
+  selector:
+    app: kafka-consumer
+  ports:
+    - name: placeholder
+      port: 80
+      targetPort: 80

@@ -109,6 +109,15 @@ tasks:
       - go build -o /tmp/pubsub-consumer-jq main.go
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-jq'
 
+  run:local:wildcard:
+    desc: "Run local consumer with wildcard '*' queue key (expands to all queues in MirrordSplitConfig)"
+    dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator/mirrord-wildcard.json'
+    cmds:
+      - go build -o /tmp/pubsub-consumer-wc main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/pubsub-consumer-wc'
+
   run:local:orders-only:
     desc: "Multi-queue: split only the orders queue (tenant=^test)"
     dir: "{{.ROOT_DIR}}/apps/pubsub-consumer"
@@ -873,6 +882,12 @@ tasks:
       - echo "    task pubsub:send TENANT=other TYPE=premium"
       - echo "    task pubsub:send TENANT=other TYPE=basic"
       - echo "    Expected - only type=premium in body JSON received, regardless of tenant"
+      - echo ""
+      - echo "  Test 4 - Wildcard queue key (split_queues[\"*\"]):"
+      - echo "    cd local-sandbox && task pubsub:run:local:wildcard"
+      - echo "    task pubsub:send TENANT=test-user"
+      - echo "    task pubsub:send TENANT=other"
+      - echo "    Expected - same as Test 1, '*' expands to all queues in MirrordSplitConfig"
 
   _setup:topic:
     internal: true

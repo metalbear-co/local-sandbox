@@ -335,6 +335,111 @@ tasks:
         NUM_CONSUMERS={{.NUM_CONSUMERS}} \
         node repro.js
 
+  statefulset:deploy:
+    desc: "Deploy Kafka with StatefulSet consumer (RollingUpdate strategy)"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-statefulset
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer:statefulset
+      - echo "Kafka StatefulSet consumer deployed (RollingUpdate strategy, 1 replica)."
+
+  statefulset:deploy:ondelete:
+    desc: "Deploy Kafka with StatefulSet consumer (OnDelete strategy -- reproduces customer issue)"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-statefulset-ondelete
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer:statefulset
+      - echo "Kafka StatefulSet consumer deployed (OnDelete strategy, 1 replica)."
+
+  statefulset:deploy:2:
+    desc: "Deploy Kafka with StatefulSet consumer (RollingUpdate, 2 replicas)"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-statefulset
+      - kubectl scale statefulset kafka-consumer -n {{.NAMESPACE}} --replicas=2
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer:statefulset
+      - echo "Kafka StatefulSet consumer deployed (RollingUpdate strategy, 2 replicas)."
+
+  statefulset:split:
+    desc: "Run mirrord Kafka split against StatefulSet consumer"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka-statefulset/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  statefulset:status:
+    desc: "Show StatefulSet Kafka consumer status"
+    cmds:
+      - echo "=== StatefulSet ==="
+      - kubectl get statefulset kafka-consumer -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-consumer -o wide 2>/dev/null || echo "No pods"
+      - echo ""
+      - echo "=== MirrordKafkaTopicsConsumer ==="
+      - kubectl get mirrordkafkatopicsconsumers -n {{.NAMESPACE}} 2>/dev/null || echo "No consumers"
+      - echo ""
+      - echo "=== Operator logs (last 20 lines) ==="
+      - kubectl logs -n mirrord -l app=mirrord-operator --tail=20 2>/dev/null || echo "No operator"
+
+  statefulset:clean:
+    desc: "Clean StatefulSet Kafka test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/kafka-statefulset --ignore-not-found=true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml --ignore-not-found=true
+
+  multi-topic:deploy:
+    desc: "Deploy Kafka with 4-topic consumer (tests per-topic restart behavior)"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-multi-topic
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer
+      - task: _create:multi-topics
+      - echo "Kafka multi-topic consumer deployed (4 topics)."
+
+  multi-topic:split:
+    desc: "Run mirrord Kafka split against 4-topic consumer (watch for per-topic restarts)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka-multi-topic/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  multi-topic:test:
+    desc: "Full multi-topic test: clean, deploy, split (reproduces per-topic restart issue)"
+    cmds:
+      - task: multi-topic:clean
+      - task: multi-topic:deploy
+      - task: multi-topic:split
+
+  multi-topic:clean:
+    desc: "Clean multi-topic Kafka test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/kafka-multi-topic --ignore-not-found=true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml --ignore-not-found=true
+      - kubectl delete mirrordkafkaephemeraltopics --all -n mirrord --ignore-not-found=true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A --ignore-not-found=true
+      - kubectl delete mirrordclusterworkloadpatches --all -A --ignore-not-found=true
+
+  _create:multi-topics:
+    internal: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        for TOPIC in topic-orders topic-payments topic-notifications topic-analytics; do
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh \
+            --create --if-not-exists --bootstrap-server localhost:9092 \
+            --topic $TOPIC --partitions 3 --replication-factor 1 2>&1 || true
+        done
+        echo "All 4 topics created."
+
   clean:
     desc: "Clean Kafka test resources"
     cmds:
@@ -357,4 +462,10 @@ tasks:
     internal: true
     cmds:
       - echo "Waiting for Kafka consumer..."
+      - kubectl wait --for=condition=ready pod -l app=kafka-consumer -n {{.NAMESPACE}} --timeout=120s
+
+  _wait:consumer:statefulset:
+    internal: true
+    cmds:
+      - echo "Waiting for StatefulSet Kafka consumer..."
       - kubectl wait --for=condition=ready pod -l app=kafka-consumer -n {{.NAMESPACE}} --timeout=120s

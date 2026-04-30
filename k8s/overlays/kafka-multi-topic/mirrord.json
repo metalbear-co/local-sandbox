@@ -1,0 +1,35 @@
+{
+    "operator": true,
+    "target": {
+        "path": "deployment/kafka-consumer",
+        "namespace": "test-mirrord"
+    },
+    "feature": {
+        "split_queues": {
+            "topic-orders": {
+                "queue_type": "Kafka",
+                "message_filter": {
+                    "user_id": "test-user"
+                }
+            },
+            "topic-payments": {
+                "queue_type": "Kafka",
+                "message_filter": {
+                    "user_id": "test-user"
+                }
+            },
+            "topic-notifications": {
+                "queue_type": "Kafka",
+                "message_filter": {
+                    "user_id": "test-user"
+                }
+            },
+            "topic-analytics": {
+                "queue_type": "Kafka",
+                "message_filter": {
+                    "user_id": "test-user"
+                }
+            }
+        }
+    }
+}

@@ -1226,6 +1226,24 @@ tasks:
       - task: kafka:repro:sasl-ssl:deploy
       - task: kafka:repro:sasl-ssl
 
+  repro:kafka:statefulset:
+    desc: "Deploy StatefulSet consumer (RollingUpdate) and run Kafka split"
+    cmds:
+      - task: kafka:statefulset:deploy
+      - task: kafka:statefulset:split
+
+  repro:kafka:statefulset:ondelete:
+    desc: "Deploy StatefulSet consumer (OnDelete) and run Kafka split -- reproduces customer issue"
+    cmds:
+      - task: kafka:statefulset:deploy:ondelete
+      - task: kafka:statefulset:split
+
+  repro:kafka:statefulset:2:
+    desc: "Deploy StatefulSet consumer (RollingUpdate, 2 replicas) and run Kafka split"
+    cmds:
+      - task: kafka:statefulset:deploy:2
+      - task: kafka:statefulset:split
+
   test:redis:
     desc: "Run Redis test"
     cmds:

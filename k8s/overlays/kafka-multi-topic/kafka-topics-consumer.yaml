@@ -1,0 +1,50 @@
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordKafkaTopicsConsumer
+metadata:
+  name: kafka-consumer-multi
+  namespace: test-mirrord
+spec:
+  consumerApiVersion: apps/v1
+  consumerKind: Deployment
+  consumerName: kafka-consumer
+  topics:
+  - id: topic-orders
+    clientConfig: kafka-test-config
+    groupIdSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_GROUP_ID
+    nameSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_TOPIC_1
+  - id: topic-payments
+    clientConfig: kafka-test-config
+    groupIdSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_GROUP_ID
+    nameSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_TOPIC_2
+  - id: topic-notifications
+    clientConfig: kafka-test-config
+    groupIdSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_GROUP_ID
+    nameSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_TOPIC_3
+  - id: topic-analytics
+    clientConfig: kafka-test-config
+    groupIdSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_GROUP_ID
+    nameSources:
+    - directEnvVar:
+        container: consumer
+        variable: KAFKA_TOPIC_4
