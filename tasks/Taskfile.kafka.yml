@@ -419,6 +419,20 @@ tasks:
       - task: multi-topic:deploy
       - task: multi-topic:split
 
+  multi-topic:two-sessions:a:
+    desc: "Run multi-topic session A (filter user_id=alice)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec --key shared-multi-key -f {{.ROOT_DIR}}/k8s/overlays/kafka-multi-topic/mirrord-session-a.json -- /tmp/kafka-consumer"
+
+  multi-topic:two-sessions:b:
+    desc: "Run multi-topic session B (filter user_id=bob)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec --key shared-multi-key -f {{.ROOT_DIR}}/k8s/overlays/kafka-multi-topic/mirrord-session-b.json -- /tmp/kafka-consumer"
+
   multi-topic:clean:
     desc: "Clean multi-topic Kafka test resources"
     cmds:
@@ -439,6 +453,43 @@ tasks:
             --topic $TOPIC --partitions 3 --replication-factor 1 2>&1 || true
         done
         echo "All 4 topics created."
+
+  two-sessions:deploy:
+    desc: "Deploy Kafka for two-session test (single topic, two filters: alice + bob)"
+    cmds:
+      - task: deploy
+      - |
+        echo ""
+        echo "Ready. Now run in separate terminals:"
+        echo "  task kafka:two-sessions:a    # session A (user_id=alice)"
+        echo "  task kafka:two-sessions:b    # session B (user_id=bob)"
+        echo ""
+        echo "Then send messages:"
+        echo "  task kafka:send TOPIC=test-topic MESSAGE=for-alice USER_ID=alice"
+        echo "  task kafka:send TOPIC=test-topic MESSAGE=for-bob USER_ID=bob"
+        echo "  task kafka:send TOPIC=test-topic MESSAGE=for-remote"
+
+  two-sessions:a:
+    desc: "Run session A (filter user_id=alice)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec --key shared-test-key -f {{.ROOT_DIR}}/k8s/overlays/kafka/mirrord-session-a.json -- /tmp/kafka-consumer"
+
+  two-sessions:b:
+    desc: "Run session B (filter user_id=bob)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec --key shared-test-key -f {{.ROOT_DIR}}/k8s/overlays/kafka/mirrord-session-b.json -- /tmp/kafka-consumer"
+
+  two-sessions:clean:
+    desc: "Clean two-session test resources"
+    cmds:
+      - task: clean
+      - kubectl delete mirrordkafkaephemeraltopics --all -n mirrord --ignore-not-found=true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A --ignore-not-found=true
+      - kubectl delete mirrordclusterworkloadpatches --all -A --ignore-not-found=true
 
   clean:
     desc: "Clean Kafka test resources"

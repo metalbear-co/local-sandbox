@@ -37,6 +37,9 @@ includes:
   pubsub:
     taskfile: ./tasks/Taskfile.pubsub.yml
     dir: ./tasks
+  servicebus:
+    taskfile: ./tasks/Taskfile.servicebus.yml
+    dir: ./tasks
   eks:
     taskfile: ./tasks/Taskfile.eks.yml
     dir: ./tasks
@@ -430,6 +433,34 @@ tasks:
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
       - task: _wait:operator
+
+  operator:quick:
+    desc: "Rebuild operator, reload image, restart pod (skips helm upgrade)"
+    cmds:
+      - task: build:operator
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      - task: _wait:operator
+
+  operator:dev:
+    desc: "Run operator locally with mirrord (steal traffic from deployed operator)"
+    dir: "{{.OPERATOR_DIR}}"
+    vars:
+      ISOLATION_MARKER: '{{.ISOLATION_MARKER | default "local-dev"}}'
+    env:
+      OPERATOR_ISOLATION_MARKER: "{{.ISOLATION_MARKER}}"
+      OPERATOR_LICENSE_ISSUER_PUBLIC_KEY:
+        sh: cat {{.SCRIPTS_DIR}}/license-issuer.pem
+    cmds:
+      - kubectl delete pods -n mirrord -l app=mirrord --force --grace-period=0 2>/dev/null || true
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=60s
+      - cargo build -p operator-service
+      - codesign -f -s - ./target/debug/operator-service
+      - |
+        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/.mirrord/operator-dev.toml -- \
+          ./target/debug/operator-service
+    interactive: true
 
   operator:download:
     desc: Download and cache a released operator image + helm chart
@@ -1092,6 +1123,12 @@ tasks:
     deps: [operator:install]
     cmds:
       - task: pubsub:deploy
+
+  test:servicebus:
+    desc: "Deploy Azure Service Bus emulator + consumer and install operator"
+    deps: [operator:install]
+    cmds:
+      - task: servicebus:deploy
 
   test:pubsub:clean:
     desc: "Clean cluster and deploy Pub/Sub from scratch"

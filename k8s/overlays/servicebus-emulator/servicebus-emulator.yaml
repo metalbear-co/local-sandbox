@@ -1,0 +1,108 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: azure-sql-edge
+  namespace: servicebus-emulator
+  labels:
+    app: azure-sql-edge
+spec:
+  containers:
+  - name: azure-sql-edge
+    image: mcr.microsoft.com/azure-sql-edge:latest
+    env:
+    - name: ACCEPT_EULA
+      value: "Y"
+    - name: MSSQL_SA_PASSWORD
+      value: "Strong!Passw0rd"
+    ports:
+    - containerPort: 1433
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: azure-sql-edge
+  namespace: servicebus-emulator
+spec:
+  selector:
+    app: azure-sql-edge
+  ports:
+  - port: 1433
+    targetPort: 1433
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: servicebus-emulator-config
+  namespace: servicebus-emulator
+data:
+  Config.json: |
+    {
+      "UserConfig": {
+        "Namespaces": [{
+          "Name": "sbemulatorns",
+          "Queues": [
+            {"Name": "test-queue", "Properties": {}},
+            {"Name": "orders-queue", "Properties": {}},
+            {"Name": "notifications-queue", "Properties": {}}
+          ],
+          "Topics": [{
+            "Name": "test-topic",
+            "Properties": {},
+            "Subscriptions": [
+              {"Name": "test-sub", "Properties": {}}
+            ]
+          }]
+        }],
+        "Logging": {
+          "Type": "Console"
+        }
+      }
+    }
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: servicebus-emulator
+  namespace: servicebus-emulator
+  labels:
+    app.kubernetes.io/name: servicebus-emulator
+spec:
+  containers:
+  - name: servicebus-emulator
+    image: mcr.microsoft.com/azure-messaging/servicebus-emulator:latest
+    env:
+    - name: ACCEPT_EULA
+      value: "Y"
+    - name: SQL_SERVER
+      value: "azure-sql-edge"
+    - name: MSSQL_SA_PASSWORD
+      value: "Strong!Passw0rd"
+    ports:
+    - containerPort: 5672
+      name: amqp
+    - containerPort: 5300
+      name: management
+    volumeMounts:
+    - name: config
+      mountPath: /ServiceBus_Emulator/ConfigFiles/Config.json
+      subPath: Config.json
+  volumes:
+  - name: config
+    configMap:
+      name: servicebus-emulator-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: servicebus-emulator
+  namespace: servicebus-emulator
+spec:
+  selector:
+    app.kubernetes.io/name: servicebus-emulator
+  ports:
+  - port: 5672
+    targetPort: 5672
+    name: amqp
+  - port: 5300
+    targetPort: 5300
+    name: management

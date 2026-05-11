@@ -4,6 +4,7 @@ operator:
   rmqSplitting: true
   kafkaSplitting: true
   gcpPubsubSplitting: true
+  azureServiceBusSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true

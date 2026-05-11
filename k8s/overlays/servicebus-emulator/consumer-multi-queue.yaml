@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: servicebus-multi-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: servicebus-multi-consumer
+  template:
+    metadata:
+      labels:
+        app: servicebus-multi-consumer
+    spec:
+      initContainers:
+      - name: wait-for-emulator
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for Service Bus emulator to be ready..."
+          until nc -z servicebus-emulator.servicebus-emulator.svc.cluster.local 5672 2>/dev/null; do
+            echo "Emulator not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "Service Bus emulator is ready!"
+      containers:
+      - name: consumer
+        image: servicebus-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: SERVICEBUS_CONNECTION_STRING
+          value: "Endpoint=sb://servicebus-emulator.servicebus-emulator.svc.cluster.local;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true"
+        - name: SERVICEBUS_ORDERS_QUEUE
+          value: "orders-queue"
+        - name: SERVICEBUS_NOTIFICATIONS_QUEUE
+          value: "notifications-queue"
