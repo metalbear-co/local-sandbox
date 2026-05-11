@@ -7,7 +7,7 @@
   "feature": {
     "split_queues": {
       "test-subscription": {
-        "queue_type": "GcpPubSub",
+        "queue_type": "GCPPubSub",
         "message_filter": {
           "tenant": "^test",
           "type": "^premium$"

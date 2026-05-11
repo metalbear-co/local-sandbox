@@ -3604,7 +3604,7 @@ tasks:
   pubsub:wait:emulator:
     desc: Wait for the Pub/Sub emulator pod to be ready
     cmds:
-      - kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n pubsub-emulator --timeout=120s
+      - kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n pubsub-emulator --timeout=300s
 
   pubsub:create:topic:
     desc: Create test topic and subscription in the emulator
@@ -3879,7 +3879,7 @@ tasks:
           "feature": {
             "split_queues": {
               "test-subscription": {
-                "queue_type": "GcpPubSub",
+                "queue_type": "GCPPubSub",
                 "message_filter": {
                   "tenant": "^test"
                 }
@@ -3914,7 +3914,7 @@ tasks:
           "feature": {
             "split_queues": {
               "test-subscription": {
-                "queue_type": "GcpPubSub",
+                "queue_type": "GCPPubSub",
                 "message_filter": {
                   "tenant": "{{.TENANT_FILTER}}"
                 }

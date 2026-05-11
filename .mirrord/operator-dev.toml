@@ -1,0 +1,23 @@
+operator = false
+skip_sip = ["operator-service"]
+
+[target]
+path = "deployment/mirrord-operator"
+namespace = "mirrord"
+
+[agent]
+log_level = "mirrord=debug"
+image = "test"
+image_pull_policy = "Never"
+namespace = "mirrord"
+clean_iptables_on_start = true
+
+[feature.network]
+incoming = "steal"
+
+[feature.fs]
+mode = "read"
+read_only = ["/var.+", "/mirrord.+"]
+
+[feature.env.override]
+RUST_LOG = "operator_service=info,mirrord=info,operator_kafka_splitting=debug,operator_pod_mutator=debug"

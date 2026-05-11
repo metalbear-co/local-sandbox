@@ -1,0 +1,17 @@
+{
+  "target": {
+    "path": "deployment/servicebus-multi-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "orders": {
+        "queue_type": "AzureServiceBus",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

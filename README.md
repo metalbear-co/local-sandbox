@@ -57,6 +57,71 @@ task license:generate
 task cluster:create
 ```
 
+## Backwards Compatibility Testing
+
+Test released operator and mirrord CLI versions against your local builds.
+
+### Setup
+
+Add your production license key to `.env` (needed for released operator images):
+
+```bash
+RELEASE_LICENSE_KEY=your-license-key-here
+```
+
+### Operator version switching
+
+```bash
+# Deploy a released operator version
+task operator:use VERSION=3.152.0
+
+# Switch back to your local build
+task operator:install
+# or
+task operator:update
+```
+
+`operator:use` downloads and caches the image + helm chart on first use, so
+subsequent switches to the same version are fast.
+
+### mirrord CLI version switching
+
+```bash
+# Use a released mirrord CLI
+task mirrord:use VERSION=3.200.0
+
+# Switch back to your local build
+task mirrord:use:local
+```
+
+This updates `MIRRORD_BIN` in `.env` (used by all sandbox tasks) and
+`MIRRORD_TESTS_USE_BINARY` in `.cargo/config.toml` (used by `cargo test`),
+if the file exists.
+
+### Example workflows
+
+```bash
+# Old operator + new CLI
+task operator:use VERSION=3.150.0
+task mirrord:use:local
+task postgres:test:branch
+
+# New operator + old CLI
+task operator:install
+task mirrord:use VERSION=3.195.0
+task postgres:test:branch
+
+# See what's cached and active
+task versions:list
+```
+
+### Pre-downloading versions
+
+```bash
+task operator:download VERSION=3.150.0
+task mirrord:download VERSION=3.195.0
+```
+
 ## Running Tests
 
 Each module follows the same pattern:
@@ -539,7 +604,7 @@ clusters with a `tenant=^test$` filter. The mirrord config looks like:
   "feature": {
     "split_queues": {
       "test-subscription": {
-        "queue_type": "GcpPubSub",
+        "queue_type": "GCPPubSub",
         "message_filter": {
           "tenant": "^test"
         }

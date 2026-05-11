@@ -1,0 +1,16 @@
+{
+    "operator": true,
+    "target": {
+        "path": "deployment/kafka-consumer",
+        "namespace": "test-mirrord"
+    },
+    "feature": {
+        "network": {
+            "dns": {
+                "enabled": true
+            },
+            "incoming": "steal",
+            "outgoing": true
+        }
+    }
+}

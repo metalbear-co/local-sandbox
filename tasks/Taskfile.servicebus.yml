@@ -1,0 +1,939 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  EMULATOR_NAMESPACE: "servicebus-emulator"
+  QUEUE: '{{.QUEUE | default "test-queue"}}'
+  OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator"
+  CONN_STR: "Endpoint=sb://servicebus-emulator.servicebus-emulator.svc.cluster.local;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true"
+
+tasks:
+  build:
+    desc: "Build and load the servicebus-consumer image into minikube"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    cmds:
+      - go mod tidy
+      - docker build -t servicebus-consumer:local .
+      - minikube -p {{.CLUSTER_NAME}} image load servicebus-consumer:local
+
+  deploy:emulator:
+    desc: "Deploy only the Azure Service Bus emulator (SQL Edge + emulator pods)"
+    cmds:
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+
+  deploy:
+    desc: "Deploy emulator + consumer pod + CRDs (for manual testing)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer.yaml
+      - task: _wait:consumer
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config.yaml
+
+  run:
+    desc: "Deploy everything + run local consumer in one shot (tenant=^test filter)"
+    cmds:
+      - task: deploy
+      - task: run:local
+
+  run:local:
+    desc: "Run servicebus consumer locally with mirrord (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/servicebus-emulator/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/servicebus-consumer main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer'
+
+  run:copy-target:
+    desc: "Deploy everything + run local consumer with copy target (tenant=^test filter)"
+    cmds:
+      - task: deploy
+      - task: run:local:copy-target
+
+  run:local:copy-target:
+    desc: "Run servicebus consumer locally with mirrord copy target (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-copy-target.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-ct main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-ct'
+
+  run:local:user-b:
+    desc: "Run a second local consumer with mirrord (tenant=^beta filter)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-user-b.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-b main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-b'
+
+  run:local:user-c:
+    desc: "Run a third local consumer with mirrord (tenant=^gamma filter)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-user-c.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-c main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-c'
+
+  run:local:multi-attr:
+    desc: "Run local consumer matching both tenant=^test AND type=^premium$"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-multi-attr.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-ma main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-ma'
+
+  run:local:jq:
+    desc: "Run local consumer with JQ body filter (type=premium in JSON body)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-jq.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-jq main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-jq'
+
+  deploy:topic:
+    desc: "Deploy emulator + topic consumer pod + CRDs (topic/subscription model)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer-topic.yaml
+      - task: _wait:topic-consumer
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-topic.yaml
+
+  run:topic:
+    desc: "Deploy topic model + run local consumer in one shot (tenant=^test filter)"
+    cmds:
+      - task: deploy:topic
+      - task: run:local:topic
+
+  run:local:topic:
+    desc: "Run topic/subscription consumer locally with mirrord (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-topic.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-topic main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-topic'
+
+  test:topic:split:
+    desc: "Deploy topic model and print instructions for testing"
+    cmds:
+      - task: deploy:topic
+      - echo ""
+      - echo "Topic/subscription split test"
+      - echo ""
+      - echo "  Window 1 - Local consumer (topic model, tenant=^test):"
+      - echo "    cd local-sandbox && task servicebus:run:local:topic"
+      - echo ""
+      - echo "  Window 2 - Target pod logs:"
+      - echo "    cd local-sandbox && task servicebus:logs:topic"
+      - echo ""
+      - echo "  Window 3 - Send messages to topic:"
+      - echo "    task servicebus:send:topic TENANT=test-user"
+      - echo "    task servicebus:send:topic TENANT=other"
+      - echo "    task servicebus:test:split:status"
+
+  logs:topic:
+    desc: "Show topic consumer logs (target pod)"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-topic-consumer --tail=100 -f
+
+  run:local:wildcard:
+    desc: "Run local consumer with wildcard '*' queue key (expands to all queues in MirrordSplitConfig)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-wildcard.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-wc main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-wc'
+
+  run:local:orders-only:
+    desc: "Multi-queue: split only the orders queue (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-orders-only.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-orders main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-orders'
+
+  run:local:notifications-only:
+    desc: "Multi-queue: split only the notifications queue (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-notifications-only.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-notif main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-notif'
+
+  run:local:both-queues:
+    desc: "Multi-queue: split both orders and notifications (tenant=^test)"
+    dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator/mirrord-both-queues.json'
+    cmds:
+      - go build -o /tmp/servicebus-consumer-both main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-both'
+
+  send:
+    desc: "Send a message to a Service Bus queue via a one-shot pod"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+      SEND_QUEUE: '{{.SEND_QUEUE | default "test-queue"}}'
+    cmds:
+      - |
+        BODY='{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"{{.TYPE}}","amount":100}'
+        PROPS="tenant={{.TENANT}},type={{.TYPE}}"
+
+        kubectl run sb-sender-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.EMULATOR_NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+          --env="SEND_QUEUE={{.SEND_QUEUE}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=$PROPS" \
+          -- /app/consumer 2>/dev/null
+
+        echo "Published to {{.SEND_QUEUE}} with tenant={{.TENANT}} type={{.TYPE}}"
+
+  send:topic:
+    desc: "Send a message to a Service Bus topic via a one-shot pod"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+      SEND_TOPIC: '{{.SEND_TOPIC | default "test-topic"}}'
+    cmds:
+      - |
+        BODY='{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"{{.TYPE}}","amount":100}'
+        PROPS="tenant={{.TENANT}},type={{.TYPE}}"
+
+        kubectl run sb-sender-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.EMULATOR_NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+          --env="SEND_TOPIC={{.SEND_TOPIC}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=$PROPS" \
+          -- /app/consumer 2>/dev/null
+
+        echo "Published to topic {{.SEND_TOPIC}} with tenant={{.TENANT}} type={{.TYPE}}"
+
+  send:match:
+    desc: "Send a message that matches the default filter (tenant=test-user)"
+    cmds:
+      - task: send
+        vars: { TENANT: "test-user", TYPE: "premium" }
+
+  send:nomatch:
+    desc: "Send a message that does NOT match any filter (tenant=other)"
+    cmds:
+      - task: send
+        vars: { TENANT: "other", TYPE: "basic" }
+
+  send:beta:
+    desc: "Send a message for user B (tenant=beta)"
+    cmds:
+      - task: send
+        vars: { TENANT: "beta", TYPE: "premium" }
+
+  send:gamma:
+    desc: "Send a message for user C (tenant=gamma)"
+    cmds:
+      - task: send
+        vars: { TENANT: "gamma", TYPE: "standard" }
+
+  send:both:
+    desc: "Send one matched + one unmatched + one beta message"
+    cmds:
+      - task: send:match
+      - task: send:nomatch
+      - task: send:beta
+
+  send:all-tenants:
+    desc: "Send one message per tenant (test-user, beta, gamma, other)"
+    cmds:
+      - task: send
+        vars: { TENANT: "test-user", TYPE: "premium" }
+      - task: send
+        vars: { TENANT: "beta", TYPE: "standard" }
+      - task: send
+        vars: { TENANT: "gamma", TYPE: "premium" }
+      - task: send
+        vars: { TENANT: "other", TYPE: "basic" }
+
+  send:flood:
+    desc: "Send many messages quickly: task servicebus:send:flood COUNT=20"
+    vars:
+      COUNT: '{{.COUNT | default "20"}}'
+      SEND_QUEUE: '{{.SEND_QUEUE | default "test-queue"}}'
+    cmds:
+      - |
+        TENANTS=("test-user" "beta" "gamma" "other" "unknown")
+        TYPES=("premium" "standard" "basic")
+
+        echo "Flooding {{.COUNT}} messages to {{.SEND_QUEUE}} across tenants: ${TENANTS[*]}"
+        for i in $(seq 1 {{.COUNT}}); do
+          T=${TENANTS[$((RANDOM % ${#TENANTS[@]}))]}
+          TY=${TYPES[$((RANDOM % ${#TYPES[@]}))]}
+          BODY="{\"order_id\":\"ORD-F$i\",\"tenant\":\"$T\",\"type\":\"$TY\",\"amount\":$((RANDOM % 1000))}"
+          PROPS="tenant=$T,type=$TY"
+
+          kubectl run sb-flood-$RANDOM --rm -i --restart=Never \
+            --image=servicebus-consumer:local \
+            --image-pull-policy=Never \
+            --namespace={{.EMULATOR_NAMESPACE}} \
+            --env="SEND_MODE=true" \
+            --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+            --env="SEND_QUEUE={{.SEND_QUEUE}}" \
+            --env="MESSAGE_BODY=$BODY" \
+            --env="MESSAGE_PROPERTIES=$PROPS" \
+            -- /app/consumer 2>/dev/null
+
+          echo "$i: tenant=$T type=$TY"
+        done
+        echo ""
+        echo "Sent {{.COUNT}} messages."
+
+  send:orders:
+    desc: "Send to the orders queue"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "premium"}}'
+    cmds:
+      - task: send
+        vars: { SEND_QUEUE: "orders-queue", TENANT: "{{.TENANT}}", TYPE: "{{.TYPE}}" }
+
+  send:notifications:
+    desc: "Send to the notifications queue"
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "alert"}}'
+    cmds:
+      - task: send
+        vars: { SEND_QUEUE: "notifications-queue", TENANT: "{{.TENANT}}", TYPE: "{{.TYPE}}" }
+
+  send:multi-queue:all:
+    desc: "Send to both orders and notifications with mixed tenants"
+    cmds:
+      - task: send:orders
+        vars: { TENANT: "test-user", TYPE: "premium" }
+      - task: send:orders
+        vars: { TENANT: "other", TYPE: "basic" }
+      - task: send:notifications
+        vars: { TENANT: "test-user", TYPE: "alert" }
+      - task: send:notifications
+        vars: { TENANT: "other", TYPE: "info" }
+
+  deploy:multi-queue:
+    desc: "Deploy multi-queue environment (orders + notifications, separate env vars)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml
+      - echo "Waiting for multi-queue consumer..."
+      - kubectl wait --for=condition=ready pod -l app=servicebus-multi-consumer -n {{.NAMESPACE}} --timeout=120s
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-multi-queue.yaml
+
+  logs:multi-queue:
+    desc: "Show multi-queue consumer logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-multi-consumer --tail=100 -f
+
+  test:split:
+    desc: "Deploy environment for split testing"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Environment ready. Open separate terminal windows and run:"
+      - echo ""
+      - echo "  Window 1 - Local consumer (receives filtered messages):"
+      - echo "    cd local-sandbox && task servicebus:run:local"
+      - echo ""
+      - echo "  Window 2 - Target pod logs (receives unfiltered messages):"
+      - echo "    cd local-sandbox && task servicebus:logs"
+      - echo ""
+      - echo "  Window 3 - Operator logs:"
+      - echo "    cd local-sandbox && task logs:operator"
+      - echo ""
+      - echo "  Window 4 - Send messages:"
+      - echo "    task servicebus:send:match"
+      - echo "    task servicebus:send:nomatch"
+      - echo "    task servicebus:test:split:status"
+
+  test:split:send:
+    desc: "Send filtered and unfiltered messages: task servicebus:test:split:send MATCHED=3 UNMATCHED=2"
+    vars:
+      MATCHED: '{{.MATCHED | default "3"}}'
+      UNMATCHED: '{{.UNMATCHED | default "2"}}'
+    cmds:
+      - |
+        echo "Sending {{.MATCHED}} matched (tenant=test-user) + {{.UNMATCHED}} unmatched (tenant=other) messages..."
+        echo ""
+
+        for i in $(seq 1 {{.MATCHED}}); do
+          BODY="{\"order_id\":\"ORD-M$i\",\"tenant\":\"test-user\",\"type\":\"premium\",\"amount\":$((RANDOM % 1000))}"
+          kubectl run sb-test-m$i-$RANDOM --rm -i --restart=Never \
+            --image=servicebus-consumer:local \
+            --image-pull-policy=Never \
+            --namespace={{.EMULATOR_NAMESPACE}} \
+            --env="SEND_MODE=true" \
+            --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+            --env="SEND_QUEUE={{.QUEUE}}" \
+            --env="MESSAGE_BODY=$BODY" \
+            --env="MESSAGE_PROPERTIES=tenant=test-user,type=premium" \
+            -- /app/consumer 2>/dev/null
+          echo "MATCHED $i: tenant=test-user order=ORD-M$i"
+        done
+
+        for i in $(seq 1 {{.UNMATCHED}}); do
+          BODY="{\"order_id\":\"ORD-U$i\",\"tenant\":\"other\",\"type\":\"basic\",\"amount\":$((RANDOM % 100))}"
+          kubectl run sb-test-u$i-$RANDOM --rm -i --restart=Never \
+            --image=servicebus-consumer:local \
+            --image-pull-policy=Never \
+            --namespace={{.EMULATOR_NAMESPACE}} \
+            --env="SEND_MODE=true" \
+            --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+            --env="SEND_QUEUE={{.QUEUE}}" \
+            --env="MESSAGE_BODY=$BODY" \
+            --env="MESSAGE_PROPERTIES=tenant=other,type=basic" \
+            -- /app/consumer 2>/dev/null
+          echo "UNMATCHED $i: tenant=other order=ORD-U$i"
+        done
+
+        echo ""
+        echo "Sent {{.MATCHED}} matched + {{.UNMATCHED}} unmatched = $(({{.MATCHED}} + {{.UNMATCHED}})) total"
+
+  test:split:status:
+    desc: "Show split session and emulator state"
+    cmds:
+      - echo "Split Sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Split Config"
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "External Resources"
+      - kubectl get mirrordclusterexternalresources -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Workload Patch Requests"
+      - kubectl get mirrordclusterworkloadpatchrequests -A 2>/dev/null || echo "(none)"
+
+  test:split:cleanup:
+    desc: "Delete all split sessions and temp resources"
+    cmds:
+      - echo "Deleting split sessions..."
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Deleting external resources..."
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Deleting workload patch requests..."
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Cleanup complete."
+
+  test:three-sessions:
+    desc: "Deploy and print instructions for running 3 concurrent sessions on the same queue"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Three-session test (same queue, different filters)"
+      - echo "Each session filters by a different tenant on the same queue."
+      - echo "Unfiltered messages go to the target pod."
+      - echo ""
+      - echo "  Window 1 - User A (tenant=^test):"
+      - echo "    cd local-sandbox && task servicebus:run:local"
+      - echo ""
+      - echo "  Window 2 - User B (tenant=^beta):"
+      - echo "    cd local-sandbox && task servicebus:run:local:user-b"
+      - echo ""
+      - echo "  Window 3 - User C (tenant=^gamma):"
+      - echo "    cd local-sandbox && task servicebus:run:local:user-c"
+      - echo ""
+      - echo "  Window 4 - Target pod logs:"
+      - echo "    cd local-sandbox && task servicebus:logs"
+      - echo ""
+      - echo "  Window 5 - Operator logs:"
+      - echo "    cd local-sandbox && task logs:operator"
+      - echo ""
+      - echo "  Window 6 - Send messages:"
+      - echo "    task servicebus:send:all-tenants   (one per tenant)"
+      - echo "    task servicebus:send:flood COUNT=30 (random mix)"
+      - echo "    task servicebus:test:split:status   (inspect state)"
+
+  test:multi-queue:
+    desc: "Deploy multi-queue environment and print instructions (tests multiple env vars)"
+    cmds:
+      - task: deploy:multi-queue
+      - echo ""
+      - echo "Multi-queue test - 2 queues via separate env vars"
+      - echo "The consumer has SERVICEBUS_ORDERS_QUEUE and SERVICEBUS_NOTIFICATIONS_QUEUE."
+      - echo "The split config maps each env var to a separate queue entry."
+      - echo ""
+      - echo "  Scenario A - One session splits only orders:"
+      - echo "    cd local-sandbox && task servicebus:run:local:orders-only"
+      - echo ""
+      - echo "  Scenario B - One session splits only notifications:"
+      - echo "    cd local-sandbox && task servicebus:run:local:notifications-only"
+      - echo ""
+      - echo "  Scenario C - One session splits both queues:"
+      - echo "    cd local-sandbox && task servicebus:run:local:both-queues"
+      - echo ""
+      - echo "  Send messages:"
+      - echo "    task servicebus:send:orders TENANT=test-user"
+      - echo "    task servicebus:send:orders TENANT=other"
+      - echo "    task servicebus:send:notifications TENANT=test-user"
+      - echo "    task servicebus:send:notifications TENANT=other"
+      - echo "    task servicebus:send:multi-queue:all  (all at once)"
+      - echo ""
+      - echo "  Logs & status:"
+      - echo "    task servicebus:logs:multi-queue"
+      - echo "    task servicebus:test:split:status"
+
+  test:multi-queue:two-users:
+    desc: "Multi-queue: two users splitting different queues simultaneously"
+    cmds:
+      - task: deploy:multi-queue
+      - echo ""
+      - echo "Two users splitting different queues on the same workload"
+      - echo "User A splits orders, User B splits notifications."
+      - echo ""
+      - echo "  Window 1 - User A (orders only):"
+      - echo "    cd local-sandbox && task servicebus:run:local:orders-only"
+      - echo ""
+      - echo "  Window 2 - User B (notifications only):"
+      - echo "    cd local-sandbox && task servicebus:run:local:notifications-only"
+      - echo ""
+      - echo "  Window 3 - Target pod logs:"
+      - echo "    cd local-sandbox && task servicebus:logs:multi-queue"
+      - echo ""
+      - echo "  Window 4 - Send and verify:"
+      - echo "    task servicebus:send:multi-queue:all"
+      - echo ""
+      - echo "  Expected:"
+      - echo "    User A gets orders with tenant=test-user"
+      - echo "    User B gets notifications with tenant=test-user"
+      - echo "    Target pod gets everything else"
+
+  test:multi-queue:overlap:
+    desc: "Multi-queue: two users splitting the same queue with different filters"
+    cmds:
+      - task: deploy:multi-queue
+      - echo ""
+      - echo "Two users splitting the SAME queue (orders) with different tenant filters"
+      - echo ""
+      - echo "  Window 1 - User A (orders, tenant=^test):"
+      - echo "    cd local-sandbox && task servicebus:run:local:orders-only"
+      - echo ""
+      - echo "  Window 2 - User B (start with custom config):"
+      - echo "    mirrord exec -f k8s/overlays/servicebus-emulator/mirrord-orders-only.json -- /tmp/servicebus-consumer-b"
+      - echo "    (edit mirrord-orders-only.json to use tenant=^beta before starting user B,"
+      - echo "     or create a custom config)"
+      - echo ""
+      - echo "  Window 3 - Send:"
+      - echo "    task servicebus:send:orders TENANT=test-user"
+      - echo "    task servicebus:send:orders TENANT=beta"
+      - echo "    task servicebus:send:orders TENANT=other"
+      - echo ""
+      - echo "  Expected:"
+      - echo "    User A gets orders with tenant=test-user"
+      - echo "    User B gets orders with tenant=beta"
+      - echo "    Target pod gets orders with tenant=other"
+
+  test:reconnect:
+    desc: "Test disconnect/reconnect - start session, kill it, start another, verify messages"
+    cmds:
+      - |
+        echo "Service Bus Fast Reconnect Test"
+        echo ""
+
+        kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+
+        cd {{.ROOT_DIR}}/apps/servicebus-consumer
+        go build -o /tmp/servicebus-consumer main.go
+
+        MIRRORD_CONFIG="{{.OVERLAY_DIR}}/mirrord.json"
+        SESSION1_LOG="/tmp/servicebus-session1.log"
+        SESSION2_LOG="/tmp/servicebus-session2.log"
+
+        echo "Step 1: Start Session 1"
+        {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/servicebus-consumer > $SESSION1_LOG 2>&1 &
+        SESSION1_PID=$!
+        echo "  PID: $SESSION1_PID"
+        sleep 15
+
+        if ! kill -0 $SESSION1_PID 2>/dev/null; then
+          echo "ERROR: Session 1 died"
+          cat $SESSION1_LOG
+          exit 1
+        fi
+
+        echo ""
+        echo "Step 2: Send message to Session 1"
+        BODY='{"order_id":"ORD-S1","tenant":"test-user","type":"premium","amount":100}'
+        kubectl run sb-reconnect-1-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.EMULATOR_NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+          --env="SEND_QUEUE={{.QUEUE}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=tenant=test-user" \
+          -- /app/consumer 2>/dev/null
+        sleep 5
+        echo "  Session 1 output:"
+        cat $SESSION1_LOG | grep "\[MSG" || echo "  (no messages yet)"
+
+        echo ""
+        echo "Step 3: Kill Session 1"
+        kill $SESSION1_PID 2>/dev/null || true
+        wait $SESSION1_PID 2>/dev/null || true
+        echo "  Session 1 terminated"
+
+        echo ""
+        echo "Step 4: Start Session 2 immediately"
+        {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/servicebus-consumer > $SESSION2_LOG 2>&1 &
+        SESSION2_PID=$!
+        echo "  PID: $SESSION2_PID"
+        sleep 15
+
+        if ! kill -0 $SESSION2_PID 2>/dev/null; then
+          echo "ERROR: Session 2 died"
+          cat $SESSION2_LOG
+          exit 1
+        fi
+
+        echo ""
+        echo "Step 5: Send 3 messages"
+        for i in 1 2 3; do
+          BODY="{\"order_id\":\"ORD-R$i\",\"tenant\":\"test-user\",\"type\":\"premium\",\"amount\":$((i * 100))}"
+          kubectl run sb-reconnect-r$i-$RANDOM --rm -i --restart=Never \
+            --image=servicebus-consumer:local \
+            --image-pull-policy=Never \
+            --namespace={{.EMULATOR_NAMESPACE}} \
+            --env="SEND_MODE=true" \
+            --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+            --env="SEND_QUEUE={{.QUEUE}}" \
+            --env="MESSAGE_BODY=$BODY" \
+            --env="MESSAGE_PROPERTIES=tenant=test-user" \
+            -- /app/consumer 2>/dev/null
+          echo "  Sent message $i"
+          sleep 1
+        done
+
+        echo "Waiting 10s for processing..."
+        sleep 10
+
+        echo ""
+        echo "Results"
+        echo ""
+        echo "Session 1 Log:"
+        cat $SESSION1_LOG
+        echo ""
+        echo "Session 2 Log:"
+        cat $SESSION2_LOG
+        echo ""
+
+        SESSION1_COUNT=$(grep -c "\[MSG" $SESSION1_LOG 2>/dev/null || echo "0")
+        SESSION2_COUNT=$(grep -c "\[MSG" $SESSION2_LOG 2>/dev/null || echo "0")
+
+        echo "Summary"
+        echo "  Session 1 received: $SESSION1_COUNT messages (expected: 1)"
+        echo "  Session 2 received: $SESSION2_COUNT messages (expected: 3)"
+
+        if [ "$SESSION2_COUNT" -lt 3 ]; then
+          echo "  WARNING: Session 2 missed messages."
+        else
+          echo "  SUCCESS: Session 2 received all messages."
+        fi
+
+        kill $SESSION2_PID 2>/dev/null || true
+        echo ""
+        echo "Test complete."
+
+  test:session-churn:
+    desc: "Rapidly start/stop sessions to stress the operator"
+    cmds:
+      - |
+        echo "Session churn test: rapidly creating and destroying sessions"
+        echo ""
+
+        cd {{.ROOT_DIR}}/apps/servicebus-consumer
+        go build -o /tmp/servicebus-consumer main.go
+
+        MIRRORD_CONFIG="{{.OVERLAY_DIR}}/mirrord.json"
+
+        for round in 1 2 3 4 5; do
+          echo "Round $round: starting session..."
+          {{.MIRRORD_BIN}} exec -f $MIRRORD_CONFIG -- /tmp/servicebus-consumer > /tmp/servicebus-churn-$round.log 2>&1 &
+          PID=$!
+          sleep 10
+
+          if ! kill -0 $PID 2>/dev/null; then
+            echo "  Session died immediately. Log:"
+            cat /tmp/servicebus-churn-$round.log
+            exit 1
+          fi
+
+          echo "  Session alive (PID $PID). Sending a message..."
+          BODY="{\"order_id\":\"ORD-CHURN-$round\",\"tenant\":\"test-user\",\"type\":\"premium\"}"
+          kubectl run sb-churn-$round-$RANDOM --rm -i --restart=Never \
+            --image=servicebus-consumer:local \
+            --image-pull-policy=Never \
+            --namespace={{.EMULATOR_NAMESPACE}} \
+            --env="SEND_MODE=true" \
+            --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+            --env="SEND_QUEUE={{.QUEUE}}" \
+            --env="MESSAGE_BODY=$BODY" \
+            --env="MESSAGE_PROPERTIES=tenant=test-user" \
+            -- /app/consumer 2>/dev/null
+          sleep 3
+
+          echo "  Killing session..."
+          kill $PID 2>/dev/null || true
+          wait $PID 2>/dev/null || true
+          sleep 2
+
+          MSG_COUNT=$(grep -c "\[MSG" /tmp/servicebus-churn-$round.log 2>/dev/null || echo "0")
+          echo "  Round $round: received $MSG_COUNT messages"
+          echo ""
+        done
+
+        echo "Checking for leftover sessions..."
+        kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+        echo ""
+        echo "Session churn test complete."
+
+  test:filter-types:
+    desc: "Deploy and print instructions for testing all filter types"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Filter type comparison (all targeting the same queue)"
+      - echo ""
+      - echo "  Test 1 - Attribute filter (single):"
+      - echo "    cd local-sandbox && task servicebus:run:local"
+      - echo "    task servicebus:send TENANT=test-user TYPE=premium"
+      - echo "    task servicebus:send TENANT=other TYPE=premium"
+      - echo "    Expected - only tenant=test-user messages received"
+      - echo ""
+      - echo "  Test 2 - Multi-attribute filter (tenant AND type):"
+      - echo "    cd local-sandbox && task servicebus:run:local:multi-attr"
+      - echo "    task servicebus:send TENANT=test-user TYPE=premium"
+      - echo "    task servicebus:send TENANT=test-user TYPE=basic"
+      - echo "    task servicebus:send TENANT=other TYPE=premium"
+      - echo "    Expected - only tenant=test-user + type=premium received"
+      - echo ""
+      - echo "  Test 3 - JQ body filter:"
+      - echo "    cd local-sandbox && task servicebus:run:local:jq"
+      - echo "    task servicebus:send TENANT=other TYPE=premium"
+      - echo "    task servicebus:send TENANT=other TYPE=basic"
+      - echo "    Expected - only type=premium in body JSON received, regardless of tenant"
+      - echo ""
+      - echo "  Test 4 - Wildcard queue key (split_queues[\"*\"]):"
+      - echo "    cd local-sandbox && task servicebus:run:local:wildcard"
+      - echo "    task servicebus:send TENANT=test-user"
+      - echo "    task servicebus:send TENANT=other"
+      - echo "    Expected - same as Test 1, '*' expands to all queues in MirrordSplitConfig"
+
+  reset:
+    desc: "Full reset: clean CRDs, restart emulator, redeploy consumers"
+    cmds:
+      - echo "Cleaning leftover CRDs..."
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - echo ""
+      - echo "Bouncing emulator pods..."
+      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator --wait=true 2>/dev/null || true
+      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} azure-sql-edge --wait=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+      - echo ""
+      - echo "Rebuilding consumer image..."
+      - task: build
+      - echo ""
+      - echo "Redeploying single-queue consumer..."
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer.yaml
+      - task: _wait:consumer
+      - echo ""
+      - echo "Redeploying multi-queue consumer..."
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml
+      - kubectl wait --for=condition=ready pod -l app=servicebus-multi-consumer -n {{.NAMESPACE}} --timeout=120s 2>/dev/null || echo "Multi-queue consumer not deployed, skipping"
+      - echo ""
+      - echo "Reapplying CRDs..."
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-multi-queue.yaml 2>/dev/null || true
+      - echo ""
+      - echo "Reset complete. Emulator, consumers, and CRDs are fresh."
+
+  reset:emulator:
+    desc: "Restart the emulator pods to clear all accumulated state"
+    cmds:
+      - echo "Bouncing emulator pods..."
+      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator --wait=true 2>/dev/null || true
+      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} azure-sql-edge --wait=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+      - echo "Emulator reset complete."
+
+  logs:
+    desc: "Show Service Bus consumer logs (target pod)"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-consumer --tail=100 -f
+
+  logs:emulator:
+    desc: "Show Service Bus emulator logs"
+    cmds:
+      - kubectl logs -n {{.EMULATOR_NAMESPACE}} servicebus-emulator --tail=100 -f
+
+  logs:sql-edge:
+    desc: "Show SQL Edge logs"
+    cmds:
+      - kubectl logs -n {{.EMULATOR_NAMESPACE}} azure-sql-edge --tail=100 -f
+
+  status:
+    desc: "Show Azure Service Bus test environment status"
+    cmds:
+      - echo "SQL Edge"
+      - kubectl get pods -n {{.EMULATOR_NAMESPACE}} azure-sql-edge 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "Service Bus Emulator"
+      - kubectl get pods -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=servicebus-emulator 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "Service Bus Consumer"
+      - kubectl get pods -n {{.NAMESPACE}} -l app=servicebus-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "Multi-Queue Consumer"
+      - kubectl get pods -n {{.NAMESPACE}} -l app=servicebus-multi-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "Split Config"
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "No split config"
+      - echo ""
+      - echo "Split Sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "No sessions"
+
+  list:
+    desc: "List all queues, topics, and subscriptions from the Service Bus emulator"
+    vars:
+      LOCAL_PORT: '{{.LOCAL_PORT | default "5673"}}'
+    cmds:
+      - |
+        extract_titles() {
+          sed -n 's/.*<title[^>]*>\([^<]*\)<\/title>.*/\1/gp'
+        }
+
+        echo "Port-forwarding to Service Bus emulator on localhost:{{.LOCAL_PORT}}..."
+        kubectl port-forward -n {{.EMULATOR_NAMESPACE}} svc/servicebus-emulator {{.LOCAL_PORT}}:5300 &
+        PF_PID=$!
+        sleep 2
+
+        echo ""
+        echo "Queues:"
+        curl -s "http://localhost:{{.LOCAL_PORT}}/\$Resources/Queues" \
+          -H "Content-Type: application/atom+xml" 2>/dev/null \
+          | extract_titles || echo "  (none or emulator not reachable)"
+
+        echo ""
+        echo "Topics:"
+        TOPICS=$(curl -s "http://localhost:{{.LOCAL_PORT}}/\$Resources/Topics" \
+          -H "Content-Type: application/atom+xml" 2>/dev/null \
+          | extract_titles)
+        echo "$TOPICS"
+
+        echo ""
+        echo "Subscriptions (per topic):"
+        echo "$TOPICS" | while read -r topic; do
+          [ -z "$topic" ] && continue
+          echo "  Topic: $topic"
+          RAW=$(curl -s "http://localhost:{{.LOCAL_PORT}}/$topic/Subscriptions" \
+            -H "Content-Type: application/atom+xml" 2>/dev/null)
+          if echo "$RAW" | grep -q '<Error>'; then
+            echo "    (listing not supported by emulator)"
+          else
+            echo "$RAW" | extract_titles | while read -r sub; do
+              echo "    - $sub"
+            done
+          fi
+        done
+
+        kill $PF_PID 2>/dev/null || true
+
+  clean:
+    desc: "Clean all Azure Service Bus resources"
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config-multi-queue.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete namespace {{.EMULATOR_NAMESPACE}} --ignore-not-found=true
+
+  _wait:sql-edge:
+    internal: true
+    cmds:
+      - echo "Waiting for SQL Edge..."
+      - kubectl wait --for=condition=ready pod azure-sql-edge -n {{.EMULATOR_NAMESPACE}} --timeout=180s
+
+  _wait:emulator:
+    internal: true
+    cmds:
+      - echo "Waiting for Service Bus emulator..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=servicebus-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=180s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Service Bus consumer..."
+      - kubectl wait --for=condition=ready pod -l app=servicebus-consumer -n {{.NAMESPACE}} --timeout=120s
+
+  _wait:topic-consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Service Bus topic consumer..."
+      - kubectl wait --for=condition=ready pod -l app=servicebus-topic-consumer -n {{.NAMESPACE}} --timeout=120s

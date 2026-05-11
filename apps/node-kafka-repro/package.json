@@ -1,0 +1,12 @@
+{
+  "name": "kafka-mirrord-repro",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Reproduce Kafka multi-connection issue through mirrord outgoing proxy",
+  "scripts": {
+    "start": "node repro.js"
+  },
+  "dependencies": {
+    "kafkajs": "^2.2.4"
+  }
+}

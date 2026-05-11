@@ -1,0 +1,18 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: servicebus-test-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: servicebus-consumer
+  clientConfigs:
+    azureServiceBus: servicebus-emulator-config
+  queues:
+  - id: test-queue
+    kind: azureServiceBus
+    appConfig:
+      serviceBusQueue:
+      - env: SERVICEBUS_QUEUE_NAME

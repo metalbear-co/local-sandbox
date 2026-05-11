@@ -1,0 +1,17 @@
+{
+  "target": {
+    "path": "deployment/servicebus-topic-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "test-topic-sub": {
+        "queue_type": "AzureServiceBus",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

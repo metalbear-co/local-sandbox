@@ -24,6 +24,9 @@ bin/
 
 # Task history (logged by task menu/up)
 .task-history
+node_modules/
+# Cached version downloads
+.versions/
 
 # Multi-cluster testing
 multi-cluster-kubeconfig.yaml

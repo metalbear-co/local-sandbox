@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"fmt"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -15,12 +16,23 @@ import (
 func main() {
 	ctx := context.Background()
 	bootstrapServers := getEnv("KAFKA_BOOTSTRAP_SERVERS", "kafka-cluster.test-mirrord.svc.cluster.local:9092")
-	topicName := getEnv("KAFKA_TOPIC_NAME", "test-topic")
 	groupID := getEnv("KAFKA_GROUP_ID", "test-consumer-group")
+
+	var topics []string
+	for i := 1; i <= 4; i++ {
+		envVar := fmt.Sprintf("KAFKA_TOPIC_%d", i)
+		if t := os.Getenv(envVar); t != "" {
+			topics = append(topics, t)
+		}
+	}
+	if len(topics) == 0 {
+		topicName := getEnv("KAFKA_TOPIC_NAME", "test-topic")
+		topics = []string{topicName}
+	}
 
 	log.Printf("Starting Kafka consumer")
 	log.Printf("Bootstrap servers: %s", bootstrapServers)
-	log.Printf("Topic: %s", topicName)
+	log.Printf("Topics: %v", topics)
 	log.Printf("Group ID: %s", groupID)
 
 	// Configure Sarama
@@ -30,11 +42,19 @@ func main() {
 	config.Consumer.Offsets.Initial = sarama.OffsetOldest
 	config.Consumer.Group.Rebalance.Strategy = sarama.NewBalanceStrategyRoundRobin()
 
-	// Create consumer group
 	brokers := strings.Split(bootstrapServers, ",")
-	consumerGroup, err := sarama.NewConsumerGroup(brokers, groupID, config)
-	if err != nil {
-		log.Fatalf("Failed to create consumer group: %v", err)
+	var consumerGroup sarama.ConsumerGroup
+	for attempt := 1; attempt <= 30; attempt++ {
+		var err error
+		consumerGroup, err = sarama.NewConsumerGroup(brokers, groupID, config)
+		if err == nil {
+			break
+		}
+		log.Printf("Kafka not ready (attempt %d/30): %v", attempt, err)
+		if attempt == 30 {
+			log.Fatalf("Failed to connect to Kafka after 30 attempts: %v", err)
+		}
+		time.Sleep(2 * time.Second)
 	}
 	defer consumerGroup.Close()
 
@@ -50,7 +70,7 @@ func main() {
 		for {
 			// Consume should be called inside an infinite loop
 			// When a server-side rebalance happens, the consumer session will need to be recreated
-			if err := consumerGroup.Consume(ctx, []string{topicName}, consumer); err != nil {
+			if err := consumerGroup.Consume(ctx, topics, consumer); err != nil {
 				log.Printf("Error from consumer: %v", err)
 			}
 			// Check if context was cancelled, signaling that the consumer should stop
