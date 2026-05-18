@@ -14,10 +14,10 @@ spec:
   - id: orders
     kind: azureServiceBus
     appConfig:
-      serviceBusQueue:
+      queue:
       - env: SERVICEBUS_ORDERS_QUEUE
   - id: notifications
     kind: azureServiceBus
     appConfig:
-      serviceBusQueue:
+      queue:
       - env: SERVICEBUS_NOTIFICATIONS_QUEUE

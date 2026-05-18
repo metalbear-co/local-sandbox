@@ -86,6 +86,20 @@ tasks:
       - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
 
+  build:operator:aks:
+    desc: Build operator image for AKS (linux/amd64) and push to ACR
+    vars:
+      ACR_NAME: '{{.ACR_NAME | default "mirrordmctest"}}'
+    cmds:
+      - cd {{.OPERATOR_DIR}}/.. && docker build --platform linux/amd64 --provenance=false -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - |
+        ACR_SERVER=$(az acr show --name {{.ACR_NAME}} --query loginServer -o tsv)
+        IMAGE="${ACR_SERVER}/mirrord-operator:dev"
+        az acr login --name {{.ACR_NAME}} -o none
+        docker tag {{.OPERATOR_IMAGE}} "$IMAGE"
+        docker push "$IMAGE"
+        echo "Pushed $IMAGE"
+
   build:operator:nocache:
     desc: Build operator without any cache (clears sccache + Docker layers)
     cmds:
@@ -457,6 +471,7 @@ tasks:
       - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=60s
       - cargo build -p operator-service
       - codesign -f -s - ./target/debug/operator-service
+      - rm -rf /tmp/mirrord
       - |
         MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/.mirrord/operator-dev.toml -- \
           ./target/debug/operator-service
