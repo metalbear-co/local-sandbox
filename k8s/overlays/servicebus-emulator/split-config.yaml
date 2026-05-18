@@ -14,5 +14,5 @@ spec:
   - id: test-queue
     kind: azureServiceBus
     appConfig:
-      serviceBusQueue:
+      queue:
       - env: SERVICEBUS_QUEUE_NAME

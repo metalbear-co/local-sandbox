@@ -1,0 +1,21 @@
+{
+  "target": {
+    "path": "deployment/servicebus-topic-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "split_queues": {
+      "test-topic-sub": {
+        "queue_type": "AzureServiceBus",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

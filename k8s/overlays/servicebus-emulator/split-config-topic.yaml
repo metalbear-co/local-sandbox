@@ -14,7 +14,7 @@ spec:
   - id: test-topic-sub
     kind: azureServiceBus
     appConfig:
-      serviceBusTopic:
+      topic:
       - env: SERVICEBUS_TOPIC_NAME
-      serviceBusSubscription:
+      subscription:
       - env: SERVICEBUS_SUBSCRIPTION_NAME

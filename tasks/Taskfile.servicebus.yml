@@ -772,6 +772,221 @@ tasks:
       - echo "    task servicebus:send TENANT=other"
       - echo "    Expected - same as Test 1, '*' expands to all queues in MirrordSplitConfig"
 
+  preview:deploy:
+    desc: "Deploy emulator + consumer + CRDs for preview testing"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "Service Bus preview environment ready."
+      - echo "Run 'task servicebus:preview:start' to create a preview session."
+
+  preview:start:
+    desc: "Start an ASB preview environment (tenant=^test filter on test-queue)"
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-asb-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "servicebus-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .OVERLAY_DIR "/mirrord-preview.json")}}'
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.MIRRORD_CONFIG}} \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:start:jq:
+    desc: "Start an ASB preview environment (JQ body filter: .type == premium)"
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-asb-preview-jq"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "servicebus-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.OVERLAY_DIR}}/mirrord-preview-jq.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:start:topic:
+    desc: "Start an ASB preview environment (topic/subscription model, tenant=^test)"
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-asb-preview-topic"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "servicebus-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.OVERLAY_DIR}}/mirrord-preview-topic.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:stop:
+    desc: "Stop an ASB preview environment"
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-asb-preview"}}'
+    cmds:
+      - "{{.MIRRORD_BIN}} preview stop -k \"{{.PREVIEW_KEY}}\" || true"
+
+  preview:status:
+    desc: "Show ASB preview session status"
+    cmds:
+      - echo "Preview Sessions"
+      - kubectl get previewsessions -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Preview Pods"
+      - kubectl get pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Split Sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "External Resources"
+      - kubectl get mirrordclusterexternalresources -A 2>/dev/null || echo "(none)"
+
+  preview:logs:
+    desc: "Show logs from the preview pod"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview --tail=100 -f
+
+  preview:test:
+    desc: "Full preview test: deploy, start preview, send messages, verify routing"
+    cmds:
+      - task: preview:deploy
+      - echo ""
+      - echo "ASB Preview Environment Test"
+      - echo ""
+      - echo "  Step 1 - Start the preview session (in a separate terminal):"
+      - echo "    cd local-sandbox && task servicebus:preview:start"
+      - echo ""
+      - echo "  Step 2 - Watch preview pod logs (in another terminal):"
+      - echo "    cd local-sandbox && task servicebus:preview:logs"
+      - echo ""
+      - echo "  Step 3 - Watch target pod logs (in another terminal):"
+      - echo "    cd local-sandbox && task servicebus:logs"
+      - echo ""
+      - echo "  Step 4 - Watch operator logs (in another terminal):"
+      - echo "    cd local-sandbox && task logs:operator"
+      - echo ""
+      - echo "  Step 5 - Send messages (after preview is Ready):"
+      - echo "    task servicebus:send:match          (tenant=test-user - should go to preview pod)"
+      - echo "    task servicebus:send:nomatch         (tenant=other - should go to target pod)"
+      - echo "    task servicebus:preview:status        (check state)"
+      - echo ""
+      - echo "  Step 6 - Stop the preview:"
+      - echo "    task servicebus:preview:stop"
+      - echo "    task servicebus:preview:status        (should show no sessions)"
+
+  preview:test:topic:
+    desc: "Preview test with topic/subscription model"
+    cmds:
+      - task: deploy:topic
+      - echo ""
+      - echo "ASB Preview Environment Test (Topic/Subscription)"
+      - echo ""
+      - echo "  Step 1 - Start the preview session:"
+      - echo "    cd local-sandbox && task servicebus:preview:start:topic"
+      - echo ""
+      - echo "  Step 2 - Watch preview pod logs:"
+      - echo "    cd local-sandbox && task servicebus:preview:logs"
+      - echo ""
+      - echo "  Step 3 - Watch target pod logs:"
+      - echo "    cd local-sandbox && task servicebus:logs:topic"
+      - echo ""
+      - echo "  Step 4 - Send messages (after preview is Ready):"
+      - echo "    task servicebus:send:topic TENANT=test-user  (should go to preview pod)"
+      - echo "    task servicebus:send:topic TENANT=other       (should go to target pod)"
+      - echo "    task servicebus:preview:status"
+      - echo ""
+      - echo "  Step 5 - Stop the preview:"
+      - echo "    task servicebus:preview:stop PREVIEW_KEY=test-asb-preview-topic"
+
+  preview:test:jq:
+    desc: "Preview test with JQ body filter"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "ASB Preview Environment Test (JQ Body Filter)"
+      - echo ""
+      - echo "  Step 1 - Start the preview session:"
+      - echo "    cd local-sandbox && task servicebus:preview:start:jq"
+      - echo ""
+      - echo "  Step 2 - Watch preview pod logs:"
+      - echo "    cd local-sandbox && task servicebus:preview:logs"
+      - echo ""
+      - echo "  Step 3 - Send messages (after preview is Ready):"
+      - echo "    task servicebus:send TENANT=other TYPE=premium   (body matches .type==premium - should go to preview)"
+      - echo "    task servicebus:send TENANT=other TYPE=basic     (body has .type==basic - should go to target)"
+      - echo "    task servicebus:preview:status"
+      - echo ""
+      - echo "  Step 4 - Stop the preview:"
+      - echo "    task servicebus:preview:stop PREVIEW_KEY=test-asb-preview-jq"
+
+  preview:clean:
+    desc: "Delete all preview sessions and related resources"
+    cmds:
+      - echo "Deleting preview sessions..."
+      - kubectl delete previewsessions --all -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Deleting preview pods..."
+      - kubectl delete pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "(none)"
+      - echo ""
+      - task: test:split:cleanup
+
+  clean:e2e:
+    desc: "Delete stale E2E test namespaces and orphaned cluster resources"
+    cmds:
+      - |
+        set +e
+        echo "Looking for stale e2e-tests-servicebus-splitting-* namespaces..."
+        STALE_NS=$(kubectl get namespaces -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n' | grep '^e2e-tests-servicebus-splitting-')
+        if [ -z "$STALE_NS" ]; then
+          echo "  No stale namespaces found."
+        else
+          COUNT=$(echo "$STALE_NS" | wc -l | tr -d ' ')
+          echo "  Found $COUNT stale namespace(s):"
+          echo "$STALE_NS" | sed 's/^/    /'
+          echo ""
+          echo "  Deleting..."
+          for ns in $STALE_NS; do
+            kubectl delete namespace "$ns" --wait=false 2>/dev/null || true
+          done
+        fi
+        echo ""
+
+        echo "Checking for orphaned MirrordClusterExternalResources..."
+        ORPHANS=$(kubectl get mirrordclusterexternalresources -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | tr ' ' '\n')
+        if [ -z "$ORPHANS" ]; then
+          echo "  No orphaned external resources."
+        else
+          COUNT=$(echo "$ORPHANS" | wc -l | tr -d ' ')
+          echo "  Found $COUNT external resource(s). Removing finalizers and deleting..."
+          for res in $ORPHANS; do
+            kubectl patch mirrordclusterexternalresource "$res" --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]' 2>/dev/null || true
+          done
+          kubectl delete mirrordclusterexternalresources --all 2>/dev/null || true
+        fi
+        echo ""
+
+        echo "Scaling down test-mirrord servicebus-consumer (prevents queue contention)..."
+        kubectl scale deployment servicebus-consumer -n {{.NAMESPACE}} --replicas=0 2>/dev/null || true
+        echo ""
+
+        echo "Restarting emulator (SQL Edge + emulator) to clear corrupted state..."
+        kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator azure-sql-edge --wait=true 2>/dev/null || true
+        kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml 2>/dev/null || true
+        echo "  Waiting for SQL Edge..."
+        kubectl wait --for=condition=ready pod azure-sql-edge -n {{.EMULATOR_NAMESPACE}} --timeout=180s 2>/dev/null || true
+        echo "  Waiting for Service Bus emulator..."
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=servicebus-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=180s 2>/dev/null || true
+        echo ""
+
+        echo "test-mirrord servicebus-consumer stays scaled to 0 (prevents queue contention during E2E tests)."
+        echo "Run 'kubectl scale deployment servicebus-consumer -n {{.NAMESPACE}} --replicas=1' to restore it for local sandbox testing."
+        echo ""
+        echo "Cleanup complete. Ready for tests."
+
   reset:
     desc: "Full reset: clean CRDs, restart emulator, redeploy consumers"
     cmds:
