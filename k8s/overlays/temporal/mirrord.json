@@ -1,0 +1,20 @@
+{
+  "target": {
+    "path": "deployment/temporal-worker",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "experimental": {
+    "sip_utils": false
+  },
+  "feature": {
+    "split_queues": {
+      "order-checkout": {
+        "queue_type": "Temporal",
+        "message_filter": {
+          "workflow_id": "^test-alice-"
+        }
+      }
+    }
+  }
+}

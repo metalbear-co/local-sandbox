@@ -1,0 +1,20 @@
+{
+  "target": {
+    "path": "deployment/redis-pubsub-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "experimental": {
+    "sip_utils": false
+  },
+  "feature": {
+    "split_queues": {
+      "orders-channel": {
+        "queue_type": "RedisPubSub",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

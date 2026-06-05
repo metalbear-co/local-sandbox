@@ -79,6 +79,23 @@ vars:
 
   OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
   AGENT_IMAGE: '{{.AGENT_IMAGE | default "mirrord-agent:custom"}}'
+
+  # Released operator image repo on GHCR and the version to pull. The version
+  # defaults to whatever the operator workspace Cargo.toml declares, so
+  # "the release that matches this source tree" is the default old version.
+  OPERATOR_RELEASE_REPO: '{{.OPERATOR_RELEASE_REPO | default "ghcr.io/metalbear-co/operator"}}'
+  OPERATOR_VERSION:
+    sh: grep -m1 '^version' "{{.ROOT_DIR}}/../operator/Cargo.toml" | sed -E 's/.*"(.*)".*/\1/'
+
+  # Release operator license. The released image ships the production license
+  # issuer key and rejects the locally generated dev license, so installing a
+  # release needs a real key. Read from .env (loaded by the root Taskfile).
+  RELEASE_LICENSE_KEY: '{{.RELEASE_LICENSE_KEY | default ""}}'
+
+  # Extra "--set" arguments appended to the operator helm install. Empty for the
+  # normal local build install; the release install fills it in to point the
+  # image at GHCR and switch the license from the mounted dev pem to the key.
+  EXTRA_HELM_ARGS: '{{.EXTRA_HELM_ARGS | default ""}}'
   ECHO_APP_IMAGE: '{{.ECHO_APP_IMAGE | default "echo-app:latest"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
@@ -320,6 +337,16 @@ tasks:
       - echo "Refreshing tokens in cluster credential Secrets..."
       - task: secrets:create
       - echo "Tokens refreshed"
+
+  secrets:refresh:restart:
+    desc: Refresh tokens and restart operator so it picks them up immediately
+    cmds:
+      - task: secrets:refresh
+      - |
+        echo "Restarting primary operator to pick up new tokens..."
+        kubectl --context {{.PRIMARY_CLUSTER}} delete pod -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0
+        kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=mirrord-operator -n mirrord --context {{.PRIMARY_CLUSTER}} --timeout=120s
+        echo "Operator restarted with fresh tokens."
 
   test:token:break:
     desc: Break token refresh by deleting the ServiceAccount on remote clusters
@@ -674,8 +701,12 @@ tasks:
     desc: Install operator in remote clusters (standard operators, not multi-cluster)
     cmds:
       - |
-        # Get LocalStack URL (NodePort on remote-1)
-        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        # LocalStack is a NodePort on the default cluster (remote-1). We use
+        # remote-1's IP on the shared "mirrord-primary" network instead of its
+        # private minikube IP, because that is the only address every cluster can
+        # reach. remote-2 is not attached to remote-1's own network, so the private
+        # IP times out from there and breaks SQS splitting after every reinstall.
+        LOCALSTACK_IP=$(docker inspect {{.REMOTE_CLUSTER_1}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
         LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
         echo "LocalStack URL for SQS: $LOCALSTACK_URL"
 
@@ -703,6 +734,7 @@ tasks:
           --set operator.imageTag=custom \
           --set agent.image={{.AGENT_IMAGE}} \
           --set operator.extraEnv.AWS_ENDPOINT_URL="$LOCALSTACK_URL" \
+          {{.EXTRA_HELM_ARGS}} \
           --wait
 
         # Patch deployment with hostNetwork (for local multicluster testing only)
@@ -738,6 +770,7 @@ tasks:
             --set operator.imageTag=custom \
             --set agent.image={{.AGENT_IMAGE}} \
             --set operator.extraEnv.AWS_ENDPOINT_URL="$LOCALSTACK_URL" \
+            {{.EXTRA_HELM_ARGS}} \
             --wait
           
           # Patch deployment with hostNetwork (for local multicluster testing only)
@@ -785,8 +818,12 @@ tasks:
           --from-file=license.pem={{.ROOT_DIR}}/scripts/company-license.pem \
           -n mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
 
-        # Get LocalStack URL (NodePort on remote-1)
-        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        # LocalStack is a NodePort on the default cluster (remote-1). We use
+        # remote-1's IP on the shared "mirrord-primary" network instead of its
+        # private minikube IP, because that is the only address every cluster can
+        # reach. remote-2 is not attached to remote-1's own network, so the private
+        # IP times out from there and breaks SQS splitting after every reinstall.
+        LOCALSTACK_IP=$(docker inspect {{.REMOTE_CLUSTER_1}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
         LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
         echo "  LocalStack URL: $LOCALSTACK_URL"
 
@@ -851,6 +888,13 @@ tasks:
           )
         fi
 
+        # Append release overrides (image + license) when installing a release.
+        # Empty for the normal local build install. Word-splitting is intentional:
+        # EXTRA_HELM_ARGS is space-separated helm flags with no spaces inside any
+        # value, so each token becomes its own array element. We avoid `read -a`
+        # because the shell embedded in Task does not support it.
+        HELM_ARGS+=({{.EXTRA_HELM_ARGS}})
+
         helm "${HELM_ARGS[@]}"
 
         # Patch deployment with hostNetwork and hostAliases (for local multicluster testing only)
@@ -879,7 +923,68 @@ tasks:
     desc: Install operator in all clusters
     cmds:
       - task: operator:install:remote
+        vars:
+          EXTRA_HELM_ARGS: "{{.EXTRA_HELM_ARGS}}"
       - task: operator:install:primary
+        vars:
+          EXTRA_HELM_ARGS: "{{.EXTRA_HELM_ARGS}}"
+
+  operator:release:load:images:
+    desc: "Pull a released operator image from GHCR and load it into all clusters. Usage: task multicluster:operator:release:load:images [VERSION=3.165.0]"
+    vars:
+      VERSION: '{{.VERSION | default .OPERATOR_VERSION}}'
+    cmds:
+      - echo "Pulling {{.OPERATOR_RELEASE_REPO}}:{{.VERSION}} ..."
+      - "{{.CONTAINER_RUNTIME}} pull {{.OPERATOR_RELEASE_REPO}}:{{.VERSION}}"
+      - |
+        CLUSTERS="{{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_1}}"
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          CLUSTERS="$CLUSTERS {{.REMOTE_CLUSTER_2}}"
+        fi
+        for CLUSTER in $CLUSTERS; do
+          echo "Loading {{.OPERATOR_RELEASE_REPO}}:{{.VERSION}} into $CLUSTER ..."
+          minikube -p "$CLUSTER" ssh "{{.CONTAINER_RUNTIME}} rmi {{.OPERATOR_RELEASE_REPO}}:{{.VERSION}} --force" 2>/dev/null || true
+          minikube -p "$CLUSTER" image load {{.OPERATOR_RELEASE_REPO}}:{{.VERSION}}
+        done
+        echo "Release image loaded into all clusters (NUM_CLUSTERS={{.NUM_CLUSTERS}})"
+
+  operator:use:release:
+    desc: "Install a RELEASED operator on all clusters (the old version). Usage: MC_NUM_CLUSTERS=3 task multicluster:operator:use:release [VERSION=3.165.0]"
+    vars:
+      VERSION: '{{.VERSION | default .OPERATOR_VERSION}}'
+    preconditions:
+      - sh: test -n "{{.RELEASE_LICENSE_KEY}}"
+        msg: "RELEASE_LICENSE_KEY is required for released operators. Set it in local-sandbox/.env"
+    cmds:
+      - echo "=== Installing RELEASED operator {{.VERSION}} on all clusters ==="
+      - task: operator:release:load:images
+        vars:
+          VERSION: "{{.VERSION}}"
+      # Reuse the normal install, but point the image at the GHCR release tag and
+      # swap the dev pem license for the release key. The release image ships the
+      # production issuer key, so the mounted dev pem would be rejected.
+      - task: operator:install:all
+        vars:
+          EXTRA_HELM_ARGS: >-
+            --set operator.image={{.OPERATOR_RELEASE_REPO}}
+            --set operator.imageTag={{.VERSION}}
+            --set image.pullPolicy=IfNotPresent
+            --set license.pemRef=
+            --set-string license.key={{.RELEASE_LICENSE_KEY}}
+      - echo ""
+      - echo "Released operator {{.VERSION}} installed on all clusters."
+      - 'echo "Go back to the local build with: task multicluster:operator:use:local"'
+
+  operator:use:local:
+    desc: Install the local build operator (mirrord-operator:custom) on all clusters - use to upgrade back from a release
+    cmds:
+      - echo "=== Installing local build operator on all clusters ==="
+      # Reload the current local build so a rebuild is picked up, then install
+      # with chart defaults (custom image + mounted dev pem license).
+      - task: operator:load:images
+      - task: operator:install:all
+      - echo ""
+      - echo "Local build operator installed on all clusters."
 
   agent:build:
     desc: Build custom mirrord-agent image from local mirrord repo
@@ -2538,15 +2643,14 @@ tasks:
         fi
 
   sqs:setup:
-    desc: Complete SQS setup for multi-cluster testing
+    desc: Complete SQS setup for multi-cluster testing (one shared LocalStack)
     cmds:
-      - task: sqs:deploy:localstack
-      - task: sqs:wait:localstack
-      - task: sqs:create:queue
-      - task: sqs:deploy:consumer
-      # - task: sqs:deploy:queue-registry
-      - echo ""
-      - echo "SQS setup complete. Run 'task multicluster:sqs:send:messages' to send test messages."
+      # Production uses a single SQS that every cluster talks to, so we deploy
+      # one LocalStack on the default cluster and let the others reach it over
+      # the shared Docker network. Deploying a separate LocalStack per cluster
+      # would give each one its own queues, so a message produced on one
+      # cluster would never be seen by a consumer on another.
+      - task: sqs:setup:single
 
   sqs:setup:single:
     desc: SQS setup with single LocalStack on default cluster (matches production)
@@ -2629,8 +2733,11 @@ tasks:
         cd {{.APPS_DIR}}/sqs-consumer
         docker build -t sqs-consumer:latest . 2>/dev/null || echo "Build may have failed, continuing..."
 
-        # Get the minikube IP of the default cluster (where LocalStack runs)
-        LOCALSTACK_IP=$(minikube -p {{.REMOTE_CLUSTER_1}} ip)
+        # LocalStack is a NodePort on the default cluster (remote-1). We use
+        # remote-1's IP on the shared "mirrord-primary" network instead of its
+        # private minikube IP, so consumers on every cluster (including remote-2,
+        # which is not on remote-1's own network) can reach the same shared queue.
+        LOCALSTACK_IP=$(docker inspect {{.REMOTE_CLUSTER_1}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
         LOCALSTACK_URL="http://${LOCALSTACK_IP}:31566"
         echo ""
         echo "LocalStack URL: $LOCALSTACK_URL"

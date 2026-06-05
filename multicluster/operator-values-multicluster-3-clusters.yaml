@@ -19,7 +19,7 @@ operator:
   awsRoleArn: arn:aws:iam::000000000000:role/dummy
   metrics: true
   jsonLog: true
-  logLevel: "warn,operator=debug,mirrord=debug,operator_sqs_splitting::forwarder=trace"
+  logLevel: "warn,operator=debug,mirrord=debug,operator_envoy=trace"
   # Note: hostNetwork and hostAliases are patched via kubectl after helm install (not in chart)
   # AWS credentials for LocalStack (SQS splitting tests)
   # Note: AWS_ENDPOINT_URL is set via --set in the task (NodePort URL)

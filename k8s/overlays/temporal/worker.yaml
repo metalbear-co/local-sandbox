@@ -1,0 +1,41 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-worker
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal-worker
+  template:
+    metadata:
+      labels:
+        app: temporal-worker
+    spec:
+      initContainers:
+      - name: wait-for-temporal
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for Temporal frontend..."
+          until nc -z temporal-frontend.temporal.svc.cluster.local 7233 2>/dev/null; do
+            echo "Temporal not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "Temporal frontend is ready"
+      containers:
+      - name: worker
+        image: temporal-worker:local
+        imagePullPolicy: Never
+        env:
+        - name: TEMPORAL_ADDRESS
+          value: temporal-frontend.temporal.svc.cluster.local:7233
+        - name: TEMPORAL_NAMESPACE
+          value: temporal
+        - name: TEMPORAL_TASK_QUEUE
+          value: order-checkout
+        - name: APP_NAME
+          value: temporal-worker

@@ -1,0 +1,18 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: redis-pubsub-test-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: redis-pubsub-consumer
+  clientConfigs:
+    redisPubSub: redis-pubsub-config
+  queues:
+  - id: orders-channel
+    kind: redisPubSub
+    appConfig:
+      channel:
+      - env: REDIS_CHANNEL

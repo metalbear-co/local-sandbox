@@ -5,6 +5,8 @@ operator:
   kafkaSplitting: true
   gcpPubsubSplitting: true
   azureServiceBusSplitting: true
+  redisPubsubSplitting: true
+  temporalSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true

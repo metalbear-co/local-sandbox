@@ -14,6 +14,13 @@ tasks:
       - task: _wait:localstack
       - task: _wait:consumer
 
+  deploy:legacy:
+    desc: "Deploy SQS env with the old MirrordWorkloadQueueRegistry only (no MirrordSplitConfig). Use this under a released operator that lacks the new CRD."
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack-legacy
+      - task: _wait:localstack
+      - task: _wait:consumer
+
   deploy:aws:
     desc: "Deploy SQS AWS test environment"
     preconditions:

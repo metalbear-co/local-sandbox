@@ -37,8 +37,14 @@ includes:
   pubsub:
     taskfile: ./tasks/Taskfile.pubsub.yml
     dir: ./tasks
+  redis-pubsub:
+    taskfile: ./tasks/Taskfile.redis-pubsub.yml
+    dir: ./tasks
   servicebus:
     taskfile: ./tasks/Taskfile.servicebus.yml
+    dir: ./tasks
+  temporal:
+    taskfile: ./tasks/Taskfile.temporal.yml
     dir: ./tasks
   eks:
     taskfile: ./tasks/Taskfile.eks.yml
@@ -85,6 +91,15 @@ tasks:
     cmds:
       - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --provenance=false -f operator/public/operator/Dockerfile -t {{.OPERATOR_IMAGE}}  --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
       - task: operator:image:load
+
+  build:operator:linux:
+    desc: Build operator image for linux/amd64 and push to Docker Hub
+    vars:
+      DOCKER_HUB_IMAGE: '{{.DOCKER_HUB_IMAGE | default "vrrashkov/operator:cloudtest"}}'
+    cmds:
+      - cd {{.OPERATOR_DIR}}/.. && docker build --platform linux/amd64 --provenance=false -f operator/public/operator/Dockerfile -t {{.DOCKER_HUB_IMAGE}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - docker push {{.DOCKER_HUB_IMAGE}}
+      - echo "Pushed {{.DOCKER_HUB_IMAGE}}"
 
   build:operator:aks:
     desc: Build operator image for AKS (linux/amd64) and push to ACR
@@ -243,9 +258,27 @@ tasks:
       - task: build:operator
       - task: build:apps
 
+  colima:configure-build-cache:
+    desc: "Raise Colima BuildKit cache limits (fixes operator rebuilds going cold after a few minutes)"
+    vars:
+      BUILD_CACHE_KEEP_STORAGE: '{{.BUILD_CACHE_KEEP_STORAGE | default "30GB"}}'
+    cmds:
+      - BUILD_CACHE_KEEP_STORAGE={{.BUILD_CACHE_KEEP_STORAGE}} {{.SCRIPTS_DIR}}/configure-colima-build-cache.sh
+      - echo ""
+      - echo "Restart Colima to apply, then verify with:"
+      - echo "  task colima:restart"
+      - echo "  docker buildx inspect default | grep -A2 'GC Policy'"
+
+  colima:restart:
+    desc: Restart Colima (needed after build-cache config changes)
+    cmds:
+      - colima restart
+      - docker buildx inspect default 2>&1 | grep -E 'GC Policy|Max Used Space|defaultKeepStorage' || true
+
   cluster:create:
     desc: Create fresh minikube cluster with infrastructure
     cmds:
+      - task: colima:configure-build-cache
       - minikube -p {{.CLUSTER_NAME}} start --driver={{.CONTAINER_RUNTIME}}
       - minikube -p {{.CLUSTER_NAME}} addons enable metrics-server
       - kubectl config use-context {{.CLUSTER_NAME}}
@@ -255,6 +288,26 @@ tasks:
     desc: Delete minikube cluster
     cmds:
       - minikube -p {{.CLUSTER_NAME}} delete
+
+  cluster:start:
+    desc: Start minikube if it exists but is stopped
+    cmds:
+      - task: _ensure:cluster
+
+  _ensure:cluster:
+    internal: true
+    desc: Start minikube profile when stopped (Colima alone is not enough)
+    cmds:
+      - |
+        if minikube -p {{.CLUSTER_NAME}} status 2>/dev/null | grep -q 'host: Running'; then
+          kubectl config use-context {{.CLUSTER_NAME}} 2>/dev/null || true
+          exit 0
+        fi
+        echo "minikube profile '{{.CLUSTER_NAME}}' is not running. Starting it now..."
+        echo "(Colima/docker running is only the container runtime - Kubernetes is separate.)"
+        minikube -p {{.CLUSTER_NAME}} start --driver={{.CONTAINER_RUNTIME}}
+        kubectl config use-context {{.CLUSTER_NAME}}
+        echo "Cluster '{{.CLUSTER_NAME}}' is ready."
 
   infra:argo:rollouts:
     desc: Install Argo Rollouts
@@ -324,7 +377,6 @@ tasks:
     cmds:
       - task: infra:argo:rollouts
       - task: infra:loki
-      - task: infra:tempo
 
   infra:status:
     desc: Check infrastructure status
@@ -441,6 +493,7 @@ tasks:
     desc: Rebuild and upgrade operator (auto-saves image tagged by current branch)
     cmds:
       - task: build:operator
+      - task: _ensure:cluster
       - task: operator:save
       - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
@@ -540,10 +593,11 @@ tasks:
       - '{{.CONTAINER_RUNTIME}} images mirrord-operator --format "table {{`{{.Tag}}`}}\t{{`{{.ID}}`}}\t{{`{{.CreatedAt}}`}}\t{{`{{.Size}}`}}"'
 
   operator:save:
-    desc: Save current operator image under a tag (defaults to current git branch)
+    desc: Save current operator image under a tag (TAG=... overrides; defaults to current git branch)
     vars:
-      TAG:
+      GIT_BRANCH:
         sh: cd {{.OPERATOR_DIR}} && git rev-parse --abbrev-ref HEAD | tr '/' '-'
+      TAG: '{{.TAG | default .GIT_BRANCH}}'
     cmds:
       - '{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.TAG}}'
       - echo "Saved operator image as mirrord-operator:{{.TAG}}"
@@ -561,7 +615,7 @@ tasks:
       - "{{.CONTAINER_RUNTIME}} tag mirrord-operator:{{.TAG}} mirrord-operator:{{.CHART_VERSION}}"
       - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
-      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts --validate=false -f -
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
       - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
@@ -570,6 +624,7 @@ tasks:
   operator:image:load:
     desc: Tag and load operator image into minikube
     cmds:
+      - task: _ensure:cluster
       - "{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.CHART_VERSION}}"
       - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
@@ -1144,6 +1199,30 @@ tasks:
     deps: [operator:install]
     cmds:
       - task: servicebus:deploy
+
+  test:temporal:
+    desc: "Deploy Temporal server + worker and install operator"
+    deps: [operator:install]
+    cmds:
+      - task: temporal:deploy
+
+  test:temporal:clean:
+    desc: "Clean cluster and deploy Temporal from scratch"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: operator:install
+      - task: temporal:deploy
+
+  test:temporal:clean:nobuild:
+    desc: "Clean cluster and deploy Temporal (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: temporal:build
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: temporal:deploy
 
   test:pubsub:clean:
     desc: "Clean cluster and deploy Pub/Sub from scratch"

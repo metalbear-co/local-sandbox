@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-pubsub-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis-pubsub-consumer
+  template:
+    metadata:
+      labels:
+        app: redis-pubsub-consumer
+    spec:
+      initContainers:
+      - name: wait-for-redis
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for Redis to be ready..."
+          until nc -z redis-main.redis-test.svc.cluster.local 6379 2>/dev/null; do
+            echo "Redis not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "Redis is ready!"
+      containers:
+      - name: consumer
+        image: redis-pubsub-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: REDIS_CHANNEL
+          value: "orders.events"
+        - name: REDIS_URL
+          value: "redis://redis-main.redis-test.svc.cluster.local:6379"
+        - name: REDIS_SUBSCRIBE_MODE
+          value: "exact"

@@ -1,0 +1,9 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: redis-pubsub-config
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: url
+    value: "redis://redis-main.redis-test.svc.cluster.local:6379"

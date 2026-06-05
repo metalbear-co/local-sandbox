@@ -1,0 +1,11 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: temporal-connection
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: address
+    value: temporal-frontend.temporal.svc.cluster.local:7233
+  - name: namespace
+    value: temporal

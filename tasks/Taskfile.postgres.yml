@@ -1123,3 +1123,66 @@ tasks:
       - kubectl delete secret pg-user-secret -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete branchdatabase -l mirrord.metalbear.co/branch-id=pg-literal-value-no-pass -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete secrets -l operator.metalbear.co/branch-credential=true -n {{.NAMESPACE}} --ignore-not-found=true
+
+  deploy:shared-branch:
+    desc: "Deploy two target deployments (api + worker) for shared branch ID testing"
+    cmds:
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/shared-branch
+      - kubectl rollout status deployment/pg-server-api -n {{.NAMESPACE}} --timeout=60s
+      - kubectl rollout status deployment/pg-server-worker -n {{.NAMESPACE}} --timeout=60s
+      - echo "Both target deployments are ready."
+
+  run:local:shared-branch:api:
+    desc: "Run mirrord session targeting the API pod with shared branch ID"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-shared-branch-api.json -- /tmp/postgres-app'
+
+  run:local:shared-branch:worker:
+    desc: "Run mirrord session targeting the worker pod with shared branch ID"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-shared-branch-worker.json -- /tmp/postgres-app'
+
+  verify:shared-branch:
+    desc: "Verify shared branch ID reuse - expect 1 branch CRD and 1 branch pod"
+    cmds:
+      - |
+        echo "=== BranchDatabase CRDs with id=shared-branch-test ==="
+        CRD_COUNT=$(kubectl get branchdatabase -n {{.NAMESPACE}} -l mirrord-branch-id=shared-branch-test -o name 2>/dev/null | wc -l | tr -d ' ')
+        kubectl get branchdatabase -n {{.NAMESPACE}} -l mirrord-branch-id=shared-branch-test -o wide 2>/dev/null || true
+        echo ""
+        echo "=== Branch pods ==="
+        POD_COUNT=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name -o name 2>/dev/null | grep branch | wc -l | tr -d ' ')
+        kubectl get pods -n {{.NAMESPACE}} -l db-owner-name -o wide 2>/dev/null | grep branch || true
+        echo ""
+        echo "=== Result ==="
+        echo "BranchDatabase CRDs: $CRD_COUNT (expected: 1)"
+        echo "Branch pods: $POD_COUNT (expected: 1)"
+        if [ "$CRD_COUNT" = "1" ] && [ "$POD_COUNT" = "1" ]; then
+          echo "PASS: Branch is shared across targets"
+        else
+          echo "FAIL: Branch is NOT shared - each target created its own"
+        fi
+
+  test:shared-branch:
+    desc: "Full shared branch ID test - deploy, run both sessions, verify reuse"
+    cmds:
+      - task: deploy:base
+      - task: deploy:shared-branch
+      - |
+        echo ""
+        echo "Run these in two separate terminals:"
+        echo "  Terminal 1: task postgres:run:local:shared-branch:api"
+        echo "  Terminal 2: task postgres:run:local:shared-branch:worker"
+        echo ""
+        echo "Then verify with:"
+        echo "  task postgres:verify:shared-branch"
+
+  clean:shared-branch:
+    desc: "Clean shared branch test resources"
+    cmds:
+      - kubectl delete deployment pg-server-api pg-server-worker -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete branchdatabase -l mirrord-branch-id=shared-branch-test -n {{.NAMESPACE}} --ignore-not-found=true
