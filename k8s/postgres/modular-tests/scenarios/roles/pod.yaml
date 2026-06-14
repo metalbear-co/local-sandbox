@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-server-roles
+  namespace: test-mirrord
+  labels:
+    test-scenario: roles
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg-server-roles
+  template:
+    metadata:
+      labels:
+        app: pg-server-roles
+        test-scenario: roles
+    spec:
+      containers:
+      - name: app
+        image: busybox
+        command: ["sh", "-c", "echo 'Postgres roles scenario target running' && sleep 3600"]
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres-roles:5432/roles_db"

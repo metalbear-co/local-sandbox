@@ -58,22 +58,28 @@ tasks:
       - task: run:local
 
   run:local:
-    desc: "Run temporal worker locally with mirrord (workflow_id=^test-alice- filter)"
+    desc: "Run temporal worker locally with mirrord (workflow_id=^test-alice- filter). Reconnects by default; pass TEMPORAL_CLEANUP=true for a fresh session."
     dir: "{{.ROOT_DIR}}/apps/temporal-worker"
     vars:
       MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/temporal/mirrord.json")}}'
+      TEMPORAL_CLEANUP: '{{.TEMPORAL_CLEANUP | default "false"}}'
     cmds:
       - task: _prepare:local
+        vars:
+          TEMPORAL_CLEANUP: "{{.TEMPORAL_CLEANUP}}"
       - go build -o /tmp/temporal-worker main.go
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/temporal-worker'
 
   run:local:user-b:
-    desc: "Run a second local worker with mirrord (workflow_id=^test-bob- filter)"
+    desc: "Run a second local worker with mirrord (workflow_id=^test-bob- filter). Keeps existing split sessions."
     dir: "{{.ROOT_DIR}}/apps/temporal-worker"
     vars:
       MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/temporal/mirrord-user-b.json'
+      TEMPORAL_CLEANUP: '{{.TEMPORAL_CLEANUP | default "false"}}'
     cmds:
       - task: _prepare:local
+        vars:
+          TEMPORAL_CLEANUP: "{{.TEMPORAL_CLEANUP}}"
       - go build -o /tmp/temporal-worker-b main.go
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/temporal-worker-b'
 
@@ -191,6 +197,10 @@ tasks:
         echo "  Or run the automated check:"
         echo "    task temporal:test:split:run"
         echo ""
+        echo "  If sessions are stuck or routing is wrong:"
+        echo "    task temporal:test:split:cleanup"
+        echo "    TEMPORAL_CLEANUP=true task temporal:run:local"
+        echo ""
         echo "  If old workflows are stuck Running in the UI:"
         echo "    task temporal:workflows:terminate-stuck"
 
@@ -302,6 +312,111 @@ tasks:
         echo "  alice -> local worker"
         echo "  bob/other -> cluster worker"
 
+  test:split:multi:
+    desc: "Automated test with two local workers (alice + bob) and other on cluster"
+    cmds:
+      - task: _cleanup:temporal-sessions
+      - task: _wait:temporal-sessions-gone
+      - |
+        set -euo pipefail
+        cd {{.ROOT_DIR}}/apps/temporal-worker
+        go build -o /tmp/temporal-worker main.go
+        go build -o /tmp/temporal-worker-b main.go
+
+        ALICE_LOG=/tmp/temporal-multi-alice.log
+        BOB_LOG=/tmp/temporal-multi-bob.log
+        rm -f "$ALICE_LOG" "$BOB_LOG"
+
+        echo "Starting alice local worker..."
+        nohup {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/temporal/mirrord.json -- /tmp/temporal-worker \
+          >> "$ALICE_LOG" 2>&1 &
+        disown $! 2>/dev/null || true
+
+        echo "Starting bob local worker..."
+        nohup {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/temporal/mirrord-user-b.json -- /tmp/temporal-worker-b \
+          >> "$BOB_LOG" 2>&1 &
+        disown $! 2>/dev/null || true
+
+        cleanup() {
+          pkill -f "mirrord exec.*temporal-worker" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        for i in $(seq 1 60); do
+          alice_ready=false
+          bob_ready=false
+          grep -q "Started Worker" "$ALICE_LOG" 2>/dev/null && alice_ready=true
+          grep -q "Started Worker" "$BOB_LOG" 2>/dev/null && bob_ready=true
+          if [ "$alice_ready" = "true" ] && [ "$bob_ready" = "true" ]; then
+            echo "Both local workers ready"
+            break
+          fi
+          sleep 2
+        done
+
+        if ! grep -q "Started Worker" "$ALICE_LOG"; then
+          echo "ERROR: alice worker failed to start"
+          cat "$ALICE_LOG"
+          exit 1
+        fi
+        if ! grep -q "Started Worker" "$BOB_LOG"; then
+          echo "ERROR: bob worker failed to start"
+          cat "$BOB_LOG"
+          exit 1
+        fi
+
+        sessions=$(kubectl get mirrordclustersplitsessions -A --no-headers 2>/dev/null | grep -c temporal-worker || true)
+        echo "Active split sessions: $sessions"
+        if [ "$sessions" -lt 2 ]; then
+          echo "ERROR: expected 2 split sessions, got $sessions"
+          kubectl get mirrordclustersplitsessions -A
+          exit 1
+        fi
+
+        task temporal:start:workflow:alice
+        task temporal:start:workflow:bob
+        task temporal:start:workflow:other
+        sleep 5
+
+        if ! grep -q '\[WORKFLOW\].*test-alice-' "$ALICE_LOG"; then
+          echo "ERROR: alice did not run on alice worker"
+          cat "$ALICE_LOG"
+          exit 1
+        fi
+        if grep -q '\[WORKFLOW\].*test-bob-' "$ALICE_LOG"; then
+          echo "ERROR: bob ran on alice worker"
+          cat "$ALICE_LOG"
+          exit 1
+        fi
+        if ! grep -q '\[WORKFLOW\].*test-bob-' "$BOB_LOG"; then
+          echo "ERROR: bob did not run on bob worker"
+          cat "$BOB_LOG"
+          exit 1
+        fi
+        if grep -q '\[WORKFLOW\].*test-alice-' "$BOB_LOG"; then
+          echo "ERROR: alice ran on bob worker"
+          cat "$BOB_LOG"
+          exit 1
+        fi
+
+        CLUSTER_LOG=$(kubectl logs -n {{.NAMESPACE}} -l app=temporal-worker --tail=20 2>/dev/null)
+        if echo "$CLUSTER_LOG" | grep -qE '\[WORKFLOW\].*test-(alice|bob)-'; then
+          echo "ERROR: alice or bob ran on cluster worker"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+        if ! echo "$CLUSTER_LOG" | grep -q '\[WORKFLOW\].*test-other-'; then
+          echo "ERROR: other did not run on cluster"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+
+        echo ""
+        echo "Multi-session split test passed:"
+        echo "  alice -> alice local worker"
+        echo "  bob   -> bob local worker"
+        echo "  other -> cluster worker"
+
   workflows:terminate-stuck:
     desc: "Terminate orphaned Running test-* workflows left from failed split sessions"
     cmds:
@@ -385,10 +500,18 @@ tasks:
 
   _prepare:local:
     internal: true
-    desc: "Remove stale temporal-worker sessions before starting a local worker"
+    desc: "Optionally remove stale temporal-worker sessions before starting a local worker"
+    vars:
+      TEMPORAL_CLEANUP: '{{.TEMPORAL_CLEANUP | default "false"}}'
     cmds:
-      - task: _cleanup:temporal-sessions
-      - task: _wait:temporal-sessions-gone
+      - |
+        if [ "{{.TEMPORAL_CLEANUP}}" != "true" ]; then
+          echo "Skipping session cleanup (mirrord will reconnect if a session still exists)"
+        else
+          echo "TEMPORAL_CLEANUP=true: removing stale temporal-worker sessions..."
+          task temporal:_cleanup:temporal-sessions
+          task temporal:_wait:temporal-sessions-gone
+        fi
 
   _cleanup:temporal-sessions:
     internal: true

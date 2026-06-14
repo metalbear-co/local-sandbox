@@ -592,33 +592,221 @@ tasks:
     cmds:
       - '{{.CONTAINER_RUNTIME}} images mirrord-operator --format "table {{`{{.Tag}}`}}\t{{`{{.ID}}`}}\t{{`{{.CreatedAt}}`}}\t{{`{{.Size}}`}}"'
 
+  operator:saved:
+    desc: List operator images archived on disk (survive a Docker purge) under .versions/operator/branches
+    vars:
+      BRANCHES_DIR: '{{.VERSIONS_DIR}}/operator/branches'
+    cmds:
+      - |
+        if ! ls {{.BRANCHES_DIR}}/*.tar >/dev/null 2>&1; then
+          echo "No archived operator images. Run 'task operator:save' to create one."
+          exit 0
+        fi
+        echo "Archived operator images ({{.BRANCHES_DIR}}):"
+        for f in {{.BRANCHES_DIR}}/*.tar; do
+          TAG=$(basename "$f" .tar)
+          SIZE=$(du -h "$f" | cut -f1)
+          printf "  %-40s %s\n" "$TAG" "$SIZE"
+        done
+
   operator:save:
-    desc: Save current operator image under a tag (TAG=... overrides; defaults to current git branch)
+    desc: Save current operator image under a tag (TAG=... overrides; defaults to current git branch). Also archives a tar under .versions so the image survives a Docker purge.
     vars:
       GIT_BRANCH:
         sh: cd {{.OPERATOR_DIR}} && git rev-parse --abbrev-ref HEAD | tr '/' '-'
       TAG: '{{.TAG | default .GIT_BRANCH}}'
+      BRANCHES_DIR: '{{.VERSIONS_DIR}}/operator/branches'
     cmds:
       - '{{.CONTAINER_RUNTIME}} tag {{.OPERATOR_IMAGE}} mirrord-operator:{{.TAG}}'
-      - echo "Saved operator image as mirrord-operator:{{.TAG}}"
+      # A docker tag alone lives in Docker's storage and is wiped by a prune. The
+      # tar sits on the host filesystem under .versions, so a purged image can be
+      # reloaded later without rebuilding.
+      - mkdir -p {{.BRANCHES_DIR}}
+      - '{{.CONTAINER_RUNTIME}} save mirrord-operator:{{.TAG}} -o {{.BRANCHES_DIR}}/{{.TAG}}.tar'
+      # Snapshot the CRDs this build ships, rendered from the chart as it looks
+      # right now. The image alone does not carry CRDs, so without this snapshot
+      # operator:load would have to fall back to whatever chart is checked out
+      # later. Saving them here lets a future load deploy the exact CRD set that
+      # matches this image, even after the working tree moved on. The
+      # multi-cluster CRDs only render when that feature is enabled in values, and
+      # `helm -s` errors on an empty render, so we append them best-effort.
+      - |
+        helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml > {{.BRANCHES_DIR}}/{{.TAG}}.crds.yaml
+        helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/multi-cluster-crd.yaml >> {{.BRANCHES_DIR}}/{{.TAG}}.crds.yaml 2>/dev/null || true
+      - echo "Saved operator image mirrord-operator:{{.TAG}} (archived {{.BRANCHES_DIR}}/{{.TAG}}.tar + CRD snapshot {{.TAG}}.crds.yaml)"
 
   operator:load:
-    desc: Load a previously saved operator image and deploy it
+    desc: "Load a saved operator image and deploy it through the local chart. Run without TAG to pick from a list; restores from the .versions tar if the Docker tag was purged. If a CRD snapshot was saved with the image, the cluster CRDs are reconciled to that version (extra mirrord CRDs are pruned, with a prompt unless FORCE=true). Pass CRDS=current to ignore the snapshot and use the current working-tree chart CRDs instead (no prune)."
+    interactive: true
     vars:
       TAG: '{{.TAG | default ""}}'
+      BRANCHES_DIR: '{{.VERSIONS_DIR}}/operator/branches'
+      FORCE: '{{.FORCE | default "false"}}'
+      CRDS: '{{.CRDS | default "snapshot"}}'
+    cmds:
+      - |
+        set -e
+        TAG="{{.TAG}}"
+        BRANCHES_DIR="{{.BRANCHES_DIR}}"
+        CRD_MODE="{{.CRDS}}"
+
+        # No TAG given: let the user pick from what we can actually deploy here -
+        # tar archives under .versions (survive a Docker purge) and mirrord-operator
+        # image tags currently in Docker. The chart's deploy tag ({{.CHART_VERSION}})
+        # is filtered out because it is just the rolling target, not a saved build.
+        if [ -z "$TAG" ]; then
+          LIST=$(
+            {
+              if ls "$BRANCHES_DIR"/*.tar >/dev/null 2>&1; then
+                for f in "$BRANCHES_DIR"/*.tar; do
+                  echo "$(basename "$f" .tar)|archived"
+                done
+              fi
+              {{.CONTAINER_RUNTIME}} images mirrord-operator --format '{{`{{.Tag}}`}}' 2>/dev/null \
+                | grep -vE '^(<none>|{{.CHART_VERSION}})$' \
+                | while read -r t; do echo "$t|in-docker"; done
+            } | awk -F'|' '!seen[$1]++' | sort
+          )
+
+          if [ -z "$LIST" ]; then
+            echo "Nothing to load. Run 'task operator:save' or 'task operator:update' first."
+            exit 0
+          fi
+
+          DISPLAY=$(echo "$LIST" | awk -F'|' '{printf "%-40s %s\n", $1, $2}')
+          if command -v fzf >/dev/null 2>&1; then
+            SELECTED=$(echo "$DISPLAY" | fzf --ansi --height=40% --reverse --border \
+              --border-label=" operator:load " --prompt="image> " \
+              --header="Pick an operator image to deploy. Esc to cancel.") || SELECTED=""
+          else
+            echo "$DISPLAY" | cat -n
+            read -p "Pick a number: " n </dev/tty
+            SELECTED=$(echo "$DISPLAY" | sed -n "${n}p")
+          fi
+          if [ -z "$SELECTED" ]; then echo "Cancelled."; exit 0; fi
+          TAG=$(echo "$SELECTED" | awk '{print $1}')
+
+          # Also pick how to handle CRDs, unless it was already set on the CLI
+          # (CRDS=... overrides the prompt). "snapshot" is the default value, so
+          # we treat that as "not chosen yet" and ask.
+          if [ "{{.CRDS}}" = "snapshot" ]; then
+            CRD_DISPLAY=$(printf '%s\n' \
+              "snapshot   version-matched CRDs for this image, prune extras (default)" \
+              "current    keep current working-tree chart CRDs, no prune")
+            if command -v fzf >/dev/null 2>&1; then
+              CRD_SEL=$(echo "$CRD_DISPLAY" | fzf --ansi --height=20% --reverse --border \
+                --border-label=" CRD handling " --prompt="crds> " \
+                --header="How should cluster CRDs be reconciled? Esc = snapshot.") || CRD_SEL=""
+            else
+              echo "$CRD_DISPLAY" | cat -n
+              read -p "CRD handling [number, blank=snapshot]: " cn </dev/tty
+              CRD_SEL=$(echo "$CRD_DISPLAY" | sed -n "${cn}p")
+            fi
+            CRD_MODE=$(echo "$CRD_SEL" | awk '{print $1}')
+            if [ -z "$CRD_MODE" ]; then CRD_MODE="snapshot"; fi
+          fi
+        fi
+
+        echo "Loading operator image: $TAG (CRDs: $CRD_MODE)"
+
+        # After a Docker purge the tag is gone but the tar remains, so reload it.
+        if ! {{.CONTAINER_RUNTIME}} image inspect mirrord-operator:"$TAG" >/dev/null 2>&1; then
+          if [ -f "$BRANCHES_DIR/$TAG.tar" ]; then
+            echo "Image not in Docker, restoring from $BRANCHES_DIR/$TAG.tar"
+            {{.CONTAINER_RUNTIME}} load -i "$BRANCHES_DIR/$TAG.tar"
+          else
+            echo "No image mirrord-operator:$TAG in Docker and no archive at $BRANCHES_DIR/$TAG.tar"
+            exit 1
+          fi
+        fi
+
+        {{.CONTAINER_RUNTIME}} tag mirrord-operator:"$TAG" mirrord-operator:{{.CHART_VERSION}}
+        minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
+        minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
+        helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
+
+        # Reconcile CRDs to the version we are loading. helm upgrade above renders
+        # the CRDs from the local chart (whatever the working tree is now), which
+        # is wrong for a downgrade. If this image was saved with a CRD snapshot,
+        # apply that exact set and remove any mirrord CRDs the snapshot does not
+        # contain, so a downgrade ends up with only the older version's CRDs.
+        # Without a snapshot (older saves) we keep the local chart CRDs and do not
+        # prune, since we cannot know what this version actually shipped.
+        # CRDS=current forces the current working-tree chart CRDs and skips the
+        # snapshot and prune, for when you knowingly want today's CRDs on an old
+        # image (helm upgrade already applied them, so there is nothing else to do).
+        CRDS_SNAPSHOT="$BRANCHES_DIR/$TAG.crds.yaml"
+        if [ "$CRD_MODE" = "current" ]; then
+          echo "CRDs=current: keeping the working-tree chart CRDs, ignoring any snapshot and skipping prune."
+        elif [ -f "$CRDS_SNAPSHOT" ]; then
+          echo "Reconciling CRDs to version $TAG (from $(basename "$CRDS_SNAPSHOT"))"
+          kubectl apply --server-side --force-conflicts --validate=false -f "$CRDS_SNAPSHOT"
+
+          WANT=$(grep -E '^  name: .*mirrord\.metalbear\.co' "$CRDS_SNAPSHOT" | awk '{print $2}' | sort -u || true)
+          HAVE=$(kubectl get crd -o name 2>/dev/null | sed 's#.*/##' | grep 'mirrord\.metalbear\.co' | sort -u || true)
+          if [ -z "$WANT" ]; then
+            echo "WARNING: could not read any CRD names from the snapshot, skipping prune to avoid deleting everything."
+          else
+            PRUNE=$(comm -13 <(printf '%s\n' "$WANT") <(printf '%s\n' "$HAVE") || true)
+            if [ -n "$PRUNE" ]; then
+              echo ""
+              echo "These mirrord CRDs are not part of $TAG and will be removed:"
+              printf '%s\n' "$PRUNE" | sed 's/^/  /'
+              echo "Deleting a CRD also deletes all of its custom resources (sessions, configs, etc.)."
+              DO_PRUNE=true
+              if [ "{{.FORCE}}" != "true" ]; then
+                read -p "Delete these CRDs? (y/N) " yn </dev/tty
+                if [ "$yn" != "y" ]; then DO_PRUNE=false; fi
+              fi
+              if [ "$DO_PRUNE" = "true" ]; then
+                printf '%s\n' "$PRUNE" | while read -r c; do
+                  if [ -z "$c" ]; then continue; fi
+                  echo "  deleting $c"
+                  kubectl delete crd "$c" --ignore-not-found 2>/dev/null || true
+                done
+              else
+                echo "Skipped CRD prune - the extra CRDs remain in the cluster."
+              fi
+            else
+              echo "Cluster CRDs already match $TAG, nothing to prune."
+            fi
+          fi
+        else
+          echo "No CRD snapshot for $TAG (saved before this feature). Keeping the local chart CRDs and skipping prune."
+        fi
+
+        echo "Operator image '$TAG' loaded and chart deployed. Restarting operator..."
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      - task: _wait:operator
+
+  operator:load:graceful:
+    desc: Like operator:load but rolls the operator gracefully (no force-kill, no lease wipe). Mirrors a real `helm upgrade` so a live session can reconnect instead of being dropped.
+    vars:
+      TAG: '{{.TAG | default ""}}'
+      BRANCHES_DIR: '{{.VERSIONS_DIR}}/operator/branches'
     preconditions:
       - sh: test -n "{{.TAG}}"
-        msg: "TAG is required. Usage: task operator:load TAG=my-branch"
-      - sh: '{{.CONTAINER_RUNTIME}} image inspect mirrord-operator:{{.TAG}} >/dev/null 2>&1'
-        msg: "Image mirrord-operator:{{.TAG}} not found. Run 'task operator:save' first."
+        msg: "TAG is required. Usage: task operator:load:graceful TAG=my-branch"
+      - sh: '{{.CONTAINER_RUNTIME}} image inspect mirrord-operator:{{.TAG}} >/dev/null 2>&1 || test -f {{.BRANCHES_DIR}}/{{.TAG}}.tar'
+        msg: "No image mirrord-operator:{{.TAG}} in Docker and no archive at {{.BRANCHES_DIR}}/{{.TAG}}.tar. Run 'task operator:save' first."
     cmds:
+      # After a Docker purge the tag is gone but the tar remains, so reload it.
+      - |
+        if ! {{.CONTAINER_RUNTIME}} image inspect mirrord-operator:{{.TAG}} >/dev/null 2>&1; then
+          echo "Image not in Docker, restoring from {{.BRANCHES_DIR}}/{{.TAG}}.tar"
+          {{.CONTAINER_RUNTIME}} load -i {{.BRANCHES_DIR}}/{{.TAG}}.tar
+        fi
       - "{{.CONTAINER_RUNTIME}} tag mirrord-operator:{{.TAG}} mirrord-operator:{{.CHART_VERSION}}"
       - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi mirrord-operator:{{.CHART_VERSION}} --force" || true
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-operator:{{.CHART_VERSION}}
       - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.ROOT_DIR}}/operator-values.yaml -s templates/crd.yaml | kubectl apply --server-side --force-conflicts --validate=false -f -
       - helm upgrade --install mirrord-operator {{.CHARTS_DIR}} --namespace mirrord -f {{.ROOT_DIR}}/operator-values.yaml
-      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
-      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      # Graceful rolling restart: a new pod comes up Ready, then the old one
+      # terminates with its normal grace period and hands over the leader lease.
+      # This is how a production `helm upgrade` behaves, so an active session's
+      # connection can drain and reconnect rather than being abruptly cut.
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
       - task: _wait:operator
 
   operator:image:load:
@@ -779,6 +967,17 @@ tasks:
               CHART=" (+ chart)"
             fi
             echo "  $VER$CHART"
+          done
+        else
+          echo "  (none)"
+        fi
+        echo ""
+        echo "=== Archived Branch Images (survive Docker purge) ==="
+        if ls {{.VERSIONS_DIR}}/operator/branches/*.tar >/dev/null 2>&1; then
+          for f in {{.VERSIONS_DIR}}/operator/branches/*.tar; do
+            TAG=$(basename "$f" .tar)
+            SIZE=$(du -h "$f" | cut -f1)
+            echo "  $TAG ($SIZE)"
           done
         else
           echo "  (none)"
@@ -1573,6 +1772,66 @@ tasks:
       - kubectl delete namespace localstack --ignore-not-found=true
       - task: operator:uninstall
 
+  clean:disk:
+    desc: "Reclaim disk - asks one by one what to clean (cargo clean mirrord/operator, prune Docker images, prune build cache). Set FORCE=true to clean everything without prompts."
+    interactive: true
+    vars:
+      FORCE: '{{.FORCE | default "false"}}'
+    cmds:
+      - |
+        echo "=== Disk usage before ==="
+        du -sh {{.MIRRORD_DIR}}/target 2>/dev/null || echo "  mirrord/target: (none)"
+        du -sh {{.OPERATOR_DIR}}/target 2>/dev/null || echo "  operator/target: (none)"
+        echo ""
+        {{.CONTAINER_RUNTIME}} system df 2>/dev/null || true
+        echo ""
+        echo "Archived operator images under .versions live on the host disk and are"
+        echo "NOT touched here - reload them later with 'task operator:load TAG=...'."
+        echo "Data volumes are kept (no --volumes), so local DBs survive."
+        echo ""
+
+        # Ask y/n for one cleanup target. Returns 0 (do it) only on an explicit
+        # 'y'. With FORCE=true every target is selected without prompting.
+        ask() {
+          [ "{{.FORCE}}" = "true" ] && return 0
+          read -p "$1 (y/N) " yn </dev/tty
+          [ "$yn" = "y" ]
+        }
+
+        DID_SOMETHING=false
+
+        if ask "cargo clean mirrord ({{.MIRRORD_DIR}}/target)?"; then
+          cd {{.MIRRORD_DIR}} && cargo clean && cd - >/dev/null
+          DID_SOMETHING=true
+        fi
+
+        if ask "cargo clean operator ({{.OPERATOR_DIR}}/target)?"; then
+          cd {{.OPERATOR_DIR}} && cargo clean && cd - >/dev/null
+          DID_SOMETHING=true
+        fi
+
+        if ask "docker prune unused images/containers/networks?"; then
+          {{.CONTAINER_RUNTIME}} system prune -af
+          DID_SOMETHING=true
+        fi
+
+        if ask "docker prune build cache (BuildKit)?"; then
+          {{.CONTAINER_RUNTIME}} builder prune -af
+          DID_SOMETHING=true
+        fi
+
+        echo ""
+        if [ "$DID_SOMETHING" = "false" ]; then
+          echo "Nothing selected, nothing cleaned."
+          exit 0
+        fi
+        echo "=== Disk usage after ==="
+        du -sh {{.MIRRORD_DIR}}/target 2>/dev/null || echo "  mirrord/target: (none)"
+        du -sh {{.OPERATOR_DIR}}/target 2>/dev/null || echo "  operator/target: (none)"
+        echo ""
+        {{.CONTAINER_RUNTIME}} system df 2>/dev/null || true
+        echo "Done."
+
   logs:operator:
     desc: Show operator logs
     cmds:
@@ -2288,4 +2547,23 @@ tasks:
   _wait:operator:
     internal: true
     cmds:
-      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=300s
+      # Wait on the Deployment's Available condition, not `rollout status`.
+      # When the spec is unchanged (e.g. we force-deleted the pod to restart
+      # it), `rollout status` reads the stale "complete" status and returns
+      # right away without waiting for the new pod, so a flapping readiness
+      # probe right after restart can leave us thinking it is up when it is
+      # not - or fail with a bare exit code. Available flips to False while
+      # the pod restarts and back to True once it passes readiness, so this
+      # is the honest check. On timeout we show what is actually wrong.
+      - |
+        if ! kubectl wait --for=condition=available deployment/mirrord-operator -n mirrord --timeout=300s; then
+          echo ""
+          echo "Operator did not become available within the timeout. State:"
+          kubectl get pods -n mirrord -l app=mirrord-operator || true
+          kubectl get events -n mirrord --sort-by=.lastTimestamp 2>/dev/null | tail -n 15 || true
+          echo ""
+          echo "Watch it with: kubectl get pods -n mirrord -l app=mirrord-operator -w"
+          echo "Logs with:     task logs:operator"
+          exit 1
+        fi
+        echo "Operator is deployed and ready."

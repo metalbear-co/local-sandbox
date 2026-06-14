@@ -232,30 +232,42 @@ tasks:
         echo "Setting up {{.CLUSTER}}..."
         kubectl --context {{.CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
 
-  secrets:create:
-    desc: Create cluster credential Secrets on the primary cluster
+  network:connect:
+    desc: Cross-connect all cluster containers to the shared Docker network so they can reach each other
     cmds:
       - |
-        echo "Creating cluster credential Secrets on primary cluster..."
-        echo ""
-
-        # Connect Docker networks so primary can reach remote clusters
-        echo "Connecting Docker networks..."
-        docker network connect mirrord-remote-1 mirrord-primary 2>/dev/null || true
-        docker network connect mirrord-primary mirrord-remote-1 2>/dev/null || true
+        # Minikube puts each cluster on its own Docker network, but the operator
+        # needs one address that reaches every cluster's API server and the
+        # shared LocalStack NodePort. We attach each remote container to the
+        # primary network (and the primary to each remote) so they all share an
+        # address on the "mirrord-primary" network. Tasks later read that address
+        # with `docker inspect ... Networks "mirrord-primary"`, so this must run
+        # before any of them. The connects are idempotent, so re-running is safe
+        # and only does real work the first time or after a restart drops them.
+        echo "Connecting Docker networks across clusters..."
+        docker network connect {{.REMOTE_CLUSTER_1}} {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+        docker network connect {{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          docker network connect mirrord-remote-2 mirrord-primary 2>/dev/null || true
-          docker network connect mirrord-primary mirrord-remote-2 2>/dev/null || true
+          docker network connect {{.REMOTE_CLUSTER_2}} {{.PRIMARY_CLUSTER}} 2>/dev/null || true
+          docker network connect {{.PRIMARY_CLUSTER}} {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
         fi
 
-        # Update kubectl contexts - Docker network changes can break port mappings
-        echo "Updating kubectl contexts..."
+        # Attaching a container to a new network can reshuffle Docker's published
+        # ports, which breaks the API server URLs minikube wrote into kubeconfig.
+        # Refresh them so kubectl keeps working against every cluster.
+        echo "Refreshing kubectl contexts..."
         minikube update-context -p {{.PRIMARY_CLUSTER}} 2>/dev/null || true
         minikube update-context -p {{.REMOTE_CLUSTER_1}} 2>/dev/null || true
         if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
           minikube update-context -p {{.REMOTE_CLUSTER_2}} 2>/dev/null || true
         fi
 
+  secrets:create:
+    desc: Create cluster credential Secrets on the primary cluster
+    cmds:
+      - echo "Creating cluster credential Secrets on primary cluster..."
+      - task: network:connect
+      - |
         # Create namespace
         kubectl --context {{.PRIMARY_CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.PRIMARY_CLUSTER}} apply -f -
       - task: secrets:create:cluster
@@ -700,6 +712,11 @@ tasks:
   operator:install:remote:
     desc: Install operator in remote clusters (standard operators, not multi-cluster)
     cmds:
+      # Make sure the shared network exists first. This task runs before
+      # operator:install:primary (which is where the network used to get
+      # connected), and after a restart the attachment is dropped, so the
+      # docker inspect below would otherwise index a nil network.
+      - task: network:connect
       - |
         # LocalStack is a NodePort on the default cluster (remote-1). We use
         # remote-1's IP on the shared "mirrord-primary" network instead of its

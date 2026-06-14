@@ -1,0 +1,36 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "deployment": "pg-server-roles"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "roles-branch-test",
+        "name": "roles_branch_db",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "copy": {
+          "mode": "schema"
+        }
+      }
+    ]
+  }
+}

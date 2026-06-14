@@ -56,6 +56,83 @@ tasks:
       - go build -o /tmp/sqs-consumer main.go
       - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer'
 
+  split:session:
+    desc: "Start a local mirrord SQS-splitting session in the foreground (Ctrl-C to stop). Output streams to this console. Pinned to eu-north-1 so it matches the source queue, the consumer deployment env, and the operator (operator-values.yaml AWS_REGION) - the operator creates the split queue in its own region, so everything must agree. Set MIRRORD_BIN to override the CLI."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - (cd apps/sqs-consumer && go build -o /tmp/sqs-consumer main.go)
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - |
+        BIN="${MIRRORD_BIN:-{{.ROOT_DIR}}/../mirrord/target/aarch64-apple-darwin/debug/mirrord}"
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer
+
+  split:send:
+    desc: "Send messages to the SQS source queue and print results to the console. FILTERED=N go to your local session (tenant Avi.Test); UNFILTERED=N stay in the cluster (tenant Basic)."
+    vars:
+      FILTERED: '{{.FILTERED | default "1"}}'
+      UNFILTERED: '{{.UNFILTERED | default "0"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+    cmds:
+      - |
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "filtered-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' >/dev/null
+          echo "sent filtered-$i  (tenant=Avi.Test -> local session)"
+        done
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "unfiltered-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Basic"}}' >/dev/null
+          echo "sent unfiltered-$i  (tenant=Basic -> stays in cluster)"
+        done
+
+  split:reset:
+    desc: "Full reset of SQS splitting state: kill the local consumer, delete every split-session CRD, delete all mirrord split queues, and restart the operator so no stale in-memory split keeps routing your messages to a dead queue."
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - echo "killing any local consumer processes"
+      - pkill -f /tmp/sqs-consumer 2>/dev/null || true
+      - echo "deleting split-session CRDs (both legacy and unified)"
+      - kubectl delete mirrordclustersplitsession --all -A --wait=false 2>/dev/null || true
+      - kubectl delete mirrordsqssession --all -A --wait=false 2>/dev/null || true
+      - kubectl delete mirrordclustersession --all -n mirrord --wait=false 2>/dev/null || true
+      # A split session carries the `mirrord-queue-splitting` finalizer, so the
+      # delete above only marks it for deletion - the operator is supposed to
+      # remove the finalizer after it cleans up the split, but an orphaned
+      # session (consumer gone, operator restarted) never gets reconciled and
+      # stays stuck in Terminating forever. Since this is a full reset that
+      # also wipes the queues and restarts the operator, that cleanup is moot,
+      # so we strip the finalizer to let the stuck sessions actually go away.
+      - echo "clearing finalizers on any stuck split-session CRDs"
+      - |
+        for name in $(kubectl get mirrordclustersplitsession -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          echo "  clearing finalizers on $name"
+          kubectl patch mirrordclustersplitsession "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      - echo "deleting all mirrord split queues in {{.REGION}}"
+      - |
+        for q in $(kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs list-queues --region {{.REGION}} --query 'QueueUrls[]' --output text 2>/dev/null \
+            | tr '\t' '\n' | grep mirrord); do
+          echo "  deleting $(basename "$q")"
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs delete-queue --queue-url "$q" --region {{.REGION}} 2>/dev/null || true
+        done
+      - echo "restarting operator to clear in-memory split state"
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - echo "reset complete - start a fresh session with 'task sqs:split:session'"
+
   run:local:aws:
     desc: "Run SQS consumer locally with mirrord (AWS)"
     dir: '{{.ROOT_DIR}}/apps/sqs-consumer'
@@ -439,6 +516,21 @@ tasks:
         kill $SESSION2_PID 2>/dev/null || true
         echo ""
         echo "Test complete!"
+
+  test:live-upgrade:
+    desc: "Test a live session surviving an operator change. MODE=both|upgrade|restart OLD_VERSION=3.165.0 RESTORE_TAG=latest"
+    vars:
+      MODE: '{{.MODE | default "both"}}'
+      OLD_VERSION: '{{.OLD_VERSION | default ""}}'
+      RESTORE_TAG: '{{.RESTORE_TAG | default "latest"}}'
+    cmds:
+      - |
+        MODE="{{.MODE}}" \
+        OLD_VERSION="{{.OLD_VERSION}}" \
+        RESTORE_TAG="{{.RESTORE_TAG}}" \
+        MIRRORD_BIN="${MIRRORD_BIN:-{{.MIRRORD_BIN}}}" \
+        RELEASE_LICENSE_KEY="${RELEASE_LICENSE_KEY:-}" \
+        bash {{.ROOT_DIR}}/scripts/test-live-operator-upgrade.sh
 
   queue:list:
     desc: "List all SQS queues in LocalStack"

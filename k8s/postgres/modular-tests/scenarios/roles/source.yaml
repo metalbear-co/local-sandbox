@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-roles
+  namespace: test-mirrord
+  labels:
+    app: postgres-roles
+spec:
+  containers:
+  - name: postgres
+    image: postgres:17
+    env:
+    - name: POSTGRES_PASSWORD
+      value: postgres
+    - name: POSTGRES_DB
+      value: roles_db
+    ports:
+    - containerPort: 5432
+    volumeMounts:
+    - name: init-script
+      mountPath: /docker-entrypoint-initdb.d
+  volumes:
+  - name: init-script
+    configMap:
+      name: postgres-roles-init-script
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-roles-init-script
+  namespace: test-mirrord
+data:
+  # The schema references a custom role through a row-level security policy.
+  # A policy (CREATE POLICY ... TO <role>) keeps the role reference in the
+  # schema dump even though pg-branch-init runs pg_dump with --no-owner
+  # --no-acl. When the branch is created on a fresh PostgreSQL container that
+  # role does not exist, so restoring the policy fails unless the operator
+  # first recreates the role as a placeholder.
+  init.sql: |
+    CREATE ROLE app_reader NOLOGIN;
+
+    CREATE TABLE docs (
+        id SERIAL PRIMARY KEY,
+        body TEXT
+    );
+
+    ALTER TABLE docs ENABLE ROW LEVEL SECURITY;
+
+    CREATE POLICY docs_read ON docs
+        FOR SELECT TO app_reader
+        USING (true);
+
+    INSERT INTO docs (body) VALUES
+    ('first document'),
+    ('second document'),
+    ('third document');
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-roles
+  namespace: test-mirrord
+spec:
+  selector:
+    app: postgres-roles
+  ports:
+  - port: 5432
+    targetPort: 5432
