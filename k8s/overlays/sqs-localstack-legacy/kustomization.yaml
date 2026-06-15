@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Registry-only variant of the sqs-localstack overlay, for testing the old
+# released operator. It reuses everything from sqs-localstack (LocalStack, the
+# consumer, the init script, and the old MirrordWorkloadQueueRegistry) but
+# removes the MirrordSplitConfig object. The released operator does not define
+# the MirrordSplitConfig CRD, so applying it under the old operator would fail.
+# After upgrading to the new operator, its legacy adapter recreates the split
+# config from the registry automatically.
+resources:
+  - ../sqs-localstack
+
+patches:
+  - target:
+      kind: MirrordSplitConfig
+    patch: |-
+      $patch: delete
+      apiVersion: queues.mirrord.metalbear.co/v1
+      kind: MirrordSplitConfig
+      metadata:
+        name: sqs-test-split-config
+        namespace: test-mirrord

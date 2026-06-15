@@ -17,8 +17,11 @@ spec:
       - name: localstack
         image: localstack/localstack:4.14.0
         env:
+        # The operator SQS e2e suite also exercises S3-event and SNS-fed queues
+        # (the jq_s3_metadata* cases), so localstack must serve s3 and sns too,
+        # not just sqs. Without them those tests get HTTP 501 at bucket creation.
         - name: SERVICES
-          value: "sqs"
+          value: "sqs,s3,sns"
         - name: AWS_DEFAULT_REGION
           value: "eu-north-1"
         - name: AWS_ACCESS_KEY_ID

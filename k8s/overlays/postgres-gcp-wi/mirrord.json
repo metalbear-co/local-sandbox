@@ -1,0 +1,39 @@
+{
+  "operator": true,
+  "experimental": {
+    "sip_utils": false
+  },
+  "target": {
+    "path": "deployment/pg-cloudsql-app",
+    "namespace": "branch-test"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "cloudsql-wi-branch",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 180,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "iam_auth": {
+          "type": "gcp_cloud_sql"
+        },
+        "copy": {
+          "mode": "all"
+        }
+      }
+    ]
+  }
+}

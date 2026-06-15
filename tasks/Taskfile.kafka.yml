@@ -5,15 +5,26 @@ vars:
     sh: cd .. && pwd
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
 
 tasks:
   deploy:
-    desc: "Deploy Kafka test environment"
+    desc: "Deploy Kafka test environment (builds and loads the consumer image first)"
     cmds:
+      - task: _build:app
       - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka
       - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
       - task: _wait:kafka
       - task: _wait:consumer
+
+  _build:app:
+    internal: true
+    desc: "Build and load the kafka-consumer:local image into the cluster"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t kafka-consumer:local ."
+      - minikube -p {{.CLUSTER_NAME}} image load kafka-consumer:local
 
   test:
     desc: "Full Kafka test (deploy + send message)"
@@ -55,6 +66,32 @@ tasks:
           printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}}
           echo "Message sent"
         fi
+
+  send:bulk:
+    desc: "Send COUNT messages fast through a single producer (TOPIC, COUNT, USER_ID, MESSAGE)"
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      COUNT: '{{.COUNT | default "50"}}'
+      MESSAGE: '{{.MESSAGE | default "bulk"}}'
+      USER_ID: '{{.USER_ID | default "test-user"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        # One producer process handles every line, so the slow JVM startup is paid
+        # once instead of once per message.
+        if [ -n "{{.USER_ID}}" ]; then
+          echo "Sending {{.COUNT}} messages to {{.TOPIC}} with header user_id={{.USER_ID}}..."
+          for i in $(seq 1 {{.COUNT}}); do printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}-%s\n' "$i"; done \
+            | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh \
+              --bootstrap-server localhost:9092 --topic {{.TOPIC}} \
+              --property 'parse.headers=true' --property 'headers.delimiter=|'
+        else
+          echo "Sending {{.COUNT}} messages to {{.TOPIC}} without headers..."
+          for i in $(seq 1 {{.COUNT}}); do printf '{{.MESSAGE}}-%s\n' "$i"; done \
+            | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh \
+              --bootstrap-server localhost:9092 --topic {{.TOPIC}}
+        fi
+        echo "Done sending {{.COUNT}} messages."
 
   consume:
     desc: "Consume messages from Kafka topic (TOPIC='test-topic')"
@@ -419,6 +456,27 @@ tasks:
       - task: multi-topic:deploy
       - task: multi-topic:split
 
+  multi-topic:send:bulk:
+    desc: "Fast bulk send to all 4 multi-topic topics: COUNT matching (user_id=test-user) + COUNT non-matching per topic"
+    vars:
+      COUNT: '{{.COUNT | default "20"}}'
+      USER_ID: '{{.USER_ID | default "test-user"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        for TOPIC in topic-orders topic-payments topic-notifications topic-analytics; do
+          echo "-> $TOPIC: {{.COUNT}} matching (user_id={{.USER_ID}}) + {{.COUNT}} non-matching"
+          # Matching messages go to the local split session, non-matching ones to
+          # the remote/fallback consumer. Both batches share one producer process.
+          {
+            for i in $(seq 1 {{.COUNT}}); do printf 'user_id:{{.USER_ID}}|match-%s\n' "$i"; done
+            for i in $(seq 1 {{.COUNT}}); do printf 'user_id:other|remote-%s\n' "$i"; done
+          } | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh \
+              --bootstrap-server localhost:9092 --topic "$TOPIC" \
+              --property 'parse.headers=true' --property 'headers.delimiter=|'
+        done
+        echo "All 4 topics done."
+
   multi-topic:two-sessions:a:
     desc: "Run multi-topic session A (filter user_id=alice)"
     dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
@@ -437,10 +495,13 @@ tasks:
     desc: "Clean multi-topic Kafka test resources"
     cmds:
       - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/kafka-multi-topic --ignore-not-found=true
+      # Deleting the overlay only removes kafka-consumer-multi. A single-topic
+      # consumer from a prior `kafka:split` run can linger and target the same
+      # workload, so clear every consumer in the namespace for a clean slate.
+      - kubectl delete mirrordkafkatopicsconsumers --all -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml --ignore-not-found=true
       - kubectl delete mirrordkafkaephemeraltopics --all -n mirrord --ignore-not-found=true
-      - kubectl delete mirrordclusterworkloadpatchrequests --all -A --ignore-not-found=true
-      - kubectl delete mirrordclusterworkloadpatches --all -A --ignore-not-found=true
+      - task: _clean:workload-patches
 
   _create:multi-topics:
     internal: true
@@ -453,6 +514,23 @@ tasks:
             --topic $TOPIC --partitions 3 --replication-factor 1 2>&1 || true
         done
         echo "All 4 topics created."
+
+  _clean:workload-patches:
+    internal: true
+    desc: "Force-delete workload patch requests/patches, clearing stuck finalizers"
+    cmds:
+      # The operator clears these finalizers only after it reverts the target
+      # workload's env. When a session's namespace was already deleted that
+      # revert can never finish, so the object sticks in "Terminating" and a
+      # plain delete blocks forever. Mark them for deletion without waiting,
+      # then strip the finalizers so they go away regardless of operator state.
+      - |
+        for kind in mirrordclusterworkloadpatchrequests mirrordclusterworkloadpatches; do
+          kubectl delete "$kind" --all -A --ignore-not-found=true --wait=false 2>/dev/null || true
+          for name in $(kubectl get "$kind" -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null); do
+            kubectl patch "$kind" "$name" --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+          done
+        done
 
   two-sessions:deploy:
     desc: "Deploy Kafka for two-session test (single topic, two filters: alice + bob)"
@@ -488,8 +566,96 @@ tasks:
     cmds:
       - task: clean
       - kubectl delete mirrordkafkaephemeraltopics --all -n mirrord --ignore-not-found=true
-      - kubectl delete mirrordclusterworkloadpatchrequests --all -A --ignore-not-found=true
-      - kubectl delete mirrordclusterworkloadpatches --all -A --ignore-not-found=true
+      - task: _clean:workload-patches
+
+  ttl-drain:deploy:
+    desc: "Deploy Kafka with splitTtl=30s"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka-ttl-drain
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer
+      - echo "Kafka deployed with splitTtl=30s"
+
+  ttl-drain:test:
+    desc: "TTL forwarding test (deploy + run automated test script)"
+    cmds:
+      - task: ttl-drain:deploy
+      - "{{.ROOT_DIR}}/scripts/test-kafka-ttl-drain.sh"
+
+  ttl-drain:run:local:
+    desc: "Run Kafka consumer locally with mirrord (ttl-drain overlay)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka-ttl-drain/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  ttl-drain:status:
+    desc: "Show TTL test environment status"
+    cmds:
+      - echo "=== Consumer CRD (check splitTtl) ==="
+      - kubectl get mirrordkafkatopicsconsumers -n {{.NAMESPACE}} -o yaml 2>/dev/null | grep -A5 "spec:" || echo "Not deployed"
+      - echo ""
+      - echo "=== Consumer Pod ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-consumer 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Operator Logs (last 30 lines) ==="
+      - kubectl logs -n mirrord -l app=mirrord-operator --tail=30 2>/dev/null || echo "No operator"
+
+  ttl-drain:clean:
+    desc: "Clean TTL test resources"
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/overlays/kafka-ttl-drain --ignore-not-found=true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml --ignore-not-found=true
+      - kubectl delete mirrordkafkaephemeraltopics --all -n mirrord --ignore-not-found=true
+      - task: _clean:workload-patches
+
+  split:reset:
+    desc: "Full reset of Kafka splitting state: kill the local consumer, delete every split-session / recovery CRD, delete the operator's temp topics, and restart the operator so no stale in-memory split keeps routing topics that the next session does not match. Keeps the consumer/client-config CRDs so you can re-run a split right after."
+    cmds:
+      - echo "killing any local consumer processes"
+      - pkill -f /tmp/kafka-consumer 2>/dev/null || true
+      - echo "deleting unified split-session CRDs"
+      - kubectl delete mirrordclustersplitsession --all -A --wait=false 2>/dev/null || true
+      # Split sessions carry the `mirrord-queue-splitting` finalizer. An orphaned
+      # session (consumer gone, operator restarted) never gets reconciled and
+      # stays stuck in Terminating, so strip finalizers since this full reset
+      # also restarts the operator and wipes the temp topics anyway.
+      - echo "clearing finalizers on any stuck split-session CRDs"
+      - |
+        for name in $(kubectl get mirrordclustersplitsession -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          echo "  clearing finalizers on $name"
+          kubectl patch mirrordclustersplitsession "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      # These drive crash recovery. If left behind, the operator rebuilds the old
+      # split (with the old topic set) on restart, which is exactly what causes
+      # "queue ... not found in resolved params" when the next session asks for a
+      # topic the recovered split never had.
+      - echo "deleting workload-patch and external-resource recovery CRDs"
+      - task: _clean:workload-patches
+      - kubectl delete mirrordclusterexternalresources --all -A --wait=false 2>/dev/null || true
+      - echo "deleting leftover legacy ephemeral-topic CRDs"
+      - kubectl delete mirrordkafkaephemeraltopics --all -n mirrord --wait=false 2>/dev/null || true
+      - echo "deleting the operator's temporary Kafka topics (mirrord-tmp-*)"
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh \
+            --bootstrap-server localhost:9092 --list 2>/dev/null \
+            | grep '^mirrord-tmp-' | while read -r topic; do
+              echo "  deleting topic $topic"
+              kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh \
+                --bootstrap-server localhost:9092 --delete --topic "$topic" 2>/dev/null || true
+            done
+        else
+          echo "  (kafka-cluster pod not found, skipping topic cleanup)"
+        fi
+      - echo "restarting operator to clear in-memory split state"
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - echo "reset complete - start a fresh split session now"
 
   clean:
     desc: "Clean Kafka test resources"

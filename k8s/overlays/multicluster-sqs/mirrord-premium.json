@@ -8,7 +8,7 @@
       "test-queue": {
         "queue_type": "SQS",
         "message_filter": {
-          "header": "x-filter-id$"
+          "type": "^premium$"
         }
       }
     },

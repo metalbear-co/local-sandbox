@@ -1,0 +1,586 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  TEMPORAL_NAMESPACE: "temporal"
+  TASK_QUEUE: '{{.TASK_QUEUE | default "order-checkout"}}'
+  TEMPORAL_NS: '{{.TEMPORAL_NS | default "temporal"}}'
+  OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/temporal"
+  CHARTS_DIR: "{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator"
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  UI_LOCAL_PORT: '{{.UI_LOCAL_PORT | default "8080"}}'
+
+tasks:
+  deploy:emulator:
+    desc: "Deploy only the Temporal server (enough for E2E tests)"
+    cmds:
+      - kubectl create namespace {{.TEMPORAL_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/temporal-server.yaml
+      - task: _wait:server
+      - task: _register:namespace
+      - kubectl apply -f {{.OVERLAY_DIR}}/temporal-ui.yaml
+      - task: _wait:ui
+
+  deploy:
+    desc: "Deploy Temporal server + cluster worker + split CRDs"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.TEMPORAL_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/temporal-server.yaml
+      - task: _wait:server
+      - task: _register:namespace
+      - kubectl apply -f {{.OVERLAY_DIR}}/temporal-ui.yaml
+      - task: _wait:ui
+      - kubectl apply -f {{.OVERLAY_DIR}}/worker.yaml
+      - task: _wait:worker
+      - task: _apply:split-crds
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config.yaml
+
+  build:
+    desc: "Build and load the temporal-worker image into minikube"
+    dir: "{{.ROOT_DIR}}/apps/temporal-worker"
+    cmds:
+      - docker build -t temporal-worker:local .
+      - minikube -p {{.CLUSTER_NAME}} image load temporal-worker:local
+
+  run:
+    desc: "Deploy everything and run a local worker with mirrord (workflow_id=^test-alice-)"
+    cmds:
+      - task: deploy
+      - task: run:local
+
+  run:local:
+    desc: "Run temporal worker locally with mirrord (workflow_id=^test-alice- filter). Reconnects by default; pass TEMPORAL_CLEANUP=true for a fresh session."
+    dir: "{{.ROOT_DIR}}/apps/temporal-worker"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/temporal/mirrord.json")}}'
+      TEMPORAL_CLEANUP: '{{.TEMPORAL_CLEANUP | default "false"}}'
+    cmds:
+      - task: _prepare:local
+        vars:
+          TEMPORAL_CLEANUP: "{{.TEMPORAL_CLEANUP}}"
+      - go build -o /tmp/temporal-worker main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/temporal-worker'
+
+  run:local:user-b:
+    desc: "Run a second local worker with mirrord (workflow_id=^test-bob- filter). Keeps existing split sessions."
+    dir: "{{.ROOT_DIR}}/apps/temporal-worker"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/temporal/mirrord-user-b.json'
+      TEMPORAL_CLEANUP: '{{.TEMPORAL_CLEANUP | default "false"}}'
+    cmds:
+      - task: _prepare:local
+        vars:
+          TEMPORAL_CLEANUP: "{{.TEMPORAL_CLEANUP}}"
+      - go build -o /tmp/temporal-worker-b main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/temporal-worker-b'
+
+  start:workflow:
+    desc: "Start a workflow on the real task queue (WORKFLOW_ID=test-alice-1 ORDER_ID=order-123)"
+    vars:
+      WORKFLOW_ID: '{{.WORKFLOW_ID | default "test-alice-1"}}'
+      ORDER_ID: '{{.ORDER_ID | default "order-123"}}'
+    cmds:
+      - task: _start:workflow
+        vars:
+          WORKFLOW_ID: "{{.WORKFLOW_ID}}"
+          ORDER_ID: "{{.ORDER_ID}}"
+
+  start:workflow:alice:
+    desc: "Start a workflow that matches the default local filter (test-alice-*)"
+    cmds:
+      - task: _start:workflow
+        vars:
+          WORKFLOW_ID:
+            sh: echo "test-alice-$(date +%s)"
+          ORDER_ID: order-alice
+
+  start:workflow:bob:
+    desc: "Start a workflow for user B (test-bob-*)"
+    cmds:
+      - task: _start:workflow
+        vars:
+          WORKFLOW_ID:
+            sh: echo "test-bob-$(date +%s)"
+          ORDER_ID: order-bob
+
+  start:workflow:other:
+    desc: "Start a workflow that does not match any local filter"
+    cmds:
+      - task: _start:workflow
+        vars:
+          WORKFLOW_ID:
+            sh: echo "test-other-$(date +%s)"
+          ORDER_ID: order-other
+
+  start:workflows:split-test:
+    desc: "Start one alice, one bob, and one other workflow"
+    cmds:
+      - task: start:workflow:alice
+      - task: start:workflow:bob
+      - task: start:workflow:other
+
+  logs:
+    desc: "Show cluster temporal worker logs"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=temporal-worker --tail=100 -f
+
+  logs:server:
+    desc: "Show Temporal server logs"
+    cmds:
+      - kubectl logs -n {{.TEMPORAL_NAMESPACE}} -l app=temporal --tail=100 -f
+
+  ui:port-forward:
+    desc: "Port-forward Temporal UI to http://localhost:8080"
+    cmds:
+      - |
+        echo "Temporal UI: http://localhost:{{.UI_LOCAL_PORT}}"
+        echo "Namespace in UI: {{.TEMPORAL_NS}}"
+        echo "Task queue: {{.TASK_QUEUE}}"
+        echo ""
+        echo "Press Ctrl+C to stop the port-forward."
+        kubectl port-forward -n {{.TEMPORAL_NAMESPACE}} svc/temporal-ui {{.UI_LOCAL_PORT}}:8080
+
+  status:
+    desc: "Show Temporal test environment status"
+    cmds:
+      - |
+        echo "Temporal Server"
+        kubectl get pods -n {{.TEMPORAL_NAMESPACE}} -l app=temporal 2>/dev/null || echo "Not deployed"
+        echo ""
+        echo "Temporal UI"
+        kubectl get pods -n {{.TEMPORAL_NAMESPACE}} -l app=temporal-ui 2>/dev/null || echo "Not deployed"
+        echo "  Open UI at http://localhost:{{.UI_LOCAL_PORT}} after running ui port-forward task"
+        echo ""
+        echo "Temporal Worker"
+        kubectl get pods -n {{.NAMESPACE}} -l app=temporal-worker 2>/dev/null || echo "Not deployed"
+        echo ""
+        echo "Split Config"
+        kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "No split config"
+        echo ""
+        echo "Split Sessions"
+        kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "No sessions"
+
+  test:split:
+    desc: "Deploy environment and print split-test instructions"
+    cmds:
+      - task: deploy
+      - |
+        echo ""
+        echo "Temporal split test environment ready."
+        echo ""
+        echo "  Window 1 - Local worker (workflow_id=^test-alice-)"
+        echo "    cd local-sandbox && task temporal:run:local"
+        echo ""
+        echo "  Window 2 - Cluster worker logs"
+        echo "    cd local-sandbox && task temporal:logs"
+        echo ""
+        echo "  Window 3 - Operator logs"
+        echo "    cd local-sandbox && task logs:operator"
+        echo ""
+        echo "  Window 4 - Temporal UI"
+        echo "    task temporal:ui:port-forward"
+        echo "    open http://localhost:8080"
+        echo ""
+        echo "  Window 5 - Start workflows"
+        echo "    task temporal:start:workflows:split-test"
+        echo "    task temporal:status"
+        echo ""
+        echo "  Or run the automated check:"
+        echo "    task temporal:test:split:run"
+        echo ""
+        echo "  If sessions are stuck or routing is wrong:"
+        echo "    task temporal:test:split:cleanup"
+        echo "    TEMPORAL_CLEANUP=true task temporal:run:local"
+        echo ""
+        echo "  If old workflows are stuck Running in the UI:"
+        echo "    task temporal:workflows:terminate-stuck"
+
+  test:split:status:
+    desc: "Show split session and Temporal state"
+    cmds:
+      - echo "Split Sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Split Config"
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "Workload Patch Requests"
+      - kubectl get mirrordclusterworkloadpatchrequests -A 2>/dev/null || echo "(none)"
+      - echo ""
+      - task: status
+
+  test:split:cleanup:
+    desc: "Delete temporal-worker mirrord sessions and wait for teardown"
+    cmds:
+      - task: _cleanup:temporal-sessions
+      - task: _wait:temporal-sessions-gone
+
+  test:split:run:
+    desc: "Automated split test: cleanup, start local worker, run workflows, verify routing"
+    cmds:
+      - task: _cleanup:temporal-sessions
+      - task: _wait:temporal-sessions-gone
+      - |
+        set -euo pipefail
+        cd {{.ROOT_DIR}}/apps/temporal-worker
+        go build -o /tmp/temporal-worker main.go
+
+        LOCAL_LOG=/tmp/temporal-split-test-local.log
+        rm -f "$LOCAL_LOG"
+
+        echo "Starting local worker..."
+        nohup {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/temporal/mirrord.json -- /tmp/temporal-worker \
+          >> "$LOCAL_LOG" 2>&1 &
+        LOCAL_PID=$!
+        disown "$LOCAL_PID" 2>/dev/null || true
+
+        cleanup() {
+          pkill -f "mirrord exec.*temporal-worker" 2>/dev/null || true
+          kill "$LOCAL_PID" 2>/dev/null || true
+          wait "$LOCAL_PID" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        ready=false
+        for i in $(seq 1 60); do
+          if grep -q "Started Worker" "$LOCAL_LOG" 2>/dev/null; then
+            echo "Local worker ready"
+            ready=true
+            break
+          fi
+          if grep -qiE "error|failed|panic" "$LOCAL_LOG" 2>/dev/null; then
+            echo "ERROR: local worker failed during startup"
+            cat "$LOCAL_LOG"
+            exit 1
+          fi
+          sleep 2
+        done
+
+        if [ "$ready" != "true" ]; then
+          echo "ERROR: local worker did not start in time"
+          cat "$LOCAL_LOG"
+          exit 1
+        fi
+
+        echo "Starting split-test workflows..."
+        task temporal:start:workflow:alice
+        task temporal:start:workflow:bob
+        task temporal:start:workflow:other
+
+        sleep 5
+
+        if ! grep -q '\[WORKFLOW\].*test-alice-' "$LOCAL_LOG"; then
+          echo "ERROR: alice workflow did not run locally"
+          echo "=== local log ==="
+          cat "$LOCAL_LOG"
+          exit 1
+        fi
+        if ! grep -q '\[ACTIVITY\].*test-alice-' "$LOCAL_LOG"; then
+          echo "ERROR: alice activity did not run locally"
+          cat "$LOCAL_LOG"
+          exit 1
+        fi
+
+        CLUSTER_LOG=$(kubectl logs -n {{.NAMESPACE}} -l app=temporal-worker --tail=30 2>/dev/null)
+        if echo "$CLUSTER_LOG" | grep -q '\[WORKFLOW\].*test-alice-'; then
+          echo "ERROR: alice workflow ran on cluster worker"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+        if ! echo "$CLUSTER_LOG" | grep -q '\[WORKFLOW\].*test-bob-'; then
+          echo "ERROR: bob workflow did not run on cluster"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+        if ! echo "$CLUSTER_LOG" | grep -q '\[WORKFLOW\].*test-other-'; then
+          echo "ERROR: other workflow did not run on cluster"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+
+        echo ""
+        echo "Split test passed:"
+        echo "  alice -> local worker"
+        echo "  bob/other -> cluster worker"
+
+  test:split:multi:
+    desc: "Automated test with two local workers (alice + bob) and other on cluster"
+    cmds:
+      - task: _cleanup:temporal-sessions
+      - task: _wait:temporal-sessions-gone
+      - |
+        set -euo pipefail
+        cd {{.ROOT_DIR}}/apps/temporal-worker
+        go build -o /tmp/temporal-worker main.go
+        go build -o /tmp/temporal-worker-b main.go
+
+        ALICE_LOG=/tmp/temporal-multi-alice.log
+        BOB_LOG=/tmp/temporal-multi-bob.log
+        rm -f "$ALICE_LOG" "$BOB_LOG"
+
+        echo "Starting alice local worker..."
+        nohup {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/temporal/mirrord.json -- /tmp/temporal-worker \
+          >> "$ALICE_LOG" 2>&1 &
+        disown $! 2>/dev/null || true
+
+        echo "Starting bob local worker..."
+        nohup {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/temporal/mirrord-user-b.json -- /tmp/temporal-worker-b \
+          >> "$BOB_LOG" 2>&1 &
+        disown $! 2>/dev/null || true
+
+        cleanup() {
+          pkill -f "mirrord exec.*temporal-worker" 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        for i in $(seq 1 60); do
+          alice_ready=false
+          bob_ready=false
+          grep -q "Started Worker" "$ALICE_LOG" 2>/dev/null && alice_ready=true
+          grep -q "Started Worker" "$BOB_LOG" 2>/dev/null && bob_ready=true
+          if [ "$alice_ready" = "true" ] && [ "$bob_ready" = "true" ]; then
+            echo "Both local workers ready"
+            break
+          fi
+          sleep 2
+        done
+
+        if ! grep -q "Started Worker" "$ALICE_LOG"; then
+          echo "ERROR: alice worker failed to start"
+          cat "$ALICE_LOG"
+          exit 1
+        fi
+        if ! grep -q "Started Worker" "$BOB_LOG"; then
+          echo "ERROR: bob worker failed to start"
+          cat "$BOB_LOG"
+          exit 1
+        fi
+
+        sessions=$(kubectl get mirrordclustersplitsessions -A --no-headers 2>/dev/null | grep -c temporal-worker || true)
+        echo "Active split sessions: $sessions"
+        if [ "$sessions" -lt 2 ]; then
+          echo "ERROR: expected 2 split sessions, got $sessions"
+          kubectl get mirrordclustersplitsessions -A
+          exit 1
+        fi
+
+        task temporal:start:workflow:alice
+        task temporal:start:workflow:bob
+        task temporal:start:workflow:other
+        sleep 5
+
+        if ! grep -q '\[WORKFLOW\].*test-alice-' "$ALICE_LOG"; then
+          echo "ERROR: alice did not run on alice worker"
+          cat "$ALICE_LOG"
+          exit 1
+        fi
+        if grep -q '\[WORKFLOW\].*test-bob-' "$ALICE_LOG"; then
+          echo "ERROR: bob ran on alice worker"
+          cat "$ALICE_LOG"
+          exit 1
+        fi
+        if ! grep -q '\[WORKFLOW\].*test-bob-' "$BOB_LOG"; then
+          echo "ERROR: bob did not run on bob worker"
+          cat "$BOB_LOG"
+          exit 1
+        fi
+        if grep -q '\[WORKFLOW\].*test-alice-' "$BOB_LOG"; then
+          echo "ERROR: alice ran on bob worker"
+          cat "$BOB_LOG"
+          exit 1
+        fi
+
+        CLUSTER_LOG=$(kubectl logs -n {{.NAMESPACE}} -l app=temporal-worker --tail=20 2>/dev/null)
+        if echo "$CLUSTER_LOG" | grep -qE '\[WORKFLOW\].*test-(alice|bob)-'; then
+          echo "ERROR: alice or bob ran on cluster worker"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+        if ! echo "$CLUSTER_LOG" | grep -q '\[WORKFLOW\].*test-other-'; then
+          echo "ERROR: other did not run on cluster"
+          echo "$CLUSTER_LOG"
+          exit 1
+        fi
+
+        echo ""
+        echo "Multi-session split test passed:"
+        echo "  alice -> alice local worker"
+        echo "  bob   -> bob local worker"
+        echo "  other -> cluster worker"
+
+  workflows:terminate-stuck:
+    desc: "Terminate orphaned Running test-* workflows left from failed split sessions"
+    cmds:
+      - |
+        POD_IP=$(kubectl get pod -n {{.TEMPORAL_NAMESPACE}} -l app=temporal -o jsonpath='{.items[0].status.podIP}')
+        RUNNING=$(kubectl exec -n {{.TEMPORAL_NAMESPACE}} deploy/temporal -- \
+          tctl --address "${POD_IP}:7233" --namespace {{.TEMPORAL_NS}} workflow list \
+            --query 'ExecutionStatus="Running" AND WorkflowId STARTS_WITH "test-"' 2>/dev/null \
+          | awk 'NR>1 && $2 != "" {print $2}')
+        if [ -z "$RUNNING" ]; then
+          echo "No stuck test-* workflows"
+          exit 0
+        fi
+        echo "$RUNNING" | while read -r wf_id; do
+          echo "Terminating $wf_id"
+          kubectl exec -n {{.TEMPORAL_NAMESPACE}} deploy/temporal -- \
+            tctl --address "${POD_IP}:7233" --namespace {{.TEMPORAL_NS}} workflow terminate \
+              --workflow_id "$wf_id" --reason "temporal split test cleanup" 2>/dev/null || true
+        done
+
+  recover:worker:
+    desc: "Stop split sessions and restart cluster worker with original Temporal env"
+    cmds:
+      - task: test:split:cleanup
+      - kubectl rollout restart deployment/temporal-worker -n {{.NAMESPACE}}
+      - kubectl wait --for=condition=ready pod -l app=temporal-worker -n {{.NAMESPACE}} --timeout=120s
+      - task: status
+
+  clean:
+    desc: "Clean all Temporal test resources"
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/worker.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/temporal-ui.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/temporal-server.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete namespace {{.TEMPORAL_NAMESPACE}} --ignore-not-found=true
+
+  _wait:ui:
+    internal: true
+    cmds:
+      - echo "Waiting for Temporal UI..."
+      - kubectl wait --for=condition=ready pod -l app=temporal-ui -n {{.TEMPORAL_NAMESPACE}} --timeout=120s
+
+  _apply:split-crds:
+    internal: true
+    desc: "Apply queue-splitting CRDs from the local operator chart (includes Temporal fields)"
+    cmds:
+      - |
+        echo "Applying MirrordSplitConfig CRD from operator chart..."
+        helm template mirrord-operator {{.CHARTS_DIR}} \
+          -f {{.ROOT_DIR}}/operator-values.yaml \
+          -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
+
+  _wait:server:
+    internal: true
+    cmds:
+      - echo "Waiting for Temporal Postgres..."
+      - kubectl wait --for=condition=ready pod -l app=temporal-postgres -n {{.TEMPORAL_NAMESPACE}} --timeout=120s
+      - echo "Waiting for Temporal server (schema setup can take a minute)..."
+      - kubectl wait --for=condition=ready pod -l app=temporal -n {{.TEMPORAL_NAMESPACE}} --timeout=300s
+
+  _wait:worker:
+    internal: true
+    cmds:
+      - echo "Waiting for Temporal worker..."
+      - kubectl wait --for=condition=ready pod -l app=temporal-worker -n {{.NAMESPACE}} --timeout=120s
+
+  _register:namespace:
+    internal: true
+    desc: "Register the temporal namespace (auto-setup only creates default)"
+    cmds:
+      - |
+        echo "Registering Temporal namespace {{.TEMPORAL_NS}}..."
+        POD_IP=$(kubectl get pod -n {{.TEMPORAL_NAMESPACE}} -l app=temporal -o jsonpath='{.items[0].status.podIP}')
+        kubectl exec -n {{.TEMPORAL_NAMESPACE}} deploy/temporal -- \
+          tctl --address "${POD_IP}:7233" --namespace {{.TEMPORAL_NS}} namespace register --rd 72h 2>/dev/null || true
+        echo "Namespace {{.TEMPORAL_NS}} ready"
+
+  _prepare:local:
+    internal: true
+    desc: "Optionally remove stale temporal-worker sessions before starting a local worker"
+    vars:
+      TEMPORAL_CLEANUP: '{{.TEMPORAL_CLEANUP | default "false"}}'
+    cmds:
+      - |
+        if [ "{{.TEMPORAL_CLEANUP}}" != "true" ]; then
+          echo "Skipping session cleanup (mirrord will reconnect if a session still exists)"
+        else
+          echo "TEMPORAL_CLEANUP=true: removing stale temporal-worker sessions..."
+          task temporal:_cleanup:temporal-sessions
+          task temporal:_wait:temporal-sessions-gone
+        fi
+
+  _cleanup:temporal-sessions:
+    internal: true
+    cmds:
+      - |
+        echo "Deleting mirrord cluster sessions for temporal-worker..."
+        kubectl get mirrordclustersessions -A -o json 2>/dev/null | python3 -c "
+        import json, sys
+        items = json.load(sys.stdin).get('items', [])
+        for session in items:
+            target = session.get('spec', {}).get('target') or {}
+            if target.get('name') == 'temporal-worker':
+                print(session['metadata']['name'])
+        " | while read -r name; do
+          [ -n "$name" ] || continue
+          kubectl delete mirrordclustersessions "$name" --wait=false 2>/dev/null || true
+        done
+        echo "Deleting temporal split sessions..."
+        kubectl get mirrordclustersplitsessions -A --no-headers 2>/dev/null \
+          | grep 'temporal-worker\.deployment' \
+          | awk '{print $1}' \
+          | while read -r name; do
+              [ -n "$name" ] || continue
+              kubectl delete mirrordclustersplitsessions "$name" --wait=false 2>/dev/null || true
+            done
+        echo "Deleting workload patch requests..."
+        kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || echo "(none)"
+
+  _wait:temporal-sessions-gone:
+    internal: true
+    vars:
+      TIMEOUT: '{{.TIMEOUT | default "120"}}'
+    cmds:
+      - |
+        echo "Waiting for temporal-worker sessions to finish teardown (up to {{.TIMEOUT}}s)..."
+        elapsed=0
+        while [ "$elapsed" -lt {{.TIMEOUT}} ]; do
+          cluster_count=$(kubectl get mirrordclustersessions -A -o json 2>/dev/null | python3 -c "
+        import json, sys
+        items = json.load(sys.stdin).get('items', [])
+        print(sum(1 for s in items if (s.get('spec', {}).get('target') or {}).get('name') == 'temporal-worker'))
+        " || echo 0)
+          split_count=$(kubectl get mirrordclustersplitsessions -A --no-headers 2>/dev/null | grep -c 'temporal-worker\.deployment' || true)
+          if [ "$cluster_count" -eq 0 ] && [ "$split_count" -eq 0 ]; then
+            echo "All temporal-worker sessions removed"
+            exit 0
+          fi
+          echo "  still waiting (${cluster_count} cluster sessions, ${split_count} split sessions)..."
+          sleep 3
+          elapsed=$((elapsed + 3))
+        done
+        echo "WARNING: timed out waiting for session teardown"
+        kubectl get mirrordclustersessions -A 2>/dev/null || true
+        kubectl get mirrordclustersplitsessions -A 2>/dev/null || true
+        exit 1
+
+  _start:workflow:
+    internal: true
+    vars:
+      WORKFLOW_ID: '{{.WORKFLOW_ID | default "test-alice-1"}}'
+      ORDER_ID: '{{.ORDER_ID | default "order-123"}}'
+    cmds:
+      - |
+        INPUT=$(printf '%s' "{{.ORDER_ID}}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+        echo "Starting CheckoutWorkflow id={{.WORKFLOW_ID}} input={{.ORDER_ID}}"
+        POD_IP=$(kubectl get pod -n {{.TEMPORAL_NAMESPACE}} -l app=temporal -o jsonpath='{.items[0].status.podIP}')
+        kubectl exec -n {{.TEMPORAL_NAMESPACE}} deploy/temporal -- \
+          tctl --address "${POD_IP}:7233" --namespace {{.TEMPORAL_NS}} workflow start \
+            --taskqueue {{.TASK_QUEUE}} \
+            --workflow_type CheckoutWorkflow \
+            --workflow_id "{{.WORKFLOW_ID}}" \
+            --input "$INPUT"

@@ -1123,3 +1123,157 @@ tasks:
       - kubectl delete secret pg-user-secret -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete branchdatabase -l mirrord.metalbear.co/branch-id=pg-literal-value-no-pass -n {{.NAMESPACE}} --ignore-not-found=true
       - kubectl delete secrets -l operator.metalbear.co/branch-credential=true -n {{.NAMESPACE}} --ignore-not-found=true
+
+  deploy:shared-branch:
+    desc: "Deploy two target deployments (api + worker) for shared branch ID testing"
+    cmds:
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/shared-branch
+      - kubectl rollout status deployment/pg-server-api -n {{.NAMESPACE}} --timeout=60s
+      - kubectl rollout status deployment/pg-server-worker -n {{.NAMESPACE}} --timeout=60s
+      - echo "Both target deployments are ready."
+
+  run:local:shared-branch:api:
+    desc: "Run mirrord session targeting the API pod with shared branch ID"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-shared-branch-api.json -- /tmp/postgres-app'
+
+  run:local:shared-branch:worker:
+    desc: "Run mirrord session targeting the worker pod with shared branch ID"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-shared-branch-worker.json -- /tmp/postgres-app'
+
+  verify:shared-branch:
+    desc: "Verify shared branch ID reuse - expect 1 branch CRD and 1 branch pod"
+    cmds:
+      - |
+        echo "=== BranchDatabase CRDs with id=shared-branch-test ==="
+        CRD_COUNT=$(kubectl get branchdatabase -n {{.NAMESPACE}} -l mirrord-branch-id=shared-branch-test -o name 2>/dev/null | wc -l | tr -d ' ')
+        kubectl get branchdatabase -n {{.NAMESPACE}} -l mirrord-branch-id=shared-branch-test -o wide 2>/dev/null || true
+        echo ""
+        echo "=== Branch pods ==="
+        POD_COUNT=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name -o name 2>/dev/null | grep branch | wc -l | tr -d ' ')
+        kubectl get pods -n {{.NAMESPACE}} -l db-owner-name -o wide 2>/dev/null | grep branch || true
+        echo ""
+        echo "=== Result ==="
+        echo "BranchDatabase CRDs: $CRD_COUNT (expected: 1)"
+        echo "Branch pods: $POD_COUNT (expected: 1)"
+        if [ "$CRD_COUNT" = "1" ] && [ "$POD_COUNT" = "1" ]; then
+          echo "PASS: Branch is shared across targets"
+        else
+          echo "FAIL: Branch is NOT shared - each target created its own"
+        fi
+
+  test:shared-branch:
+    desc: "Full shared branch ID test - deploy, run both sessions, verify reuse"
+    cmds:
+      - task: deploy:base
+      - task: deploy:shared-branch
+      - |
+        echo ""
+        echo "Run these in two separate terminals:"
+        echo "  Terminal 1: task postgres:run:local:shared-branch:api"
+        echo "  Terminal 2: task postgres:run:local:shared-branch:worker"
+        echo ""
+        echo "Then verify with:"
+        echo "  task postgres:verify:shared-branch"
+
+  clean:shared-branch:
+    desc: "Clean shared branch test resources"
+    cmds:
+      - kubectl delete deployment pg-server-api pg-server-worker -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete branchdatabase -l mirrord-branch-id=shared-branch-test -n {{.NAMESPACE}} --ignore-not-found=true
+
+  # Roles scenario: the source schema references a custom role through a
+  # row-level security policy. Branch creation only succeeds if the operator
+  # recreates that role on the fresh branch before restoring the schema. With
+  # an operator that lacks the role-stub step the branch init fails and the
+  # mirrord session cannot start. With the fix it starts and the policy is
+  # present on the branch.
+  deploy:roles:
+    desc: "Deploy the roles scenario source DB and target deployment"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.MODULAR_TESTS_DIR}}/scenarios/roles
+      - kubectl wait --for=condition=ready pod -l app=postgres-roles -n {{.NAMESPACE}} --timeout=120s
+      - kubectl rollout status deployment/pg-server-roles -n {{.NAMESPACE}} --timeout=60s
+      - echo "Roles scenario is ready. Source role app_reader and RLS policy are in roles_db."
+
+  run:local:roles:
+    desc: "Run mirrord against the roles target (branch fails without the role fix, works with it)"
+    dir: '{{.ROOT_DIR}}/apps/postgres-app'
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-roles.json'
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - echo "Running with mirrord - config {{.MIRRORD_CONFIG}}"
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/postgres-app'
+
+  verify:roles:
+    desc: "Verify the roles branch restored the custom role and its policy"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "FAIL: no running branch pod found - branch creation did not finish"
+          echo "Check the init container logs with: task postgres:logs:roles:branch"
+          exit 1
+        fi
+        echo "Branch pod -> $POD"
+        echo ""
+        echo "=== Placeholder role on the branch ==="
+        kubectl exec -n {{.NAMESPACE}} $POD -- psql -U postgres -d roles_branch_db -tAc \
+          "SELECT rolname FROM pg_roles WHERE rolname = 'app_reader';"
+        echo ""
+        echo "=== Restored RLS policy on the branch ==="
+        kubectl exec -n {{.NAMESPACE}} $POD -- psql -U postgres -d roles_branch_db -c \
+          "SELECT policyname, roles FROM pg_policies WHERE policyname = 'docs_read';"
+        echo ""
+        echo "If you see app_reader and the docs_read policy above, the fix works."
+
+  logs:roles:branch:
+    desc: "Show the roles branch pod init + postgres logs (use to see the failure)"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No branch pod found yet. Start the session with 'task postgres:run:local:roles'."
+          exit 1
+        fi
+        echo "Branch pod -> $POD"
+        echo ""
+        echo "=== pg-branch-init init container logs ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c pg-branch-init 2>/dev/null || echo "(init logs not available)"
+        echo ""
+        echo "=== postgres container logs ==="
+        kubectl logs -n {{.NAMESPACE}} $POD -c postgres --tail=50 2>/dev/null || echo "(postgres logs not available)"
+
+  clean:roles:
+    desc: "Clean roles scenario resources"
+    cmds:
+      - kubectl delete -k {{.MODULAR_TESTS_DIR}}/scenarios/roles --ignore-not-found=true
+      - kubectl delete branchdatabase -l mirrord-branch-id=roles-branch-test -n {{.NAMESPACE}} --ignore-not-found=true
+
+  test:roles:
+    desc: "Full roles scenario guidance: deploy, then run before/after updating the operator"
+    cmds:
+      - task: deploy:roles
+      - |
+        echo ""
+        echo "Roles scenario deployed."
+        echo ""
+        echo "1) With the CURRENTLY deployed operator (no fix) run:"
+        echo "     task postgres:run:local:roles"
+        echo "   The branch init should fail. Inspect it with:"
+        echo "     task postgres:logs:roles:branch"
+        echo ""
+        echo "2) Update the operator to the build with the role fix:"
+        echo "     task operator:update"
+        echo ""
+        echo "3) Run again - the session should start and the branch should be ready:"
+        echo "     task postgres:run:local:roles"
+        echo "   Then verify the role and policy were restored:"
+        echo "     task postgres:verify:roles"

@@ -27,4 +27,4 @@ mode = "read"
 read_only = ["/var.+", "/mirrord.+"]
 
 [feature.env.override]
-RUST_LOG = "operator_service=info,mirrord=info,operator_kafka_splitting=debug,operator_pod_mutator=debug,operator_queue_splitting=debug"
+RUST_LOG = "operator_service=info,mirrord=info,operator_pod_mutator=debug,operator_queue_splitting=debug"

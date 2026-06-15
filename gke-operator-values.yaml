@@ -1,0 +1,20 @@
+operator:
+  image: vrrashkov/operator
+  imageTag: cloudtest
+  requireFrontProxyClientCert: false
+  pgBranching: true
+  dbBranchingLiteralCredentials: true
+  jsonLog: true
+  logLevel: "mirrord=info,operator=info,operator_db_branching=debug,operator_pod_mutator=debug"
+  limits:
+    memory: 512Mi
+    cpu: 500m
+
+license:
+  pemRef: "mirrord-operator-license-pem"
+  allowSeatOverages: false
+
+createNamespace: false
+
+image:
+  pullPolicy: Always

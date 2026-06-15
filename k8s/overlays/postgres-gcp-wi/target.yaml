@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-cloudsql-app
+  namespace: branch-test
+  labels:
+    app: pg-cloudsql-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg-cloudsql-app
+  template:
+    metadata:
+      labels:
+        app: pg-cloudsql-app
+    spec:
+      serviceAccountName: app-sa
+      containers:
+        - name: app
+          image: postgres:17
+          command: ["sleep", "infinity"]
+          env:
+            - name: DATABASE_URL
+              value: "postgres://pg-branch-gsa%40potent-retina-459406-m7.iam@127.0.0.1:5432/appdb?sslmode=disable"
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.11.0
+          args:
+            - "--address=0.0.0.0"
+            - "--port=5432"
+            - "potent-retina-459406-m7:us-central1:pg-branch-sql"
+          securityContext:
+            runAsNonRoot: true

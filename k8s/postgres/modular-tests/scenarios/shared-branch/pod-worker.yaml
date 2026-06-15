@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-server-worker
+  namespace: test-mirrord
+  labels:
+    test-scenario: shared-branch
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pg-server-worker
+  template:
+    metadata:
+      labels:
+        app: pg-server-worker
+        test-scenario: shared-branch
+    spec:
+      containers:
+      - name: app
+        image: busybox
+        command: ["sh", "-c", "echo 'Postgres shared-branch worker target running' && sleep 3600"]
+        env:
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres-test:5432/source_db"

@@ -1,0 +1,16 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: sqs-test-split-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sqs-consumer
+  queues:
+    - id: test-queue
+      kind: sqs
+      appConfig:
+        queue:
+          - env: QUEUE_NAME

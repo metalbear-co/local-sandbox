@@ -163,6 +163,251 @@ tasks:
     cmds:
       - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-topic-consumer --tail=100 -f
 
+  native:guide:
+    desc: "Native subscription splitting: deploy topic model and explain what to look for"
+    cmds:
+      - task: deploy:topic
+      - |
+        cat <<'EOF'
+
+        Native Azure Service Bus subscription splitting
+
+        What "native" means here:
+          The operator does NOT create a temporary topic and does NOT rewrite the
+          deployed app's topic/subscription env vars. Instead it uses Service Bus's
+          own fan-out: it stamps each message with an application property called
+          "mirrord_route" and installs SQL filter rules on subscriptions so each
+          copy lands in the right place. This is why it works with MassTransit,
+          which generates its own topic names and ignores the topic env var.
+
+        How a split looks while running (topic "test-topic", app subscription "test-sub"):
+          - mirrord-ingest-<hash>  : an operator subscription with rule
+                                      "mirrord_route IS NULL". It grabs every brand
+                                      new (unmarked) message first.
+          - test-sub (the app's)   : its accept-all "$Default" rule is swapped for
+                                      "mirrord_route = 'main'", so the deployed app
+                                      only gets messages marked for production.
+          - mirrord-s-<hash>       : one subscription per dev session with rule
+                                      "mirrord_route = '<session-id>'".
+          The operator reads from the ingest subscription, decides per message who
+          should get it, re-publishes it to the SAME topic with the matching marker,
+          and Service Bus delivers each copy to the subscription whose rule matches.
+
+        Run the full automated check (asserts routing + clean teardown):
+          task servicebus:test:native:topic
+
+        Or drive it by hand in separate terminals:
+          Window 1 - local dev session (tenant=^test filter):
+            cd local-sandbox && task servicebus:run:local:topic
+          Window 2 - deployed app logs:
+            cd local-sandbox && task servicebus:logs:topic
+          Window 3 - send messages:
+            task servicebus:send:topic TENANT=test-user   (matches -> local session)
+            task servicebus:send:topic TENANT=other        (no match -> deployed app)
+
+        Inspect the live state at any time:
+          task servicebus:native:status   (resources, no temp topic, deployed spec untouched)
+          task servicebus:native:rules     (the actual SQL rules on each subscription)
+
+        What to look for:
+          - In the LOCAL session log: only tenant=test-user, tagged
+            "mirrord_route=<session-id>".
+          - In the DEPLOYED app log: only tenant=other, tagged "mirrord_route=main".
+          - native:status shows the deployment generation never changes and its
+            env still points at test-sub / test-topic (no patch, no temp topic).
+          - After the session ends, native:status shows no split sessions and no
+            external resources left, and native:rules shows test-sub back on its
+            "$Default" accept-all rule.
+        EOF
+
+  native:status:
+    desc: "Show native split state: resources, topic count, and that the deployed spec is untouched"
+    vars:
+      DEPLOY: '{{.DEPLOY | default "servicebus-topic-consumer"}}'
+      LOCAL_PORT: '{{.LOCAL_PORT | default "5673"}}'
+    cmds:
+      - |
+        echo "Split sessions"
+        kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "  (none)"
+        echo ""
+        echo "External resources (operator cleanup tracking - name encodes the Service Bus path)"
+        OUT=$(kubectl get mirrordclusterexternalresources -A -o jsonpath='{range .items[*]}  {.spec.azureServiceBusResource.kind}  {.spec.azureServiceBusResource.name}{"\n"}{end}' 2>/dev/null)
+        if [ -z "$OUT" ]; then echo "  (none)"; else echo "$OUT"; fi
+        echo ""
+        echo "Deployed workload (must stay untouched: generation should not change, env keeps test-sub/test-topic)"
+        kubectl get deploy {{.DEPLOY}} -n {{.NAMESPACE}} -o jsonpath='  generation={.metadata.generation}  observedGeneration={.status.observedGeneration}{"\n"}' 2>/dev/null || echo "  (deployment not found)"
+        kubectl get deploy {{.DEPLOY}} -n {{.NAMESPACE}} -o jsonpath='{range .spec.template.spec.containers[0].env[*]}  {.name}={.value}{"\n"}{end}' 2>/dev/null | grep -iE "SERVICEBUS_(TOPIC|SUBSCRIPTION)" || true
+        echo ""
+        echo "Topics in the emulator (native splitting must NOT add a temporary topic)"
+        kubectl port-forward -n {{.EMULATOR_NAMESPACE}} svc/servicebus-emulator {{.LOCAL_PORT}}:5300 >/dev/null 2>&1 &
+        PF_PID=$!
+        sleep 2
+        curl -s "http://localhost:{{.LOCAL_PORT}}/\$Resources/Topics" -H "Content-Type: application/atom+xml" 2>/dev/null \
+          | sed -n 's/.*<title[^>]*>\([^<]*\)<\/title>.*/  \1/gp' || echo "  (emulator not reachable)"
+        kill $PF_PID 2>/dev/null || true
+
+  native:rules:
+    desc: "Show the SQL filter rules on the topic's subscriptions (works against real Azure SB; the emulator may not expose rule listing)"
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      APP_SUB: '{{.APP_SUB | default "test-sub"}}'
+      LOCAL_PORT: '{{.LOCAL_PORT | default "5673"}}'
+    cmds:
+      - |
+        kubectl port-forward -n {{.EMULATOR_NAMESPACE}} svc/servicebus-emulator {{.LOCAL_PORT}}:5300 >/dev/null 2>&1 &
+        PF_PID=$!
+        sleep 2
+
+        show_rules() {
+          sub="$1"
+          echo "  Subscription: $sub"
+          # The emulator can reset the connection on this endpoint (it does not
+          # support rule listing), so tolerate a curl failure and report it.
+          RAW=$(curl -s "http://localhost:{{.LOCAL_PORT}}/{{.TOPIC}}/subscriptions/$sub/rules" \
+            -H "Content-Type: application/atom+xml" 2>/dev/null || true)
+          if [ -z "$RAW" ] || echo "$RAW" | grep -q '<Error>'; then
+            echo "    (rule listing not available on this emulator)"
+            return
+          fi
+          NAMES=$(echo "$RAW" | grep -oE '<title[^>]*>[^<]*</title>' | sed -E 's/<[^>]+>//g')
+          SQL=$(echo "$RAW" | grep -oE '<SqlExpression>[^<]*</SqlExpression>' | sed -E 's/<[^>]+>//g')
+          if [ -z "$NAMES" ]; then echo "    (none)"; else
+            echo "    rule names : $(echo $NAMES | tr '\n' ' ')"
+            echo "    filters    : $(echo $SQL | tr '\n' '|')"
+          fi
+        }
+
+        echo "Rules on topic '{{.TOPIC}}':"
+        echo ""
+        show_rules "{{.APP_SUB}}"
+
+        # Any operator-created subscriptions currently live show up as external resources.
+        SUBS=$(kubectl get mirrordclusterexternalresources -A -o jsonpath='{range .items[*]}{.spec.azureServiceBusResource.name}{"\n"}{end}' 2>/dev/null \
+          | sed -nE 's#^{{.TOPIC}}/subscriptions/(mirrord-[^/]+)$#\1#p' | sort -u)
+        for s in $SUBS; do
+          show_rules "$s"
+        done
+
+        kill $PF_PID 2>/dev/null || true
+        echo ""
+        echo "Note: this emulator usually does not expose rule listing over REST."
+        echo "The real proof of routing locally is message behavior + 'native:status'."
+
+  test:native:topic:
+    desc: "Automated native topic split test: asserts routing, untouched workload, and clean teardown"
+    vars:
+      TOPIC: "test-topic"
+      APP_SUB: "test-sub"
+      DEPLOY: "servicebus-topic-consumer"
+      APP_LABEL: "app=servicebus-topic-consumer"
+      MIRRORD_CONFIG: '{{.OVERLAY_DIR}}/mirrord-topic.json'
+      LOCAL_LOG: "/tmp/sb-native-local.log"
+    cmds:
+      - |
+        set +e
+        PASS=0; FAIL=0
+        check() {
+          if [ "$1" = "$2" ]; then echo "  PASS: $3"; PASS=$((PASS+1));
+          else echo "  FAIL: $3 (expected '$2', got '$1')"; FAIL=$((FAIL+1)); fi
+        }
+        contains() {
+          if echo "$1" | grep -q "$2"; then echo "  PASS: $3"; PASS=$((PASS+1));
+          else echo "  FAIL: $3"; FAIL=$((FAIL+1)); fi
+        }
+        not_contains() {
+          if echo "$1" | grep -q "$2"; then echo "  FAIL: $3"; FAIL=$((FAIL+1));
+          else echo "  PASS: $3"; PASS=$((PASS+1)); fi
+        }
+
+        echo "Native topic/subscription split - automated test"
+        echo ""
+        echo "Step 0: clean slate and build local consumer"
+        pkill -f "/tmp/sb-native" 2>/dev/null || true
+        pkill -f "exec -f .*mirrord-topic.json" 2>/dev/null || true
+        kubectl delete mirrordclustersplitsessions --all -A >/dev/null 2>&1
+        # The ingest subscription has a deterministic name, so a leftover from a
+        # previous run would clash with this one. Wait for the operator to finish
+        # tearing down any prior split before starting.
+        for i in $(seq 1 18); do
+          REMAIN=$(kubectl get mirrordclusterexternalresources -A -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+          [ -z "$REMAIN" ] && break
+          [ "$i" = "1" ] && echo "  waiting for previous resources to clear..."
+          sleep 5
+        done
+        (cd {{.ROOT_DIR}}/apps/servicebus-consumer && go build -o /tmp/sb-native main.go) \
+          || { echo "  build failed"; exit 1; }
+        rm -f {{.LOCAL_LOG}}
+
+        GEN_BEFORE=$(kubectl get deploy {{.DEPLOY}} -n {{.NAMESPACE}} -o jsonpath='{.metadata.generation}' 2>/dev/null)
+
+        echo ""
+        echo "Step 1: start mirrord session (filter tenant=^test)"
+        # mirrord exec startup takes ~15s (sidecar + intproxy), so poll the
+        # consumer log for readiness rather than checking the process - mirrord's
+        # launcher PID is not a reliable liveness signal.
+        {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/sb-native > {{.LOCAL_LOG}} 2>&1 &
+        READY="no"
+        for i in $(seq 1 40); do
+          sleep 2
+          if grep -q "Listening for messages" {{.LOCAL_LOG}} 2>/dev/null; then READY="yes"; break; fi
+        done
+        if [ "$READY" != "yes" ]; then
+          echo "  session never became ready, log:"; cat {{.LOCAL_LOG}}
+          pkill -f "/tmp/sb-native" 2>/dev/null || true
+          pkill -f "exec -f .*mirrord-topic.json" 2>/dev/null || true
+          exit 1
+        fi
+        echo "  session ready"
+
+        echo ""
+        echo "Step 2: assert the operator built the native resources"
+        RES=$(kubectl get mirrordclusterexternalresources -A -o jsonpath='{range .items[*]}{.spec.azureServiceBusResource.name}{"\n"}{end}' 2>/dev/null)
+        contains "$RES" "mirrord-ingest" "ingest subscription created"
+        contains "$RES" "{{.APP_SUB}}/rules/mirrord-main" "app subscription marker rule registered for restore"
+        contains "$RES" "subscriptions/mirrord-s" "per-session subscription created"
+
+        echo ""
+        echo "Step 3: assert the deployed workload spec was NOT changed"
+        GEN_AFTER=$(kubectl get deploy {{.DEPLOY}} -n {{.NAMESPACE}} -o jsonpath='{.metadata.generation}' 2>/dev/null)
+        check "$GEN_AFTER" "$GEN_BEFORE" "deployment generation unchanged (no spec patch)"
+        SUB_ENV=$(kubectl get deploy {{.DEPLOY}} -n {{.NAMESPACE}} -o jsonpath='{range .spec.template.spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null | grep SERVICEBUS_SUBSCRIPTION_NAME | cut -d= -f2)
+        check "$SUB_ENV" "{{.APP_SUB}}" "deployed app env still points at the original subscription"
+
+        echo ""
+        echo "Step 4: send one matching + one non-matching message"
+        task servicebus:send:topic TENANT=test-user >/dev/null 2>&1
+        task servicebus:send:topic TENANT=other >/dev/null 2>&1
+        sleep 8
+
+        echo ""
+        echo "Step 5: assert routing"
+        LOCAL=$(grep "\[MSG" {{.LOCAL_LOG}} 2>/dev/null)
+        DEPLOYED=$(kubectl logs -n {{.NAMESPACE}} -l {{.APP_LABEL}} --tail=50 2>/dev/null | grep "\[MSG")
+        contains "$LOCAL" "tenant=test-user" "local session received the matching message"
+        not_contains "$LOCAL" "tenant=other" "local session did NOT receive the non-matching message"
+        contains "$DEPLOYED" "tenant=other" "deployed app received the non-matching message"
+        contains "$DEPLOYED" "mirrord_route=main" "deployed app message carries the 'main' marker"
+        not_contains "$DEPLOYED" "tenant=test-user" "deployed app did NOT receive the matching message"
+
+        echo ""
+        echo "Step 6: stop the session and wait for teardown"
+        pkill -f "/tmp/sb-native" 2>/dev/null || true
+        pkill -f "exec -f .*mirrord-topic.json" 2>/dev/null || true
+        LEFT="present"
+        for i in $(seq 1 24); do
+          sleep 10
+          REMAIN=$(kubectl get mirrordclusterexternalresources -A -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+          SESS=$(kubectl get mirrordclustersplitsessions -A -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
+          if [ -z "$REMAIN" ] && [ -z "$SESS" ]; then LEFT="gone"; break; fi
+          echo "  waiting for teardown... ($((i*10))s)"
+        done
+        check "$LEFT" "gone" "all split sessions and external resources cleaned up"
+
+        echo ""
+        echo "Results: $PASS passed, $FAIL failed"
+        if [ "$FAIL" -ne 0 ]; then exit 1; fi
+        echo "Native topic split test PASSED."
+
   run:local:wildcard:
     desc: "Run local consumer with wildcard '*' queue key (expands to all queues in MirrordSplitConfig)"
     dir: "{{.ROOT_DIR}}/apps/servicebus-consumer"

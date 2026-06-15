@@ -1,0 +1,247 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  REDIS_NAMESPACE: "redis-test"
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  CHANNEL: '{{.CHANNEL | default "orders.events"}}'
+  LOCAL_PORT: '{{.LOCAL_PORT | default "16379"}}'
+  OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/redis-pubsub"
+
+tasks:
+  deploy:redis:
+    desc: "Deploy Redis server only (not the KV redis-app from k8s/redis)"
+    cmds:
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/namespace.yaml
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/redis-deployment.yaml
+      - kubectl delete deployment redis-app -n {{.REDIS_NAMESPACE}} --ignore-not-found=true
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.REDIS_NAMESPACE}} --timeout=120s
+
+  deploy:
+    desc: "Deploy Redis + consumer + queue splitting CRDs"
+    cmds:
+      - task: build
+      - task: deploy:redis
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/consumer.yaml
+      - kubectl wait --for=condition=ready pod -l app=redis-pubsub-consumer -n {{.NAMESPACE}} --timeout=120s
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/split-config.yaml
+
+  build:
+    desc: "Build and load redis-pubsub-consumer image into minikube"
+    dir: "{{.ROOT_DIR}}/apps/redis-pubsub-consumer"
+    cmds:
+      - go mod tidy
+      - docker build -t redis-pubsub-consumer:local .
+      - minikube -p {{.CLUSTER_NAME}} image load redis-pubsub-consumer:local
+
+  run:local:
+    desc: "Run redis pub/sub consumer locally with mirrord (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/redis-pubsub-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/redis-pubsub/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/redis-pubsub-consumer main.go
+      # mirrord.json sets experimental.sip_utils=false for locally-built CLI binaries on macOS.
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/redis-pubsub-consumer'
+
+  test:split:
+    desc: "End-to-end split test (mirrord session + publish + verify filtered messages)"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/redis-pubsub/mirrord.json'
+      LOG: /tmp/redis-pubsub-test.log
+    cmds:
+      - task: deploy
+      - cd {{.ROOT_DIR}}/apps/redis-pubsub-consumer && go build -o /tmp/redis-pubsub-consumer main.go
+      - rm -f {{.LOG}}
+      - |
+        {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/redis-pubsub-consumer > {{.LOG}} 2>&1 &
+        MIR_PID=$!
+        trap 'kill $MIR_PID 2>/dev/null || true' EXIT
+        for i in $(seq 1 30); do
+          sleep 1
+          grep -q 'starting channel=' {{.LOG}} && break
+        done
+        if ! grep -q 'starting channel=' {{.LOG}}; then
+          echo "mirrord consumer failed to start:"; cat {{.LOG}}; exit 1
+        fi
+        sleep 2
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBLISH {{.CHANNEL}} '{"tenant":"test","body":"matched-1"}' >/dev/null
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBLISH {{.CHANNEL}} '{"tenant":"other","body":"unmatched"}' >/dev/null
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBLISH {{.CHANNEL}} '{"tenant":"test","body":"matched-2"}' >/dev/null
+        sleep 5
+        grep -q '1:{"tenant":"test","body":"matched-1"}' {{.LOG}} || { echo "missing matched-1"; cat {{.LOG}}; exit 1; }
+        grep -q '1:{"tenant":"test","body":"matched-2"}' {{.LOG}} || { echo "missing matched-2"; cat {{.LOG}}; exit 1; }
+        grep -q 'unmatched' {{.LOG}} && { echo "unmatched message leaked"; cat {{.LOG}}; exit 1; } || true
+        echo "redis pub/sub split test passed"
+
+  publish:
+    desc: "Publish a test JSON message to the source channel"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.REDIS_NAMESPACE}} $POD -- redis-cli PUBLISH {{.CHANNEL}} '{"tenant":"test","body":"hello"}'
+
+  port-forward:
+    desc: "Port-forward cluster Redis to localhost for Redis Insight / redis-cli"
+    cmds:
+      - |
+        echo "Forwarding redis-main.{{.REDIS_NAMESPACE}} -> 127.0.0.1:{{.LOCAL_PORT}}"
+        echo ""
+        echo "Redis Insight / redis-cli on your Mac cannot use cluster DNS"
+        echo "(redis-main.redis-test.svc.cluster.local). That hostname only works"
+        echo "inside the cluster or under mirrord exec. Use localhost instead:"
+        echo ""
+        echo "  Host:     127.0.0.1"
+        echo "  Port:     {{.LOCAL_PORT}}"
+        echo "  Username: (leave empty)"
+        echo "  Password: (leave empty)"
+        echo "  TLS:      off"
+        echo ""
+        echo "CLI example:"
+        echo "  redis-cli -h 127.0.0.1 -p {{.LOCAL_PORT}} PUBSUB CHANNELS '*'"
+        echo ""
+        echo "Pub/Sub channels only appear while something is subscribed."
+        echo "Start a mirrord session first, then: task redis-pubsub:channels"
+        echo ""
+        echo "Press Ctrl+C to stop the port-forward."
+        kubectl port-forward -n {{.REDIS_NAMESPACE}} svc/redis-main {{.LOCAL_PORT}}:6379
+
+  channels:
+    desc: "List active Redis pub/sub channels and subscriber counts"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        if [ -z "$POD" ]; then
+          echo "redis-main pod not found in {{.REDIS_NAMESPACE}}"; exit 1
+        fi
+        echo "Active channels (must have at least one subscriber):"
+        echo ""
+        printf "%-40s %12s\n" "CHANNEL" "SUBSCRIBERS"
+        printf "%-40s %12s\n" "-------" "------------"
+        CHANNELS=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB CHANNELS '*' 2>/dev/null || true)
+        if [ -z "$CHANNELS" ]; then
+          echo "(no active channels - start a mirrord session or cluster consumer first)"
+          exit 0
+        fi
+        for ch in $CHANNELS; do
+          count=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB NUMSUB "$ch" 2>/dev/null | tail -1)
+          printf "%-40s %12s\n" "$ch" "${count:-0}"
+        done
+
+  status:
+    desc: "Table view of split sessions, temp channels, and live Redis pub/sub state"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+        echo "=== Deployment (source channel env) ==="
+        printf "%-20s %-30s %s\n" "DEPLOYMENT" "ENV" "VALUE"
+        printf "%-20s %-30s %s\n" "----------" "---" "-----"
+        kubectl get deploy redis-pubsub-consumer -n {{.NAMESPACE}} -o json 2>/dev/null | python3 -c "
+        import json,sys
+        d=json.load(sys.stdin)
+        for c in d['spec']['template']['spec']['containers']:
+          for e in c.get('env',[]):
+            if e.get('name','').startswith('REDIS'):
+              print(f\"{'redis-pubsub-consumer':<20} {e['name']:<30} {e.get('value','')}\")
+        " 2>/dev/null || echo "(deployment not found)"
+
+        echo ""
+        echo "=== MirrordSplitConfig (configured queue ids) ==="
+        kubectl get mirrordsplitconfig redis-pubsub-test-config -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,QUEUE_ID:.spec.queues[0].id,KIND:.spec.queues[0].kind,SOURCE_ENV:.spec.queues[0].appConfig.channel[0].env 2>/dev/null || echo "(split config not found)"
+
+        echo ""
+        echo "=== Split sessions (operator temp channel mapping) ==="
+        SESSIONS=$(kubectl get mirrordclustersplitsessions -A -o json 2>/dev/null)
+        if [ -z "$SESSIONS" ] || [ "$(echo "$SESSIONS" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("items",[])))')" = "0" ]; then
+          echo "(no active split sessions)"
+        else
+          printf "%-45s %-12s %-30s %-35s %s\n" "SESSION" "QUEUE_ID" "ORIGINAL_CHANNEL" "TEMP_CHANNEL" "FILTER"
+          printf "%-45s %-12s %-30s %-35s %s\n" "-------" "--------" "----------------" "------------" "------"
+          echo "$SESSIONS" | python3 -c "
+        import json,sys
+        data=json.load(sys.stdin)
+        for s in data.get('items',[]):
+          name=s['metadata']['name'][:45]
+          for q in s['spec'].get('queues',[]):
+            filt=','.join(f'{k}={v}' for k,v in (q.get('headersFilter') or {}).items()) or '-'
+            ready=s.get('status',{}).get('ready') or {}
+            tmp=ready.get('tmpResources') or []
+            if not tmp:
+              print(f'{name:<45} {q.get(\"id\",\"\"):<12} {\"(pending)\":<30} {\"\":<35} {filt}')
+              continue
+            for entry in tmp:
+              qid=entry.get('queueId',q.get('id',''))
+              ch=entry.get('channel') or {}
+              if not ch:
+                print(f'{name:<45} {qid:<12} {\"(none)\":<30} {\"\":<35} {filt}')
+              for orig,tmpch in ch.items():
+                print(f'{name:<45} {qid:<12} {orig:<30} {tmpch:<35} {filt}')
+        "
+        fi
+
+        echo ""
+        echo "=== Live Redis pub/sub (subscriber counts) ==="
+        if [ -z "$POD" ]; then
+          echo "(redis-main pod not running)"
+        else
+          printf "%-40s %12s %s\n" "CHANNEL" "SUBSCRIBERS" "NOTES"
+          printf "%-40s %12s %s\n" "-------" "------------" "-----"
+          for pattern in '{{.CHANNEL}}' 'mirrord*' 'orders*'; do
+            for ch in $(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB CHANNELS "$pattern" 2>/dev/null); do
+              count=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB NUMSUB "$ch" 2>/dev/null | tail -1)
+              note=""
+              case "$ch" in
+                {{.CHANNEL}}) note="source channel (publish here)" ;;
+                *-main-*) note="main/fallback output" ;;
+                mirrord-tmp-*) note="session or operator forwarder" ;;
+              esac
+              printf "%-40s %12s %s\n" "$ch" "${count:-0}" "$note"
+            done
+          done
+          ACTIVE=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB CHANNELS '*' 2>/dev/null | wc -w | tr -d ' ')
+          if [ "$ACTIVE" = "0" ]; then
+            echo "(no channels with subscribers - normal when no mirrord session is running)"
+          fi
+        fi
+
+        echo ""
+        echo "=== Cleanup notes ==="
+        echo "Redis Pub/Sub has no durable queues. Temp channels are just names;"
+        echo "they disappear when the last subscriber disconnects (no Redis key to delete)."
+        echo "mirrord removes the split session CR and stops the operator forwarder on session end."
+        echo "After the last session ends, run this again - temp channels should be gone from PUBSUB."
+        echo ""
+        echo "Redis Insight: task redis-pubsub:port-forward  (connect to 127.0.0.1:{{.LOCAL_PORT}})"
+
+  test:split:status:
+    desc: "Alias for status (matches pubsub/servicebus task naming)"
+    cmds:
+      - task: status
+
+  test:split:cleanup:
+    desc: "Delete all split sessions (stops temp channel routing)"
+    cmds:
+      - echo "Deleting split sessions..."
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || echo "(none)"
+      - echo "Done. Re-run task redis-pubsub:status to confirm channels dropped."
+
+  run:
+    desc: "Deploy everything and run local consumer"
+    cmds:
+      - task: deploy
+      - task: run:local
+
+  clean:
+    desc: "Remove redis pub/sub test resources"
+    cmds:
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY_DIR}}/property-list.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY_DIR}}/namespace.yaml --ignore-not-found=true
