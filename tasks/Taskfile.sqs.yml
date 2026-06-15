@@ -133,6 +133,115 @@ tasks:
       - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
       - echo "reset complete - start a fresh session with 'task sqs:split:session'"
 
+  split:multi-registry:
+    desc: "Backwards-compat test for two MirrordWorkloadQueueRegistry objects on the same workload, each declaring a different queue. The old operator merged them; the unified resolver must too. Splits BOTH test-queue (registry 1) and orders-queue (registry 2) in one session and checks the MirrordClusterSplitSession resolves both. PASS = both queue ids present; FAIL = the second registry was dropped or the session errored."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord-multi-registry.json")}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+      CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+    cmds:
+      # Rebuild and load the consumer image so the in-cluster pods run the
+      # multi-queue app too (it reads QUEUE_NAME and ORDERS_QUEUE_NAME). The
+      # local session rebuilds its own binary below via `go build`.
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local {{.ROOT_DIR}}/apps/sqs-consumer"
+      - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack-legacy
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml
+      # A real MirrordSplitConfig always wins over legacy registries, so any
+      # leftover from a prior `sqs:deploy` would hide the legacy path we want to
+      # test. Kustomize `$patch: delete` in the legacy overlay does not remove an
+      # already-created object, so delete it explicitly here.
+      - kubectl delete mirrordsplitconfig --all -n {{.NAMESPACE}} --ignore-not-found=true
+      # registry 2's orders-queue reads its name from ORDERS_QUEUE_NAME, a
+      # different env var than test-queue's QUEUE_NAME, so the operator patches
+      # two distinct vars instead of clashing on one. Inject it at runtime and
+      # create the matching LocalStack queue.
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME=OrdersQueue
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name OrdersQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      # Start clean so the only split session we inspect is the one we create.
+      - kubectl delete mirrordclustersplitsession --all -n {{.NAMESPACE}} --ignore-not-found=true --wait=false
+      - task: _wait:localstack
+      - task: _wait:consumer
+      - echo "two registries now target Deployment/sqs-consumer:"
+      - kubectl get mirrordworkloadqueueregistry -n {{.NAMESPACE}} -o custom-columns='NAME:.metadata.name,CONSUMER:.spec.consumer.name,QUEUES:.spec.queues'
+      - (cd apps/sqs-consumer && go build -o /tmp/sqs-consumer main.go)
+      - |
+        BIN="${MIRRORD_BIN:-{{.ROOT_DIR}}/../mirrord/target/aarch64-apple-darwin/debug/mirrord}"
+        LOG=$(mktemp)
+        echo "starting split session in the background (log: $LOG)"
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer > "$LOG" 2>&1 &
+        MIRRORD_PID=$!
+
+        RESOLVED=""
+        for i in $(seq 1 30); do
+          if ! kill -0 "$MIRRORD_PID" 2>/dev/null; then
+            break
+          fi
+          RESOLVED=$(kubectl get mirrordclustersplitsession -n {{.NAMESPACE}} \
+            -o jsonpath='{range .items[*]}{.status.ready.tmpResources[*].queueId}{"\n"}{end}' 2>/dev/null \
+            | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+          if [ -n "$RESOLVED" ]; then
+            break
+          fi
+          sleep 2
+        done
+
+        kill "$MIRRORD_PID" 2>/dev/null || true
+        wait "$MIRRORD_PID" 2>/dev/null || true
+
+        echo "-----------------------------------------------------------------"
+        echo "session log (tail):"
+        tail -n 15 "$LOG" || true
+        echo "-----------------------------------------------------------------"
+        echo "resolved queue ids in MirrordClusterSplitSession: [$RESOLVED]"
+        if echo "$RESOLVED" | grep -q 'test-queue' && echo "$RESOLVED" | grep -q 'orders-queue'; then
+          echo "PASS: both registries merged - test-queue (registry 1) and orders-queue (registry 2) resolved"
+        else
+          echo "FAIL: the two registries did not merge - expected both 'test-queue' and 'orders-queue'"
+          echo "      (the unified resolver likely rejected or dropped the second registry)"
+          exit 1
+        fi
+
+  split:multi-registry:send:
+    desc: "Send messages to BOTH source queues (TestQueue + OrdersQueue) for the multi-registry test. FILTERED=N per queue match the filter (tenant=Avi.Test) and go to your local session; UNFILTERED=N per queue do not match (tenant=Basic) and stay in the cluster. Defaults: FILTERED=2 UNFILTERED=1."
+    vars:
+      FILTERED: '{{.FILTERED | default "2"}}'
+      UNFILTERED: '{{.UNFILTERED | default "1"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - |
+        Q=http://localhost:4566/000000000000
+        send() {
+          # $1 queue url, $2 body, $3 tenant
+          kubectl exec -n localstack deploy/localstack -- awslocal sqs send-message \
+            --region {{.REGION}} --queue-url "$1" --message-body "$2" \
+            --message-attributes "{\"tenant\":{\"DataType\":\"String\",\"StringValue\":\"$3\"}}" >/dev/null
+          echo "  sent $2 (tenant=$3) -> $(basename "$1")"
+        }
+        for NAME in TestQueue OrdersQueue; do
+          echo "queue $NAME:"
+          for i in $(seq 1 {{.FILTERED}}); do
+            send "$Q/$NAME" "${NAME}-local-$i" "Avi.Test"
+          done
+          for i in $(seq 1 {{.UNFILTERED}}); do
+            send "$Q/$NAME" "${NAME}-remote-$i" "Basic"
+          done
+        done
+        echo ""
+        echo "filtered (tenant=Avi.Test) -> local session consumer"
+        echo "unfiltered (tenant=Basic)  -> in-cluster pods (kubectl logs -n {{.NAMESPACE}} -l app=sqs-consumer -c consumer)"
+
+  split:multi-registry:clean:
+    desc: "Remove the second registry and extra env/queue added by sqs:split:multi-registry."
+    cmds:
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml --ignore-not-found=true
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME- 2>/dev/null || true
+
   run:local:aws:
     desc: "Run SQS consumer locally with mirrord (AWS)"
     dir: '{{.ROOT_DIR}}/apps/sqs-consumer'

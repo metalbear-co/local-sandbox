@@ -1,0 +1,18 @@
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordWorkloadQueueRegistry
+metadata:
+  name: sqs-test-registry-second
+  namespace: test-mirrord
+spec:
+  # Second registry for the SAME workload (sqs-consumer) as sqs-test-registry.
+  # The old operator merged every registry that matched a workload, so spreading
+  # queues across multiple registries was a supported setup. This declares a
+  # different queue id so the two registries together describe the full queue set.
+  queues:
+    orders-queue:
+      queueType: SQS
+      nameSource:
+        envVar: ORDERS_QUEUE_NAME
+  consumer:
+    name: sqs-consumer
+    workloadType: Deployment
