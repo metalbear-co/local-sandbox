@@ -7,6 +7,14 @@ vars:
   WORKER_NAMESPACE: '{{.WORKER_NAMESPACE | default "test-mirrord"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
   RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+  # Namespace where the hello-world RabbitMQ cluster (and its default-user secret) live.
+  RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+  # Namespace for the queue-splitting test target + CRDs. A stable namespace so
+  # the operator can still resolve the MirrordPropertyList to clean up temp
+  # queues; a throwaway namespace would delete the credentials before cleanup.
+  SPLIT_NAMESPACE: '{{.SPLIT_NAMESPACE | default "test-mirrord"}}'
+  INVENTORY_QUEUE: '{{.INVENTORY_QUEUE | default "inventory"}}'
+  ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
 
 tasks:
   deploy:
@@ -37,13 +45,16 @@ tasks:
       TENANT: '{{.TENANT | default "test-user"}}'
     cmds:
       - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -o jsonpath='{.data.password}' | base64 -d)
         POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
         echo "Publishing to queue '{{.QUEUE}}' with header tenant={{.TENANT}}"
-        kubectl exec $POD -- \
-          rabbitmqadmin publish \
-            routing_key="{{.QUEUE}}" \
-            payload='{{.MESSAGE}}' \
-            properties='{"headers":{"tenant":"{{.TENANT}}"}}'
+        kubectl exec $POD -c rabbitmq -- \
+          rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+            --routing-key "{{.QUEUE}}" \
+            --payload '{{.MESSAGE}}' \
+            --properties '{"headers":{"tenant":"{{.TENANT}}"}}'
 
   send:nofilter:
     desc: "Publish a message without filter headers"
@@ -52,12 +63,15 @@ tasks:
       MESSAGE: '{{.MESSAGE | default "unfiltered message"}}'
     cmds:
       - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -o jsonpath='{.data.password}' | base64 -d)
         POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
         echo "Publishing to queue '{{.QUEUE}}' without filter headers"
-        kubectl exec $POD -- \
-          rabbitmqadmin publish \
-            routing_key="{{.QUEUE}}" \
-            payload='{{.MESSAGE}}'
+        kubectl exec $POD -c rabbitmq -- \
+          rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+            --routing-key "{{.QUEUE}}" \
+            --payload '{{.MESSAGE}}'
 
   logs:
     desc: "Show RabbitMQ server logs"
@@ -160,7 +174,7 @@ tasks:
     cmds:
       - |
         POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
-        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name 2>/dev/null | grep "^mirrord-")
+        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name 2>/dev/null | grep "^mirrord-" || true)
         if [ -z "$QUEUES" ]; then
           echo "No mirrord temp queues found."
         else
@@ -172,7 +186,7 @@ tasks:
     cmds:
       - |
         POD=$(kubectl get pod -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
-        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name --no-table-headers 2>/dev/null | grep "^mirrord-")
+        QUEUES=$(kubectl exec $POD -- rabbitmqctl list_queues name --no-table-headers 2>/dev/null | grep "^mirrord-" || true)
         if [ -z "$QUEUES" ]; then
           echo "No mirrord temp queues to delete."
         else
@@ -181,6 +195,190 @@ tasks:
             echo "Deleted: $q"
           done
         fi
+
+  split:deploy:
+    desc: "Deploy RMQ queue-splitting infra: broker queues, a consumer target, a MirrordPropertyList, and a legacy MirrordWorkloadQueueRegistry. The legacy registry is understood by both old (pre-unification) and new operators, which is what the backwards-compat test needs."
+    cmds:
+      - |
+        set -e
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        HOST="{{.RMQ_CLUSTER_NAME}}.{{.RMQ_CLUSTER_NS}}.svc"
+        # The cluster-operator generates passwords that can contain URL-special
+        # characters (+, /), so encode them before embedding in the AMQP URL.
+        RMQ_USER_ENC=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$RMQ_USER")
+        RMQ_PASS_ENC=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$RMQ_PASS")
+        AMQP_URL="amqp://$RMQ_USER_ENC:$RMQ_PASS_ENC@$HOST:5672/%2F"
+
+        echo "Declaring broker queues '{{.INVENTORY_QUEUE}}' and '{{.ORDERS_QUEUE}}'"
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" declare queue --name {{.INVENTORY_QUEUE}} --type classic --durable true
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" declare queue --name {{.ORDERS_QUEUE}} --type classic --durable true
+
+        kubectl create namespace {{.SPLIT_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+
+        cat <<EOF | kubectl apply -f -
+        apiVersion: mirrord.metalbear.co/v1
+        kind: MirrordPropertyList
+        metadata:
+          name: rmq-cluster
+          namespace: {{.SPLIT_NAMESPACE}}
+        spec:
+          properties:
+            - name: scheme
+              value: amqp
+            - name: host
+              value: "$HOST"
+            - name: port
+              value: "5672"
+            - name: username
+              value: "$RMQ_USER"
+            - name: password
+              value: "$RMQ_PASS"
+            - name: vhost
+              value: "/"
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: rmq-consumer
+          namespace: {{.SPLIT_NAMESPACE}}
+          labels:
+            app: rmq-consumer
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: rmq-consumer
+          template:
+            metadata:
+              labels:
+                app: rmq-consumer
+            spec:
+              containers:
+                - name: consumer
+                  image: registry.k8s.io/pause:3.9
+                  env:
+                    - name: RABBIT_MQ_INVENTORY_QUEUE
+                      value: "{{.INVENTORY_QUEUE}}"
+                    - name: RABBIT_MQ_ORDERS_QUEUE
+                      value: "{{.ORDERS_QUEUE}}"
+                    - name: RABBIT_MQ_URL
+                      value: "$AMQP_URL"
+        ---
+        apiVersion: queues.mirrord.metalbear.co/v1alpha
+        kind: MirrordWorkloadQueueRegistry
+        metadata:
+          name: rmq-registry
+          namespace: {{.SPLIT_NAMESPACE}}
+        spec:
+          consumer:
+            name: rmq-consumer
+            workloadType: Deployment
+          queues:
+            inventory-queue:
+              queueType: RMQ
+              clusterProperties: rmq-cluster
+              nameSource:
+                envVar: RABBIT_MQ_INVENTORY_QUEUE
+            orders-queue:
+              queueType: RMQ
+              clusterProperties: rmq-cluster
+              nameSource:
+                envVar: RABBIT_MQ_ORDERS_QUEUE
+        EOF
+
+        kubectl rollout status deployment/rmq-consumer -n {{.SPLIT_NAMESPACE}} --timeout=60s
+        echo "RMQ split infra ready in namespace {{.SPLIT_NAMESPACE}}"
+
+  split:run:
+    desc: "Run the RMQ consumer locally under mirrord with queue splitting (filter tenant=a). Uses the mirrord CLI on PATH (override with MIRRORD_BIN)."
+    dir: "{{.ROOT_DIR}}/apps/rmq-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/rabbitmq/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/rmq-consumer .
+      - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/rmq-consumer"
+
+  split:run:dev:
+    desc: "Run the RMQ consumer with the branch debug-built mirrord CLI. Use for the operator-upgrade test - a released CLI on PATH may not reconnect after the operator is swapped."
+    dir: "{{.ROOT_DIR}}/apps/rmq-consumer"
+    vars:
+      MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+      HOST_TRIPLE:
+        sh: rustc -vV | awk '/^host:/ {print $2}'
+      MIRRORD_DEV_BIN: '{{.MIRRORD_DEV_BIN | default (print .MIRRORD_DIR "/target/" .HOST_TRIPLE "/debug/mirrord")}}'
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/rabbitmq/mirrord.json")}}'
+    preconditions:
+      - sh: test -x "{{.MIRRORD_DEV_BIN}}"
+        msg: "Branch mirrord build not found at {{.MIRRORD_DEV_BIN}}. Build it first: cd {{.MIRRORD_DIR}} && cargo build -p mirrord"
+    cmds:
+      - go build -o /tmp/rmq-consumer .
+      - echo "Using mirrord CLI {{.MIRRORD_DEV_BIN}}"
+      - '"{{.MIRRORD_DEV_BIN}}" exec -f {{.MIRRORD_CONFIG}} -- /tmp/rmq-consumer'
+
+  split:send:
+    desc: "Publish FILTERED (tenant=a) + UNFILTERED (tenant=b) messages for split testing (QUEUE=inventory FILTERED=2 UNFILTERED=1). Only tenant=a should reach the local session."
+    vars:
+      QUEUE: '{{.QUEUE | default "inventory"}}'
+      FILTERED: '{{.FILTERED | default "2"}}'
+      UNFILTERED: '{{.UNFILTERED | default "1"}}'
+    cmds:
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+            --routing-key "{{.QUEUE}}" \
+            --payload "filtered-$i tenant=a" \
+            --properties '{"headers":{"tenant":"a"}}'
+        done
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+            --routing-key "{{.QUEUE}}" \
+            --payload "unfiltered-$i tenant=b" \
+            --properties '{"headers":{"tenant":"b"}}'
+        done
+        echo "Sent {{.FILTERED}} filtered (tenant=a) + {{.UNFILTERED}} unfiltered (tenant=b) to '{{.QUEUE}}'"
+
+  split:status:
+    desc: "Show RMQ queue-splitting state (registry, sessions for old + new operator, property list, target)"
+    cmds:
+      - echo "=== MirrordWorkloadQueueRegistry (legacy config, read by both operators) ==="
+      - kubectl get mirrordworkloadqueueregistry -n {{.SPLIT_NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== Legacy RMQ sessions (created by old/pre-unification operator) ==="
+      - kubectl get mirrordrmqsessions -A 2>/dev/null || echo "(CRD not present)"
+      - echo ""
+      - echo "=== Unified split sessions (created/adopted by new operator) ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "(CRD not present)"
+      - echo ""
+      - echo "=== MirrordPropertyList ==="
+      - kubectl get mirrordpropertylist -n {{.SPLIT_NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== Consumer target ==="
+      - kubectl get deployment rmq-consumer -n {{.SPLIT_NAMESPACE}} 2>/dev/null || echo "(none)"
+
+  split:clean:
+    desc: "Remove RMQ queue-splitting infra and any leftover temp queues"
+    cmds:
+      - kubectl delete mirrordworkloadqueueregistry rmq-registry -n {{.SPLIT_NAMESPACE}} --ignore-not-found=true
+      - kubectl delete deployment rmq-consumer -n {{.SPLIT_NAMESPACE}} --ignore-not-found=true
+      - kubectl delete mirrordpropertylist rmq-cluster -n {{.SPLIT_NAMESPACE}} --ignore-not-found=true
+      - task: queues:mirrord:delete
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d 2>/dev/null)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d 2>/dev/null)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" delete queue --name {{.INVENTORY_QUEUE}} --idempotently 2>/dev/null || true
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" delete queue --name {{.ORDERS_QUEUE}} --idempotently 2>/dev/null || true
+        fi
+      - echo "RMQ split infra cleaned"
 
   _wait:rabbitmq:
     internal: true
