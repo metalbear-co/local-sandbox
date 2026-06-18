@@ -18,6 +18,24 @@ tasks:
       - task: _wait:kafka
       - task: _wait:consumer
 
+  e2e:strimzi:
+    desc: "Install Strimzi + the `my-cluster` Kafka the operator e2e tests expect (not needed for `kafka:deploy`)"
+    cmds:
+      # The operator/tests kafka suite reads a Strimzi `Kafka/my-cluster` in the
+      # `kafka` namespace. Nothing in the repo ships these; CI installs them from
+      # strimzi.io at test time. This task does the same so the suite can run on a
+      # long-lived local cluster. The CRD check keeps it idempotent because the
+      # Strimzi bundle uses `kubectl create`, which errors if the CRDs exist.
+      - |
+        if ! kubectl get crd kafkas.kafka.strimzi.io >/dev/null 2>&1; then
+          kubectl create namespace kafka --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create -f "https://strimzi.io/install/latest?namespace=kafka" -n kafka
+        fi
+      - kubectl wait --for=condition=Available deployment/strimzi-cluster-operator -n kafka --timeout=180s
+      - kubectl apply -f "https://strimzi.io/examples/latest/kafka/kafka-single-node.yaml" -n kafka
+      - kubectl wait --for=condition=Ready kafka/my-cluster --timeout=360s -n kafka
+      - echo "Strimzi and kafka/my-cluster are ready. The operator kafka e2e tests can run now."
+
   _build:app:
     internal: true
     desc: "Build and load the kafka-consumer:local image into the cluster"
@@ -47,6 +65,26 @@ tasks:
     cmds:
       - go build -o /tmp/kafka-consumer main.go
       - "{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  run:local:dev:
+    desc: "Run the Kafka consumer with the branch debug-built mirrord CLI (use for recovery/upgrade tests - the released CLI on PATH may not reconnect after an operator restart)"
+    dir: "{{.ROOT_DIR}}/apps/kafka-consumer"
+    vars:
+      MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+      # The debug build lives under a host-triple subdir (e.g.
+      # aarch64-apple-darwin on Apple silicon), so resolve it instead of
+      # hardcoding one machine's path.
+      HOST_TRIPLE:
+        sh: rustc -vV | awk '/^host:/ {print $2}'
+      MIRRORD_DEV_BIN: '{{.MIRRORD_DEV_BIN | default (print .MIRRORD_DIR "/target/" .HOST_TRIPLE "/debug/mirrord")}}'
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka/mirrord.json")}}'
+    preconditions:
+      - sh: test -x "{{.MIRRORD_DEV_BIN}}"
+        msg: "Branch mirrord build not found at {{.MIRRORD_DEV_BIN}}. Build it first: cd {{.MIRRORD_DIR}} && cargo build -p mirrord"
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - echo "Using mirrord CLI {{.MIRRORD_DEV_BIN}}"
+      - '"{{.MIRRORD_DEV_BIN}}" exec -f {{.MIRRORD_CONFIG}} -- /tmp/kafka-consumer'
 
   send:
     desc: "Send test message to Kafka (MESSAGE='hello' TOPIC='test-topic' USER_ID='123')"
@@ -92,6 +130,38 @@ tasks:
               --bootstrap-server localhost:9092 --topic {{.TOPIC}}
         fi
         echo "Done sending {{.COUNT}} messages."
+
+  split:send:
+    desc: "Send FILTERED + UNFILTERED messages for split testing (FILTERED=3 UNFILTERED=2 TOPIC=test-topic USER_ID=test-user)"
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      FILTERED: '{{.FILTERED | default "3"}}'
+      UNFILTERED: '{{.UNFILTERED | default "2"}}'
+      USER_ID: '{{.USER_ID | default "test-user"}}'
+      MESSAGE: '{{.MESSAGE | default "msg"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        # The split filter matches the header user_id={{.USER_ID}}. Messages
+        # carrying that header are routed to the local mirrord session; messages
+        # without it fall through to the deployed workload. We send them in two
+        # separate producer runs because the headered batch needs parse.headers
+        # while the plain batch must not, otherwise the producer rejects lines
+        # that have no header delimiter.
+        if [ "{{.FILTERED}}" -gt 0 ]; then
+          echo "Sending {{.FILTERED}} FILTERED messages (user_id={{.USER_ID}}) to {{.TOPIC}}..."
+          for i in $(seq 1 {{.FILTERED}}); do printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}-filtered-%s\n' "$i"; done \
+            | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh \
+              --bootstrap-server localhost:9092 --topic {{.TOPIC}} \
+              --property 'parse.headers=true' --property 'headers.delimiter=|'
+        fi
+        if [ "{{.UNFILTERED}}" -gt 0 ]; then
+          echo "Sending {{.UNFILTERED}} UNFILTERED messages (no header) to {{.TOPIC}}..."
+          for i in $(seq 1 {{.UNFILTERED}}); do printf '{{.MESSAGE}}-unfiltered-%s\n' "$i"; done \
+            | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh \
+              --bootstrap-server localhost:9092 --topic {{.TOPIC}}
+        fi
+        echo "Done: {{.FILTERED}} filtered + {{.UNFILTERED}} unfiltered."
 
   consume:
     desc: "Consume messages from Kafka topic (TOPIC='test-topic')"

@@ -603,10 +603,15 @@ tasks:
           exit 0
         fi
         echo "Archived operator images ({{.BRANCHES_DIR}}):"
+        printf "  %-40s %-8s %s\n" "TAG" "SIZE" "CREATED"
         for f in {{.BRANCHES_DIR}}/*.tar; do
           TAG=$(basename "$f" .tar)
           SIZE=$(du -h "$f" | cut -f1)
-          printf "  %-40s %s\n" "$TAG" "$SIZE"
+          # File mtime is when the tar was written, i.e. when the image was
+          # saved. BSD stat (macOS) and GNU stat (Linux/CI) take different flags,
+          # so try BSD first and fall back to GNU.
+          CREATED=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$f" 2>/dev/null || stat -c "%y" "$f" 2>/dev/null | cut -d. -f1)
+          printf "  %-40s %-8s %s\n" "$TAG" "$SIZE" "$CREATED"
         done
 
   operator:save:

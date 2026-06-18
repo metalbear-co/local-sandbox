@@ -3728,7 +3728,10 @@ tasks:
   pubsub:wait:emulator:
     desc: Wait for the Pub/Sub emulator pod to be ready
     cmds:
-      - kubectl --context {{.REMOTE_CLUSTER_1}} wait --for=condition=ready pod -l app.kubernetes.io/name=pubsub-emulator -n pubsub-emulator --timeout=300s
+      # Wait on the Deployment rollout so we don't race the ReplicaSet: a bare
+      # `kubectl wait pod -l ...` fails with "no matching resources found" if
+      # the pod hasn't been created yet right after apply.
+      - kubectl --context {{.REMOTE_CLUSTER_1}} rollout status deployment/pubsub-emulator -n pubsub-emulator --timeout=300s
 
   pubsub:create:topic:
     desc: Create test topic and subscription in the emulator

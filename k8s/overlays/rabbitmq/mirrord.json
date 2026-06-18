@@ -1,0 +1,26 @@
+{
+  "target": {
+    "path": "deployment/rmq-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "network": {
+      "dns": true
+    },
+    "split_queues": {
+      "inventory-queue": {
+        "queue_type": "RMQ",
+        "message_filter": {
+          "tenant": "^a$"
+        }
+      },
+      "orders-queue": {
+        "queue_type": "RMQ",
+        "message_filter": {
+          "tenant": "^a$"
+        }
+      }
+    }
+  }
+}
