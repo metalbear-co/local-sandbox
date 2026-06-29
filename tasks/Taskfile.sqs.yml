@@ -9,7 +9,12 @@ vars:
 tasks:
   deploy:
     desc: "Deploy SQS LocalStack test environment"
+    vars:
+      CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+      CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
     cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local {{.ROOT_DIR}}/apps/sqs-consumer"
+      - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
       - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack
       - task: _wait:localstack
       - task: _wait:consumer
@@ -241,6 +246,104 @@ tasks:
     cmds:
       - kubectl delete -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml --ignore-not-found=true
       - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME- 2>/dev/null || true
+
+  split:multi-type:
+    desc: "Split TWO DIFFERENT broker types (SQS test-queue + Kafka kafka-topic) for one workload in a single session, using one MirrordSplitConfig listing both kinds. Prints the resulting QueueSplit and MirrordClusterSplitSession so you can SEE which kinds actually land in one session."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord-multi-type.json")}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+      CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local {{.ROOT_DIR}}/apps/sqs-consumer"
+      - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack
+      # Kafka splitting needs the client config (in the operator namespace) and a
+      # running Kafka cluster with the source topic. The kafka deploy provides both.
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      # One config, two kinds, same target.
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config-multi-type.yaml
+      # The operator resolves the SQS queue name from QUEUE_NAME (already set) and
+      # the Kafka topic + group from these. sqs-consumer does not actually consume
+      # Kafka, but resolution only reads the env vars from the pod template.
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} KAFKA_TOPIC_NAME=test-topic KAFKA_GROUP_ID=test-consumer-group
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - kubectl delete mirrordclustersplitsession --all -n {{.NAMESPACE}} --ignore-not-found=true --wait=false
+      # Clear persisted recovery state for the target so the next session does a
+      # fresh init instead of rebuilding an older single-queue split.
+      - |
+        for name in $(kubectl get mirrordclusterworkloadpatchrequest -o json 2>/dev/null \
+            | jq -r '.items[] | select(.spec.workloadRef.name=="sqs-consumer") | .metadata.name'); do
+          kubectl patch mirrordclusterworkloadpatchrequest "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+          kubectl delete mirrordclusterworkloadpatchrequest "$name" --ignore-not-found=true --wait=false 2>/dev/null || true
+        done
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - |
+        echo "waiting for the operator API to serve requests"
+        for i in $(seq 1 30); do
+          if kubectl get --raw '/apis/operator.metalbear.co/v1' >/dev/null 2>&1; then
+            echo "  operator API ready"
+            break
+          fi
+          sleep 2
+        done
+      - task: _wait:localstack
+      - task: _wait:consumer
+      - echo "one MirrordSplitConfig targeting Deployment/sqs-consumer with TWO kinds:"
+      - kubectl get mirrordsplitconfig sqs-test-split-config -n {{.NAMESPACE}} -o jsonpath='{range .spec.queues[*]}{.id}{" -> "}{.kind}{"\n"}{end}'
+      - (cd apps/sqs-consumer && go build -o /tmp/sqs-consumer main.go)
+      - |
+        BIN="${MIRRORD_BIN:-{{.ROOT_DIR}}/../mirrord/target/aarch64-apple-darwin/debug/mirrord}"
+        LOG=$(mktemp)
+        echo "starting split session in the background (log: $LOG)"
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer > "$LOG" 2>&1 &
+        MIRRORD_PID=$!
+
+        CAPTURE=""
+        for i in $(seq 1 40); do
+          if ! kill -0 "$MIRRORD_PID" 2>/dev/null; then
+            break
+          fi
+          # The QueueSplit custom API only exists while the session is live.
+          CAPTURE=$(kubectl get queuesplits -n {{.NAMESPACE}} -o yaml 2>/dev/null)
+          if echo "$CAPTURE" | grep -q 'type:'; then
+            break
+          fi
+          sleep 2
+        done
+
+        echo "================================================================="
+        echo "QueueSplit (custom API) while the session is live:"
+        echo "$CAPTURE"
+        echo "================================================================="
+        echo "MirrordClusterSplitSession spec.queues (what the connect flow persisted):"
+        kubectl get mirrordclustersplitsession -n {{.NAMESPACE}} \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .spec.queues[*]}{"  "}{.id}{" -> "}{.kind}{"\n"}{end}{end}' 2>/dev/null
+        echo "================================================================="
+
+        kill "$MIRRORD_PID" 2>/dev/null || true
+        wait "$MIRRORD_PID" 2>/dev/null || true
+
+        echo "session log (tail):"
+        tail -n 12 "$LOG" || true
+        echo "================================================================="
+        KINDS=$(echo "$CAPTURE" | grep -E '^\s+type:' | awk '{print $2}' | sort -u | tr '\n' ' ')
+        echo "distinct queue kinds in the QueueSplit: [$KINDS]"
+        if echo "$KINDS" | grep -qi 'SQS' && echo "$KINDS" | grep -qi 'Kafka'; then
+          echo "RESULT: one session carried BOTH SQS and Kafka."
+        else
+          echo "RESULT: only one kind landed - the other was dropped by the connect flow."
+        fi
+
+  split:multi-type:clean:
+    desc: "Restore the single-queue split config and remove Kafka env added by sqs:split:multi-type."
+    cmds:
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config.yaml
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} KAFKA_TOPIC_NAME- KAFKA_GROUP_ID- 2>/dev/null || true
 
   run:local:aws:
     desc: "Run SQS consumer locally with mirrord (AWS)"

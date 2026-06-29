@@ -1,0 +1,17 @@
+{
+  "target": {
+    "path": "deployment/sqs-fallback-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "probe-sqs": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "tenant": "^Avi"
+        }
+      }
+    }
+  }
+}

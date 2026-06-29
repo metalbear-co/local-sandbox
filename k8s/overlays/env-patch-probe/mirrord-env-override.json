@@ -1,0 +1,15 @@
+{
+  "target": {
+    "path": "deployment/env-patch-probe",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "env": {
+      "override": {
+        "Service__ServiceName": "session-only-subscription",
+        "TOPIC": "session-only-topic"
+      }
+    }
+  }
+}

@@ -12,6 +12,7 @@ tasks:
   deploy:
     desc: "Deploy Kafka test environment (builds and loads the consumer image first)"
     cmds:
+      - task: e2e:strimzi
       - task: _build:app
       - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/kafka
       - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
@@ -19,22 +20,36 @@ tasks:
       - task: _wait:consumer
 
   e2e:strimzi:
-    desc: "Install Strimzi + the `my-cluster` Kafka the operator e2e tests expect (not needed for `kafka:deploy`)"
+    desc: "Install Strimzi + the `my-cluster` Kafka the operator e2e tests expect"
     cmds:
       # The operator/tests kafka suite reads a Strimzi `Kafka/my-cluster` in the
-      # `kafka` namespace. Nothing in the repo ships these; CI installs them from
-      # strimzi.io at test time. This task does the same so the suite can run on a
-      # long-lived local cluster. The CRD check keeps it idempotent because the
-      # Strimzi bundle uses `kubectl create`, which errors if the CRDs exist.
+      # `kafka` namespace. This task installs everything from scratch and handles
+      # leftover state from previous installs (stale CRDs, PVCs with mismatched
+      # cluster IDs, etc.) so it can be re-run on a long-lived local cluster.
+      - kubectl create namespace kafka --dry-run=client -o yaml | kubectl apply -f -
       - |
-        if ! kubectl get crd kafkas.kafka.strimzi.io >/dev/null 2>&1; then
-          kubectl create namespace kafka --dry-run=client -o yaml | kubectl apply -f -
-          kubectl create -f "https://strimzi.io/install/latest?namespace=kafka" -n kafka
+        if ! kubectl get deployment strimzi-cluster-operator -n kafka >/dev/null 2>&1; then
+          kubectl apply --server-side -f "https://strimzi.io/install/latest?namespace=kafka" -n kafka
         fi
       - kubectl wait --for=condition=Available deployment/strimzi-cluster-operator -n kafka --timeout=180s
+      - |
+        if kubectl get kafka my-cluster -n kafka >/dev/null 2>&1; then
+          STATUS=$(kubectl get kafka my-cluster -n kafka -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)
+          if [ "$STATUS" = "True" ]; then
+            echo "kafka/my-cluster already Ready, skipping."
+            exit 0
+          fi
+          echo "kafka/my-cluster exists but not Ready, recreating with clean PVCs..."
+          kubectl delete kafka my-cluster -n kafka --wait=true --timeout=60s 2>/dev/null || true
+          kubectl delete pod -l strimzi.io/cluster=my-cluster -n kafka --force --grace-period=0 2>/dev/null || true
+          kubectl delete pvc -l strimzi.io/cluster=my-cluster -n kafka --wait=false 2>/dev/null || true
+          for pvc in $(kubectl get pvc -n kafka -l strimzi.io/cluster=my-cluster -o name 2>/dev/null); do
+            kubectl patch "$pvc" -n kafka --type=merge -p '{"metadata":{"finalizers":null}}' 2>/dev/null || true
+          done
+        fi
       - kubectl apply -f "https://strimzi.io/examples/latest/kafka/kafka-single-node.yaml" -n kafka
       - kubectl wait --for=condition=Ready kafka/my-cluster --timeout=360s -n kafka
-      - echo "Strimzi and kafka/my-cluster are ready. The operator kafka e2e tests can run now."
+      - echo "Strimzi and kafka/my-cluster are ready."
 
   _build:app:
     internal: true

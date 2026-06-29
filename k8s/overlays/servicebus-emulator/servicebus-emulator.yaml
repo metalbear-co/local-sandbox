@@ -77,6 +77,12 @@ spec:
       value: "azure-sql-edge"
     - name: MSSQL_SA_PASSWORD
       value: "Strong!Passw0rd"
+    # Give the SQL backend more time to finish its schema setup before the
+    # emulator's health check starts probing it. Without this the emulator can
+    # mark SQL unhealthy and retry while the database is still being created,
+    # which slows or breaks startup.
+    - name: SQL_WAIT_INTERVAL
+      value: "60"
     ports:
     - containerPort: 5672
       name: amqp

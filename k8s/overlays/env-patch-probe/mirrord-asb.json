@@ -1,0 +1,20 @@
+{
+  "target": {
+    "path": {
+      "container": "main",
+      "deployment": "env-patch-probe"
+    },
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "reward-point-balance-changed": {
+        "queue_type": "AzureServiceBus",
+        "message_filter": {
+          "cot-context-intercept-id": "s*test$"
+        }
+      }
+    }
+  }
+}

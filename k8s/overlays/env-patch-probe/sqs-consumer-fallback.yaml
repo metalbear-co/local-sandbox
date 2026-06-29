@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sqs-fallback-consumer
+  namespace: test-mirrord
+  labels:
+    app: sqs-fallback-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sqs-fallback-consumer
+  template:
+    metadata:
+      labels:
+        app: sqs-fallback-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: sqs-consumer:local
+        imagePullPolicy: Never
+        # QUEUE_NAME is deliberately absent. The split config supplies the queue
+        # name through `fallback`, and the operator adds QUEUE_NAME when it
+        # patches this workload during a session. Without a session, the consumer
+        # falls back to its own default and just retries - it is not consuming the
+        # real source queue, so it does not compete with the split.
+        env:
+        - name: APP_NAME
+          value: "remote-fallback"
+        - name: AWS_ENDPOINT_URL
+          value: "http://localstack.localstack.svc.cluster.local:4566"
+        - name: AWS_ACCESS_KEY_ID
+          value: "test"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "test"
+        - name: AWS_DEFAULT_REGION
+          value: "eu-north-1"
+        - name: AWS_REGION
+          value: "eu-north-1"

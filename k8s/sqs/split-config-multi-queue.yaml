@@ -1,0 +1,23 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  # Same name as the base sqs-test-split-config so applying this overwrites it,
+  # keeping a single config per target (two configs for one target is rejected).
+  name: sqs-test-split-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sqs-consumer
+  queues:
+    - id: test-queue
+      kind: sqs
+      appConfig:
+        queue:
+          - env: QUEUE_NAME
+    - id: orders-queue
+      kind: sqs
+      appConfig:
+        queue:
+          - env: ORDERS_QUEUE_NAME

@@ -1,0 +1,17 @@
+{
+  "target": {
+    "path": "deployment/env-patch-probe",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "probe-topic": {
+        "queue_type": "AzureServiceBus",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

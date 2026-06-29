@@ -1,0 +1,316 @@
+version: "3"
+
+# Demonstrates that mirrord can set an environment variable on the target
+# workload during a session even when the deployment never declared it. The
+# probe app (apps/env-patch-probe) just prints a watched set of variables on a
+# loop, so you can literally watch a variable go from <unset> to a value while a
+# session runs, and back to <unset> after it ends.
+#
+# Two scenarios:
+#   - run:principle  - plain `feature.env.override`, no broker. The fastest way
+#                      to see the patch happen.
+#   - run:fallback   - the real Azure Service Bus queue-splitting path. The split
+#                      config supplies the subscription name through `fallback`,
+#                      and the operator adds `Service__ServiceName` when it
+#                      patches the workload. Needs the Service Bus emulator.
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  EMULATOR_NAMESPACE: "servicebus-emulator"
+  OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/env-patch-probe"
+
+tasks:
+  build:
+    desc: "Build and load the env-patch-probe image into minikube"
+    dir: "{{.ROOT_DIR}}/apps/env-patch-probe"
+    cmds:
+      - go mod tidy
+      - docker build -t env-patch-probe:local .
+      - minikube -p {{.CLUSTER_NAME}} image load env-patch-probe:local
+
+  deploy:
+    desc: "Deploy the probe (no subscription/topic env vars set on the pod)"
+    cmds:
+      - task: build
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY_DIR}}/deployment.yaml
+      - kubectl rollout status deployment/env-patch-probe -n {{.NAMESPACE}} --timeout=120s
+
+  deploy:fallback:
+    desc: "Deploy the probe + property list + split config for the fallback path"
+    preconditions:
+      - sh: kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=servicebus-emulator -o name | grep -q .
+        msg: "Service Bus emulator is not running. Deploy it first with: task servicebus:deploy:emulator"
+    cmds:
+      - task: deploy
+      - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config.yaml
+
+  deploy:sqs:
+    desc: "Deploy a real SQS consumer with NO QUEUE_NAME + split config (env-via-fallback). Needs LocalStack from the sqs module."
+    preconditions:
+      - sh: kubectl get pod -n localstack -l app.kubernetes.io/name=localstack -o name | grep -q .
+        msg: "LocalStack is not running. Deploy the SQS env first with: task sqs:deploy"
+    cmds:
+      # The operator splits from this source queue, so it must exist in LocalStack.
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region eu-north-1 >/dev/null 2>&1 || true
+      # With no QUEUE_NAME the consumer falls back to its built-in default
+      # `test-queue` while idle. Create it so the pod stays up instead of
+      # crash-looping (a crash-loop adds restart backoff that can stall the
+      # operator when it restarts the pod to apply the split patch).
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name test-queue --region eu-north-1 >/dev/null 2>&1 || true
+      # The stock sqs-consumer reads TestQueue directly. Scale it to 0 so it does
+      # not race the split for the same source queue during this test.
+      - kubectl scale deployment sqs-consumer -n {{.NAMESPACE}} --replicas=0 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/sqs-consumer-fallback.yaml
+      # No rollout wait on purpose: with no QUEUE_NAME and no session, the consumer
+      # cannot find its source queue and exits (CrashLoopBackOff). That is fine -
+      # starting a session patches QUEUE_NAME and a fresh pod reads the temp queue.
+      - kubectl apply -f {{.OVERLAY_DIR}}/split-config-sqs.yaml
+
+  run:sqs:
+    desc: "SQS fallback test: run the real consumer locally. Operator patches QUEUE_NAME from the fallback; filtered messages (tenant Avi.*) arrive here."
+    dir: "{{.ROOT_DIR}}/apps/sqs-consumer"
+    cmds:
+      - go build -o /tmp/sqs-consumer main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.OVERLAY_DIR}}/mirrord-sqs.json -- /tmp/sqs-consumer'
+
+  send:sqs:
+    desc: "Send SQS messages: FILTERED=N (tenant=Avi.Test -> local session) + UNFILTERED=N (tenant=Basic -> remote consumer)."
+    vars:
+      FILTERED: '{{.FILTERED | default "2"}}'
+      UNFILTERED: '{{.UNFILTERED | default "2"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+    cmds:
+      - |
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "{\"order_id\":\"ORD-F$i\",\"tenant\":\"Avi.Test\",\"type\":\"premium\",\"amount\":$((RANDOM % 1000))}" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' >/dev/null
+          echo "sent FILTERED ORD-F$i  (tenant=Avi.Test -> local session)"
+        done
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "{\"order_id\":\"ORD-U$i\",\"tenant\":\"Basic\",\"type\":\"basic\",\"amount\":$((RANDOM % 100))}" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Basic"}}' >/dev/null
+          echo "sent UNFILTERED ORD-U$i  (tenant=Basic -> remote consumer)"
+        done
+
+  logs:sqs:remote:
+    desc: "Follow the remote fallback consumer pod (unfiltered messages land here)"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=sqs-fallback-consumer --tail=30 -f
+
+  restore:sqs:
+    desc: "Tear down the SQS fallback consumer and scale the stock sqs-consumer back up"
+    cmds:
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config-sqs.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/sqs-consumer-fallback.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl scale deployment sqs-consumer -n {{.NAMESPACE}} --replicas=1 2>/dev/null || true
+
+  reset:sqs:
+    desc: "Clean slate for the SQS fallback test: kill any local session, delete split sessions + leftover temp queues, and restart the consumer."
+    cmds:
+      - pkill -f 'mirrord exec' 2>/dev/null || true
+      # Strip finalizers so stuck sessions delete immediately, then remove them.
+      - |
+        for s in $(kubectl get mirrordclustersplitsessions -o name 2>/dev/null || true); do
+          kubectl patch "$s" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
+          kubectl delete "$s" --wait=false >/dev/null 2>&1 || true
+        done
+      # An interrupted session can orphan its workload patch request. While it
+      # lives, a mutating webhook keeps injecting QUEUE_NAME into new pods, so the
+      # env never looks reverted. Remove these and any leftover copy-target pods.
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A --wait=false 2>/dev/null || true
+      - |
+        for p in $(kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep 'mirrord-copy' || true); do
+          kubectl delete "$p" -n {{.NAMESPACE}} --wait=false 2>/dev/null || true
+        done
+      # Drop the per-session temp queues left behind in LocalStack.
+      - |
+        kubectl exec -n localstack deploy/localstack -- awslocal sqs list-queues --region eu-north-1 --query 'QueueUrls[]' --output text 2>/dev/null \
+          | tr '\t' '\n' | grep -i 'mirrord-' | while read q; do
+            kubectl exec -n localstack deploy/localstack -- awslocal sqs delete-queue --region eu-north-1 --queue-url "$q" >/dev/null 2>&1 || true
+          done
+      # Roll a fresh consumer pod so its env reflects the no-session state again.
+      - kubectl rollout restart deployment/sqs-fallback-consumer -n {{.NAMESPACE}} 2>/dev/null || true
+      - echo "reset done - QUEUE_NAME should be unset again (check with 'task envpatch:env:sqs')"
+
+  env:sqs:
+    desc: "Show whether QUEUE_NAME is currently patched on the fallback consumer (run before/during/after a session)."
+    cmds:
+      - echo "Active split sessions:"
+      - kubectl get mirrordclustersplitsessions 2>/dev/null || echo "  (none)"
+      - echo ""
+      - echo "QUEUE_NAME the fallback consumer resolved (from its latest startup log):"
+      - kubectl logs -n {{.NAMESPACE}} -l app=sqs-fallback-consumer --tail=200 2>/dev/null | grep -E 'Queue:|Connected:' | tail -2 || echo "  (no consumer pod yet)"
+
+  asb:deploy:broken:
+    desc: "Azure Service Bus resolution test (BROKEN): subscription has no env var and no fallback, so it resolves to nothing."
+    cmds:
+      - task: deploy
+      - kubectl apply -f {{.OVERLAY_DIR}}/asb-property-list.yaml
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-split-config-fixed.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/asb-split-config-broken.yaml
+
+  asb:deploy:fixed:
+    desc: "Azure Service Bus resolution test (FIXED): subscription gets a fallback, so resolution succeeds (then fails later at the fake broker)."
+    cmds:
+      - task: deploy
+      - kubectl apply -f {{.OVERLAY_DIR}}/asb-property-list.yaml
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-split-config-broken.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl apply -f {{.OVERLAY_DIR}}/asb-split-config-fixed.yaml
+
+  asb:run:
+    desc: "Start the ASB split session. BROKEN config fails instantly with 'no resource name resolved'; FIXED config gets past resolution."
+    dir: "{{.ROOT_DIR}}/apps/env-patch-probe"
+    cmds:
+      - go build -o /tmp/env-patch-probe main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.OVERLAY_DIR}}/mirrord-asb.json -- /tmp/env-patch-probe'
+
+  asb:operator-logs:
+    desc: "Show the operator's resolution log lines (which side resolved empty, and what env vars it could see)."
+    cmds:
+      - kubectl logs -n mirrord -l app==mirrord-operator --tail=300 2>/dev/null | grep -iE "resolve|resource name|Azure Service Bus params" | tail -30 || echo "  (no matching lines - is operator.logLevel set to debug for operator_queue_splitting?)"
+
+  asb:clean:
+    desc: "Remove the ASB resolution test CRDs and any leftover sessions."
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-split-config-broken.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-split-config-fixed.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-property-list.yaml --ignore-not-found=true 2>/dev/null || true
+
+  before:
+    desc: "Show the watched env vars on the deployed pod before any session (all <unset>)"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=env-patch-probe --tail=8
+
+  logs:
+    desc: "Follow the deployed probe pod logs (watch the variable flip during a session)"
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=env-patch-probe --tail=20 -f
+
+  run:principle:
+    desc: "Principle test: plain env override, no broker. Local probe prints the injected values."
+    dir: "{{.ROOT_DIR}}/apps/env-patch-probe"
+    cmds:
+      - go build -o /tmp/env-patch-probe main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.OVERLAY_DIR}}/mirrord-env-override.json -- /tmp/env-patch-probe'
+
+  run:fallback:
+    desc: "Fallback test: Azure Service Bus split. Operator patches Service__ServiceName from the fallback."
+    dir: "{{.ROOT_DIR}}/apps/env-patch-probe"
+    cmds:
+      - go build -o /tmp/env-patch-probe main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.OVERLAY_DIR}}/mirrord-fallback.json -- /tmp/env-patch-probe'
+
+  status:
+    desc: "Show split state and the deployed pod's patched env (empty when no session is active)"
+    cmds:
+      - echo "Split sessions"
+      - kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "  (none)"
+      - echo ""
+      - echo "Deployed pod env (container spec - patched only while a session runs)"
+      - kubectl get deploy env-patch-probe -n {{.NAMESPACE}} -o jsonpath='{range .spec.template.spec.containers[0].env[*]}  {.name}={.value}{"\n"}{end}' 2>/dev/null || echo "  (deployment not found)"
+
+  guide:
+    desc: "Print the step-by-step walkthrough for both env-patch tests"
+    cmds:
+      - |
+        cat <<'EOF'
+
+        env-patch-probe - watch mirrord set a variable that the deployment never declared
+
+        The probe prints a set of env vars every 3s. The deployment sets NONE of the
+        interesting ones (Service__ServiceName, TOPIC, ...), so they start <unset>.
+
+        --- Scenario A: principle (plain env override, no broker) --------------------
+
+          1. Deploy the probe:
+               task envpatch:deploy
+
+          2. Watch the deployed pod (separate terminal). All vars print <unset>:
+               task envpatch:before
+               task envpatch:logs
+
+          3. Run a local session that overrides the vars:
+               task envpatch:run:principle
+             The LOCAL process prints Service__ServiceName="session-only-subscription".
+             The patch is scoped to the session - it does not change appsettings.json
+             and reverts when the session ends.
+
+        --- Scenario B: fallback (real Azure Service Bus split) ----------------------
+
+          1. Bring up the emulator (reuses the servicebus module, amd64-pinned):
+               task servicebus:deploy:emulator
+
+          2. Deploy the probe + property list + split config:
+               task envpatch:deploy:fallback
+
+          3. Watch the deployed pod (separate terminal):
+               task envpatch:logs
+
+          4. Start the split session:
+               task envpatch:run:fallback
+             The operator resolves the subscription name from `fallback` and patches
+             Service__ServiceName onto the workload. The probe (deployed and local)
+             prints it set to the operator's temporary subscription instead of <unset>.
+
+          5. Inspect / clean up:
+               task envpatch:status
+               task envpatch:clean
+
+        --- Scenario C: Azure Service Bus resolution (no broker needed) ---------------
+
+        Reproduces the customer's "no resource name resolved" failure. Param
+        resolution runs entirely inside the operator and never contacts Azure, so
+        this needs no emulator - the broken config fails before any broker call.
+
+          1. Deploy the probe + property list + the BROKEN split config (the
+             subscription has no env var on the pod and no fallback):
+               task envpatch:asb:deploy:broken
+
+          2. Start a session. It fails almost instantly with
+             "no resource name resolved for queue entry reward-point-balance-changed":
+               task envpatch:asb:run
+
+          3. See which side resolved empty in the operator logs (needs
+             operator_queue_splitting at debug for the per-var lines; the summary
+             warning shows at the default level):
+               task envpatch:asb:operator-logs
+             Look for subscription_resolved=false and the available_env list.
+
+          4. Apply the FIXED config (subscription gains a `fallback`) and re-run.
+             Resolution now succeeds (see "Resolved Azure Service Bus params") and
+             the session instead fails later reaching the fake namespace - which is
+             the proof that resolution passed:
+               task envpatch:asb:deploy:fixed
+               task envpatch:asb:run
+
+          5. Clean up:
+               task envpatch:asb:clean
+        EOF
+
+  clean:
+    desc: "Delete the probe, CRDs, and any leftover split sessions"
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config-sqs.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/sqs-consumer-fallback.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl scale deployment sqs-consumer -n {{.NAMESPACE}} --replicas=1 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-split-config-broken.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-split-config-fixed.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/asb-property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY_DIR}}/deployment.yaml --ignore-not-found=true 2>/dev/null || true

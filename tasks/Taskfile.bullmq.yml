@@ -1,0 +1,221 @@
+version: "3"
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  REDIS_NAMESPACE: "redis-test"
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  BULLMQ_QUEUE: '{{.BULLMQ_QUEUE | default "orders"}}'
+  BULLMQ_PREFIX: '{{.BULLMQ_PREFIX | default "bull"}}'
+  LOCAL_PORT: '{{.LOCAL_PORT | default "16379"}}'
+  OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/bullmq"
+  CHARTS_DIR: "{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator"
+
+tasks:
+  deploy:redis:
+    desc: "Deploy Redis server (reuses the shared redis-test namespace)"
+    cmds:
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/namespace.yaml
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/redis-deployment.yaml
+      - kubectl delete deployment redis-app -n {{.REDIS_NAMESPACE}} --ignore-not-found=true
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.REDIS_NAMESPACE}} --timeout=120s
+
+  deploy:
+    desc: "Deploy Redis + BullMQ consumer + queue splitting CRDs"
+    cmds:
+      - task: build
+      - task: deploy:redis
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/namespace.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/consumer.yaml
+      - kubectl wait --for=condition=ready pod -l app=bullmq-consumer -n {{.NAMESPACE}} --timeout=120s
+      - task: _apply:split-crds
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/property-list.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY_DIR}}/split-config.yaml
+
+  build:
+    desc: "Build and load bullmq-consumer image into minikube"
+    dir: "{{.ROOT_DIR}}/apps/bullmq-consumer"
+    cmds:
+      - go mod tidy
+      - docker build -t bullmq-consumer:local .
+      - minikube -p {{.CLUSTER_NAME}} image load bullmq-consumer:local
+
+  run:local:
+    desc: "Run BullMQ consumer locally with mirrord (tenant=^test filter)"
+    dir: "{{.ROOT_DIR}}/apps/bullmq-consumer"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/bullmq/mirrord.json")}}'
+    cmds:
+      - go build -o /tmp/bullmq-consumer main.go
+      - '{{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/bullmq-consumer'
+
+  enqueue:
+    desc: "Enqueue a test job (TENANT=test DATA=hello)"
+    vars:
+      TENANT: '{{.TENANT | default "test"}}'
+      DATA: '{{.DATA | default "hello"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        ID=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli INCR "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:id")
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli HSET "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$ID" data "{\"tenant\":\"{{.TENANT}}\",\"body\":\"{{.DATA}}\"}"
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli RPUSH "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" "$ID"
+        echo "Enqueued job $ID to {{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}} (tenant={{.TENANT}})"
+
+  enqueue:match:
+    desc: "Enqueue a job that matches the default filter (tenant=test)"
+    cmds:
+      - task: enqueue
+        vars: { BULLMQ_QUEUE: "orders", TENANT: "test", DATA: "matched-job" }
+
+  enqueue:nomatch:
+    desc: "Enqueue a job that does not match (tenant=other)"
+    cmds:
+      - task: enqueue
+        vars: { BULLMQ_QUEUE: "orders", TENANT: "other", DATA: "unmatched-job" }
+
+  enqueue:both:
+    desc: "Enqueue one matching and one non-matching job"
+    cmds:
+      - task: enqueue
+        vars: { BULLMQ_QUEUE: "orders", TENANT: "test", DATA: "matched-job" }
+      - task: enqueue
+        vars: { BULLMQ_QUEUE: "orders", TENANT: "other", DATA: "unmatched-job" }
+
+  test:split:
+    desc: "End-to-end split test: start mirrord session, enqueue jobs, verify filtering"
+    vars:
+      MIRRORD_CONFIG: '{{.ROOT_DIR}}/k8s/overlays/bullmq/mirrord.json'
+      LOG: /tmp/bullmq-split-test.log
+    cmds:
+      - task: deploy
+      - cd {{.ROOT_DIR}}/apps/bullmq-consumer && go build -o /tmp/bullmq-consumer main.go
+      - rm -f {{.LOG}}
+      - |
+        {{.MIRRORD_BIN}} exec -f {{.MIRRORD_CONFIG}} -- /tmp/bullmq-consumer > {{.LOG}} 2>&1 &
+        MIR_PID=$!
+        trap 'kill $MIR_PID 2>/dev/null || true' EXIT
+        for i in $(seq 1 30); do
+          sleep 1
+          grep -q 'bullmq-consumer ready' {{.LOG}} && break
+        done
+        if ! grep -q 'bullmq-consumer ready' {{.LOG}}; then
+          echo "mirrord consumer failed to start:"; cat {{.LOG}}; exit 1
+        fi
+        sleep 2
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        # Enqueue matching job
+        ID1=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli INCR "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:id")
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli HSET "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$ID1" data '{"tenant":"test","body":"matched-1"}' >/dev/null
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli RPUSH "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" "$ID1" >/dev/null
+        # Enqueue non-matching job
+        ID2=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli INCR "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:id")
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli HSET "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$ID2" data '{"tenant":"other","body":"unmatched"}' >/dev/null
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli RPUSH "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" "$ID2" >/dev/null
+        # Enqueue another matching job
+        ID3=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli INCR "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:id")
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli HSET "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$ID3" data '{"tenant":"test","body":"matched-2"}' >/dev/null
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli RPUSH "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" "$ID3" >/dev/null
+        sleep 8
+        grep -q 'matched-1' {{.LOG}} || { echo "missing matched-1"; cat {{.LOG}}; exit 1; }
+        grep -q 'matched-2' {{.LOG}} || { echo "missing matched-2"; cat {{.LOG}}; exit 1; }
+        grep -q 'unmatched' {{.LOG}} && { echo "unmatched message leaked to local consumer"; cat {{.LOG}}; exit 1; } || true
+        echo "bullmq split test passed"
+
+  status:
+    desc: "Show BullMQ test environment status"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+
+        echo "=== Deployment ==="
+        kubectl get deploy bullmq-consumer -n {{.NAMESPACE}} 2>/dev/null || echo "(not deployed)"
+
+        echo ""
+        echo "=== MirrordSplitConfig ==="
+        kubectl get mirrordsplitconfig bullmq-test-config -n {{.NAMESPACE}} 2>/dev/null || echo "(not found)"
+
+        echo ""
+        echo "=== Property List ==="
+        kubectl get mirrordpropertylist bullmq-config -n {{.NAMESPACE}} 2>/dev/null || echo "(not found)"
+
+        echo ""
+        echo "=== Split Sessions ==="
+        kubectl get mirrordclustersplitsessions -A 2>/dev/null || echo "(none)"
+
+        echo ""
+        echo "=== Redis Queue Depth ==="
+        if [ -z "$POD" ]; then
+          echo "(redis-main pod not running)"
+        else
+          WAIT=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli LLEN "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" 2>/dev/null || echo 0)
+          ACTIVE=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli LLEN "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:active" 2>/dev/null || echo 0)
+          DELAYED=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli ZCARD "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:delayed" 2>/dev/null || echo 0)
+          printf "%-30s %s\n" "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" "$WAIT"
+          printf "%-30s %s\n" "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:active" "$ACTIVE"
+          printf "%-30s %s\n" "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:delayed" "$DELAYED"
+          echo ""
+          echo "Temp queues (mirrord-tmp-*):"
+          KEYS=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli KEYS "{{.BULLMQ_PREFIX}}:mirrord-tmp-*:wait" 2>/dev/null || true)
+          if [ -z "$KEYS" ]; then
+            echo "  (none)"
+          else
+            for k in $KEYS; do
+              DEPTH=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli LLEN "$k" 2>/dev/null || echo 0)
+              printf "  %-50s %s\n" "$k" "$DEPTH"
+            done
+          fi
+        fi
+
+  test:split:status:
+    desc: "Alias for status"
+    cmds:
+      - task: status
+
+  test:split:cleanup:
+    desc: "Delete all split sessions"
+    cmds:
+      - echo "Deleting split sessions..."
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || echo "(none)"
+      - echo "Done. Re-run task bullmq:status to verify."
+
+  port-forward:
+    desc: "Port-forward cluster Redis to localhost for redis-cli"
+    cmds:
+      - |
+        echo "Forwarding redis-main.{{.REDIS_NAMESPACE}} -> 127.0.0.1:{{.LOCAL_PORT}}"
+        echo ""
+        echo "Connect with:"
+        echo "  redis-cli -h 127.0.0.1 -p {{.LOCAL_PORT}}"
+        echo ""
+        echo "Inspect queue state:"
+        echo "  redis-cli -h 127.0.0.1 -p {{.LOCAL_PORT}} LLEN {{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait"
+        echo "  redis-cli -h 127.0.0.1 -p {{.LOCAL_PORT}} KEYS '{{.BULLMQ_PREFIX}}:*'"
+        echo ""
+        echo "Press Ctrl+C to stop the port-forward."
+        kubectl port-forward -n {{.REDIS_NAMESPACE}} svc/redis-main {{.LOCAL_PORT}}:6379
+
+  run:
+    desc: "Deploy everything and run local consumer"
+    cmds:
+      - task: deploy
+      - task: run:local
+
+  clean:
+    desc: "Remove BullMQ test resources"
+    cmds:
+      - kubectl delete -f {{.OVERLAY_DIR}}/split-config.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY_DIR}}/property-list.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY_DIR}}/consumer.yaml --ignore-not-found=true
+
+  _apply:split-crds:
+    internal: true
+    desc: "Apply queue-splitting CRDs from the local operator chart"
+    cmds:
+      - |
+        echo "Applying CRDs from operator chart..."
+        helm template mirrord-operator {{.CHARTS_DIR}} \
+          -f {{.ROOT_DIR}}/operator-values.yaml \
+          -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -

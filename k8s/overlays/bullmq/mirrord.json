@@ -1,0 +1,20 @@
+{
+  "target": {
+    "path": "deployment/bullmq-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "experimental": {
+    "sip_utils": false
+  },
+  "feature": {
+    "split_queues": {
+      "orders-queue": {
+        "queue_type": "BullMQ",
+        "message_filter": {
+          "tenant": "^test"
+        }
+      }
+    }
+  }
+}

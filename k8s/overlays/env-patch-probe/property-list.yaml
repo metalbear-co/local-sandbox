@@ -1,0 +1,9 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: env-patch-probe-config
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: connection_string
+    value: "Endpoint=sb://servicebus-emulator.servicebus-emulator.svc.cluster.local;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true"

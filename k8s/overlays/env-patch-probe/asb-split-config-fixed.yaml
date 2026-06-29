@@ -1,0 +1,28 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: env-patch-probe-asb
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: env-patch-probe
+  clientConfigs:
+    azureServiceBus: asb-config
+  queues:
+    # The fix for the "broken" config: the subscription now carries a `fallback`
+    # with the real subscription name, so it resolves even though the pod does
+    # not set SERVICEBUS_SUBSCRIPTION_NAME. Resolution now succeeds (look for the
+    # "Resolved Azure Service Bus params" debug line), and the session proceeds to
+    # the broker - which then fails to reach the fake namespace in the property
+    # list. That later failure is the proof that resolution itself passed.
+    - id: reward-point-balance-changed
+      kind: azureServiceBus
+      appConfig:
+        topic:
+          - env: TOPIC
+            fallback: "capitalontap.messaging.contracts.rewards/irewardpointbalancechangedevent"
+        subscription:
+          - env: SERVICEBUS_SUBSCRIPTION_NAME
+            fallback: "Development UK"

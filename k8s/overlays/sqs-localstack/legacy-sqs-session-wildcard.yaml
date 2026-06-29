@@ -1,0 +1,13 @@
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordSQSSession
+metadata:
+  name: wildcard-repro.sqs-consumer.deployment
+  namespace: test-mirrord
+spec:
+  sessionId: deadbeefdeadbeef
+  queueConsumer:
+    name: sqs-consumer
+    workloadType: Deployment
+  queueFilters:
+    "*":
+      tenant: "^Avi\\."

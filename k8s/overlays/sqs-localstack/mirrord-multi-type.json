@@ -1,0 +1,23 @@
+{
+  "target": {
+    "path": "deployment/sqs-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "test-queue": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "tenant": "^Avi\\."
+        }
+      },
+      "kafka-topic": {
+        "queue_type": "Kafka",
+        "message_filter": {
+          "user_id": "test-user"
+        }
+      }
+    }
+  }
+}
