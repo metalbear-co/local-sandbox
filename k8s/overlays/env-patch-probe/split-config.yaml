@@ -1,0 +1,31 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: env-patch-probe-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: env-patch-probe
+  clientConfigs:
+    azureServiceBus: env-patch-probe-config
+  queues:
+  - id: probe-topic
+    kind: azureServiceBus
+    appConfig:
+      # Topic: the operator only needs to KNOW the name. A throwaway `env` plus a
+      # `fallback` is enough - the operator never has to read it back from a real
+      # pod env var. `test-topic` is a real topic in the emulator so a temporary
+      # subscription can be created on it.
+      topic:
+      - env: TOPIC
+        fallback: test-topic
+      # Subscription: same env+fallback shape, but `env` must be the name the app
+      # would actually consume (here the .NET key Service__ServiceName). The
+      # operator adds this var when it patches the workload, so after a session
+      # starts the probe should print it set to the temporary subscription name
+      # instead of <unset>. `test-sub` is the real subscription in the emulator.
+      subscription:
+      - env: Service__ServiceName
+        fallback: test-sub

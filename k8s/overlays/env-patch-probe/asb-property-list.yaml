@@ -1,0 +1,16 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: asb-config
+  namespace: test-mirrord
+spec:
+  # This points at a namespace that does not exist. That is on purpose: the
+  # resolution step this test exercises runs entirely inside the operator and
+  # never contacts Azure, so the broker connection details do not matter. With
+  # the "broken" split config the session fails before the broker is touched;
+  # with the "fixed" one resolution succeeds and the session then fails later
+  # trying to reach this fake namespace - which is exactly how you can tell
+  # resolution passed.
+  properties:
+    - name: fully_qualified_namespace
+      value: does-not-exist.servicebus.windows.net

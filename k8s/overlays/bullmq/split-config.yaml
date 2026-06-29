@@ -1,0 +1,18 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: bullmq-test-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: bullmq-consumer
+  clientConfigs:
+    bullMq: bullmq-config
+  queues:
+  - id: orders-queue
+    kind: bullMq
+    appConfig:
+      queue:
+      - env: BULLMQ_QUEUE

@@ -571,6 +571,50 @@ task pubsub:test:reconnect
 task pubsub:send:flood COUNT=50
 ```
 
+### BullMQ Queue Splitting
+
+BullMQ uses Redis lists and hashes as a persistent job queue. The operator's BullMQ
+forwarder dequeues jobs via `BLPOP` on the source queue, inspects the job data JSON,
+and routes matching jobs to temporary queues for the local consumer.
+
+```bash
+# Fresh cluster with BullMQ from scratch
+task test:bullmq:clean
+
+# Deploy Redis + consumer + CRDs (operator must be installed)
+task bullmq:deploy
+
+# Build the Go consumer image and load into minikube
+task bullmq:build
+
+# Run consumer locally with mirrord (tenant=^test filter)
+task bullmq:run:local
+
+# Enqueue test jobs
+task bullmq:enqueue:match               # tenant=test (routed to local consumer)
+task bullmq:enqueue:nomatch             # tenant=other (stays on cluster consumer)
+task bullmq:enqueue:both                 # one of each
+task bullmq:enqueue TENANT="custom" DATA="payload"   # custom job
+
+# Port-forward Redis for redis-cli inspection
+task bullmq:port-forward
+
+# Show queue depths, split sessions, temp queues
+task bullmq:status
+
+# Automated split test (deploy, start session, enqueue, verify routing)
+task bullmq:test:split
+
+# Delete split sessions
+task bullmq:test:split:cleanup
+
+# Remove all BullMQ resources
+task bullmq:clean
+
+# Run the e2e tests (from the operator/ directory)
+cargo test -p tests -- --ignored bullmq --nocapture
+```
+
 ### Multi-Cluster GCP Pub/Sub Queue Splitting
 
 Multi-cluster Pub/Sub splitting runs across a primary (management) cluster and one or two

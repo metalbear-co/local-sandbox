@@ -1,0 +1,28 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: env-patch-probe-sqs
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sqs-fallback-consumer
+  # 0 = skip the drain entirely: as soon as the session ends, the operator
+  # removes the workload patch and QUEUE_NAME reverts right away. Good for a
+  # clear demo. Leave it unset (or use a positive value) if you want to drain
+  # leftover messages before reverting.
+  drainTimeout: 0
+  queues:
+  - id: probe-sqs
+    kind: sqs
+    appConfig:
+      # Same env+fallback shape as the Azure case, but for SQS. QUEUE_NAME is NOT
+      # set on the deployment (see sqs-consumer-fallback.yaml), so resolution
+      # falls back to `TestQueue` - the real source queue in LocalStack. The
+      # operator creates the temporary split queues and patches QUEUE_NAME onto
+      # the workload (added, since it was absent), so the consumer reads the
+      # mirrord temp queue while a session runs.
+      queue:
+      - env: QUEUE_NAME
+        fallback: TestQueue

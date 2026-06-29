@@ -1,0 +1,53 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: common-variables
+  namespace: test-mirrord
+data:
+  # Stand-in for the customer's `common-variables` ConfigMap pulled in via
+  # envFrom. Its contents do not matter for the test; what matters is that the
+  # ConfigMap exists, because a missing envFrom ConfigMap makes the operator
+  # fail the whole container's env resolution (a different error than the one we
+  # are chasing).
+  SOME_SHARED_VALUE: "from-common-variables"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: env-patch-probe
+  namespace: test-mirrord
+  labels:
+    app: env-patch-probe
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: env-patch-probe
+  template:
+    metadata:
+      labels:
+        app: env-patch-probe
+    spec:
+      containers:
+      # Named `main` to match the customer's container, so the mirrord target
+      # `container: main` resolves against the same shape.
+      - name: main
+        image: env-patch-probe:local
+        imagePullPolicy: Never
+        # Mirrors the customer's deployment: the subscription name comes from a
+        # real pod env var named `Service.ServiceName` (note the dot - that is
+        # exactly how they set it). The split config points the subscription at
+        # this same variable with no fallback, so this is a 1:1 reproduction. If
+        # the operator still reports "no resource name resolved" with this set, it
+        # cannot read an env var whose name contains a dot, which would be the bug.
+        env:
+        - name: Service.ServiceName
+          value: Prelive-BillPay.Handlers.Bus
+        - name: WATCH_ENV
+          value: "Service.ServiceName,Service__ServiceName,TOPIC,SERVICEBUS_SUBSCRIPTION_NAME,QUEUE_NAME"
+        # Matches the customer's deployment, which pulls shared config in via
+        # envFrom. The literal `Service.ServiceName` above still wins for that
+        # key; this just makes the container's env shape identical to theirs.
+        envFrom:
+        - configMapRef:
+            name: common-variables

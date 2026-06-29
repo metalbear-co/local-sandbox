@@ -9,6 +9,11 @@ vars:
   EMULATOR_NAMESPACE: "servicebus-emulator"
   QUEUE: '{{.QUEUE | default "test-queue"}}'
   OVERLAY_DIR: "{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator"
+  # The operator e2e tests deploy their own emulator manifest, which differs
+  # from the local-sandbox overlay: it binds hostPort 5672/5300 so operators on
+  # every cluster can reach the emulator, and it creates the namespace. Reset
+  # against this one when you are debugging the `azure_service_bus_*` e2e tests.
+  E2E_MANIFEST: "{{.ROOT_DIR}}/../operator/tests/emulators/azure-servicebus.yaml"
   CONN_STR: "Endpoint=sb://servicebus-emulator.servicebus-emulator.svc.cluster.local;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true"
 
 tasks:
@@ -25,9 +30,9 @@ tasks:
     cmds:
       - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
-      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
-      - task: _wait:sql-edge
-      - task: _wait:emulator
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.OVERLAY_DIR}}/servicebus-emulator.yaml"
 
   deploy:
     desc: "Deploy emulator + consumer pod + CRDs (for manual testing)"
@@ -36,9 +41,9 @@ tasks:
       - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
-      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
-      - task: _wait:sql-edge
-      - task: _wait:emulator
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.OVERLAY_DIR}}/servicebus-emulator.yaml"
       - kubectl apply -f {{.OVERLAY_DIR}}/consumer.yaml
       - task: _wait:consumer
       - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
@@ -117,9 +122,9 @@ tasks:
       - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
-      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
-      - task: _wait:sql-edge
-      - task: _wait:emulator
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.OVERLAY_DIR}}/servicebus-emulator.yaml"
       - kubectl apply -f {{.OVERLAY_DIR}}/consumer-topic.yaml
       - task: _wait:topic-consumer
       - kubectl apply -f {{.OVERLAY_DIR}}/property-list.yaml
@@ -605,9 +610,9 @@ tasks:
       - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl create namespace {{.EMULATOR_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl apply -f {{.OVERLAY_DIR}}/namespace.yaml
-      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
-      - task: _wait:sql-edge
-      - task: _wait:emulator
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.OVERLAY_DIR}}/servicebus-emulator.yaml"
       - kubectl apply -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml
       - echo "Waiting for multi-queue consumer..."
       - kubectl wait --for=condition=ready pod -l app=servicebus-multi-consumer -n {{.NAMESPACE}} --timeout=120s
@@ -1243,9 +1248,9 @@ tasks:
       - echo "Bouncing emulator pods..."
       - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator --wait=true 2>/dev/null || true
       - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} azure-sql-edge --wait=true 2>/dev/null || true
-      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
-      - task: _wait:sql-edge
-      - task: _wait:emulator
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.OVERLAY_DIR}}/servicebus-emulator.yaml"
       - echo ""
       - echo "Rebuilding consumer image..."
       - task: build
@@ -1268,15 +1273,22 @@ tasks:
       - echo "Reset complete. Emulator, consumers, and CRDs are fresh."
 
   reset:emulator:
-    desc: "Restart the emulator pods to clear all accumulated state"
+    desc: "Clean leftover split CRDs and restart the emulator pods for a fresh state"
     cmds:
-      - echo "Bouncing emulator pods..."
-      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator --wait=true 2>/dev/null || true
-      - kubectl delete pod -n {{.EMULATOR_NAMESPACE}} azure-sql-edge --wait=true 2>/dev/null || true
-      - kubectl apply -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml
-      - task: _wait:sql-edge
-      - task: _wait:emulator
+      - task: _clean:split:crds
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.OVERLAY_DIR}}/servicebus-emulator.yaml"
       - echo "Emulator reset complete."
+
+  reset:emulator:e2e:
+    desc: "Clean leftover split CRDs and redeploy the emulator using the operator e2e manifest (hostPort + namespace)"
+    cmds:
+      - task: _clean:split:crds
+      - task: _deploy:emulator:amd64
+        vars:
+          MANIFEST: "{{.E2E_MANIFEST}}"
+      - echo "E2E emulator reset complete."
 
   logs:
     desc: "Show Service Bus consumer logs (target pod)"
@@ -1373,6 +1385,61 @@ tasks:
       - kubectl delete -f {{.OVERLAY_DIR}}/consumer-multi-queue.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY_DIR}}/servicebus-emulator.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete namespace {{.EMULATOR_NAMESPACE}} --ignore-not-found=true
+
+  _clean:split:crds:
+    internal: true
+    # Wipe leftover queue-splitting CRDs before recreating the emulator. The
+    # emulator reset throws away its queues, so any MirrordClusterExternalResource
+    # still pointing at a temp queue would block the next test: the operator can
+    # never finish deleting a queue that no longer exists, so its finalizer never
+    # clears and the next test's "clean slate" setup gate hangs forever. We strip
+    # the finalizers first so the delete actually goes through, then remove the
+    # split sessions and workload patch requests that reference them.
+    cmds:
+      - |
+        set +e
+        echo "Cleaning leftover queue-splitting CRDs..."
+        for r in $(kubectl get mirrordclusterexternalresources -o name 2>/dev/null); do
+          kubectl patch "$r" --type=json -p='[{"op":"remove","path":"/metadata/finalizers"}]' >/dev/null 2>&1
+        done
+        kubectl delete mirrordclustersplitsessions --all -A >/dev/null 2>&1
+        kubectl delete mirrordclusterexternalresources --all >/dev/null 2>&1
+        kubectl delete mirrordclusterworkloadpatchrequests --all -A >/dev/null 2>&1
+        echo "  done."
+
+  _deploy:emulator:amd64:
+    internal: true
+    # On Apple Silicon the cluster node is arm64, so by default it pulls the
+    # arm64 build of the Service Bus emulator. That build's management gateway
+    # is broken: it cannot create or delete the temporary queues that queue
+    # splitting needs and crashes with "q.qm not found", so every split session
+    # fails to start. The amd64 build (the same one CI runs) does not have this
+    # bug and runs fine here through Rosetta. Kubernetes has no per-pod platform
+    # field, so the only way to force amd64 on an arm64 node is to reference the
+    # image by its amd64 manifest digest. We resolve that digest at deploy time
+    # so we always track the current "latest" amd64 build.
+    requires:
+      vars: [MANIFEST]
+    cmds:
+      - |
+        set -euo pipefail
+        amd64_digest() {
+          docker manifest inspect "$1" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(m["digest"] for m in d["manifests"] if m["platform"]["architecture"]=="amd64" and m["platform"]["os"]=="linux"))'
+        }
+        echo "Resolving amd64 image digests..."
+        EMU_DIGEST=$(amd64_digest mcr.microsoft.com/azure-messaging/servicebus-emulator:latest)
+        SQL_DIGEST=$(amd64_digest mcr.microsoft.com/azure-sql-edge:latest)
+        echo "  emulator amd64: ${EMU_DIGEST}"
+        echo "  sql-edge amd64: ${SQL_DIGEST}"
+        echo "Bouncing emulator pods..."
+        kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator azure-sql-edge --wait=true --ignore-not-found=true
+        echo "Applying {{.MANIFEST}} pinned to the amd64 build..."
+        sed -e "s#mcr.microsoft.com/azure-messaging/servicebus-emulator:latest#mcr.microsoft.com/azure-messaging/servicebus-emulator@${EMU_DIGEST}#" \
+            -e "s#mcr.microsoft.com/azure-sql-edge:latest#mcr.microsoft.com/azure-sql-edge@${SQL_DIGEST}#" \
+            "{{.MANIFEST}}" | kubectl apply -f -
+      - task: _wait:sql-edge
+      - task: _wait:emulator
 
   _wait:sql-edge:
     internal: true

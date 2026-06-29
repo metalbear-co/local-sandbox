@@ -7,6 +7,7 @@ operator:
   azureServiceBusSplitting: true
   redisPubsubSplitting: true
   temporalSplitting: true
+  bullmqSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true

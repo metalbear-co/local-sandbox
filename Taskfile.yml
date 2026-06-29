@@ -43,8 +43,14 @@ includes:
   servicebus:
     taskfile: ./tasks/Taskfile.servicebus.yml
     dir: ./tasks
+  envpatch:
+    taskfile: ./tasks/Taskfile.envpatch.yml
+    dir: ./tasks
   temporal:
     taskfile: ./tasks/Taskfile.temporal.yml
+    dir: ./tasks
+  bullmq:
+    taskfile: ./tasks/Taskfile.bullmq.yml
     dir: ./tasks
   eks:
     taskfile: ./tasks/Taskfile.eks.yml
@@ -1427,6 +1433,30 @@ tasks:
       - task: license:create:secret
       - task: operator:install:nobuild
       - task: temporal:deploy
+
+  test:bullmq:
+    desc: "Deploy Redis + BullMQ consumer and install operator"
+    deps: [operator:install]
+    cmds:
+      - task: bullmq:deploy
+
+  test:bullmq:clean:
+    desc: "Clean cluster and deploy BullMQ from scratch"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: operator:install
+      - task: bullmq:deploy
+
+  test:bullmq:clean:nobuild:
+    desc: "Clean cluster and deploy BullMQ (skip operator build)"
+    cmds:
+      - task: cluster:delete
+      - task: cluster:create
+      - task: bullmq:build
+      - task: license:create:secret
+      - task: operator:install:nobuild
+      - task: bullmq:deploy
 
   test:pubsub:clean:
     desc: "Clean cluster and deploy Pub/Sub from scratch"

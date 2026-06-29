@@ -1,0 +1,28 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: env-patch-probe-asb
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: env-patch-probe
+  clientConfigs:
+    azureServiceBus: asb-config
+  queues:
+    # 1:1 copy of the customer's queue entry shape: the subscription reads the
+    # real pod env var `Service.ServiceName` (with a dot) and has no fallback, and
+    # the topic uses the `dummy` placeholder env with the real name in `fallback`.
+    # The matching deployment.yaml sets `Service.ServiceName`, so resolution
+    # SHOULD succeed and the session should instead fail later reaching the fake
+    # namespace. If it still reports "no resource name resolved", the operator
+    # cannot read an env var whose name contains a dot - that would be the bug.
+    - id: reward-point-balance-changed
+      kind: azureServiceBus
+      appConfig:
+        subscription:
+          - env: Service.ServiceName
+        topic:
+          - env: dummy
+            fallback: "capitalontap.messaging.contracts.rewards~irewardpointbalancechangedevent"

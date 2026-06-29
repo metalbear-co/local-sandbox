@@ -77,6 +77,20 @@ spec:
       - name: temporal
         image: temporalio/auto-setup:1.24.2
         env:
+        # Bind the frontend gRPC on all interfaces. Without this the auto-setup
+        # image binds to the pod IP only, so pod-to-pod traffic works but a
+        # host `kubectl port-forward` (which targets the pod's loopback) hits
+        # nothing and the client fails with "error reading server preface: EOF".
+        # The e2e WorkflowStarter reaches Temporal through such a port-forward.
+        - name: BIND_ON_IP
+          value: "0.0.0.0"
+        # When binding on all interfaces, ringpop membership cannot guess which
+        # address to advertise to other services and refuses to start. Give it
+        # the pod IP explicitly so cluster membership still works.
+        - name: TEMPORAL_BROADCAST_ADDRESS
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
         - name: DB
           value: postgres12
         - name: DB_PORT
