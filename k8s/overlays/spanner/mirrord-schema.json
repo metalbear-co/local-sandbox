@@ -1,0 +1,36 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "spanner-consumer"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "spanner-dev-branch",
+        "type": "spanner",
+        "version": "1.5.23",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "params": {
+            "project": "SPANNER_PROJECT_ID",
+            "instance": "SPANNER_INSTANCE_ID",
+            "database_id": "SPANNER_DATABASE_ID"
+          }
+        },
+        "copy": {
+          "mode": "schema"
+        }
+      }
+    ]
+  }
+}

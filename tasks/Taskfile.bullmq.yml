@@ -157,14 +157,28 @@ tasks:
           printf "%-30s %s\n" "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:active" "$ACTIVE"
           printf "%-30s %s\n" "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:delayed" "$DELAYED"
           echo ""
-          echo "Temp queues (mirrord-tmp-*):"
-          KEYS=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli KEYS "{{.BULLMQ_PREFIX}}:mirrord-tmp-*:wait" 2>/dev/null || true)
-          if [ -z "$KEYS" ]; then
-            echo "  (none)"
+          echo "Source job hashes (should only be 'id' counter):"
+          SRC_KEYS=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli KEYS "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:*" 2>/dev/null || true)
+          LEAKED=$(echo "$SRC_KEYS" | grep -v -E ':(wait|active|delayed|id|meta|stalled)$' | grep -v '^$' || true)
+          if [ -z "$LEAKED" ]; then
+            echo "  (clean - no orphan job hashes)"
           else
-            for k in $KEYS; do
-              DEPTH=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli LLEN "$k" 2>/dev/null || echo 0)
-              printf "  %-50s %s\n" "$k" "$DEPTH"
+            COUNT=$(echo "$LEAKED" | wc -l | tr -d ' ')
+            echo "  $COUNT orphan job hash(es) leaked:"
+            echo "$LEAKED" | head -10 | sed 's/^/    /'
+            if [ "$COUNT" -gt 10 ]; then echo "    ... and $((COUNT - 10)) more"; fi
+          fi
+          echo ""
+          echo "Temp queues (mirrord-tmp-*):"
+          KEYS=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli KEYS "{{.BULLMQ_PREFIX}}:mirrord-tmp-*" 2>/dev/null || true)
+          if [ -z "$KEYS" ]; then
+            echo "  (none - no temp keys in Redis)"
+          else
+            QUEUES=$(echo "$KEYS" | sed 's|{{.BULLMQ_PREFIX}}:\([^:]*\):.*|\1|' | sort -u)
+            for q in $QUEUES; do
+              KEY_COUNT=$(echo "$KEYS" | grep -c "{{.BULLMQ_PREFIX}}:${q}:" || true)
+              WAIT=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli LLEN "{{.BULLMQ_PREFIX}}:${q}:wait" 2>/dev/null || echo 0)
+              printf "  %-50s keys=%-4s wait=%s\n" "$q" "$KEY_COUNT" "$WAIT"
             done
           fi
         fi

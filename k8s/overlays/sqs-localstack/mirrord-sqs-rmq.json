@@ -1,0 +1,26 @@
+{
+  "target": {
+    "path": "deployment/sqs-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "network": {
+      "dns": true
+    },
+    "split_queues": {
+      "test-queue": {
+        "queue_type": "SQS",
+        "message_filter": {
+          "tenant": "^Avi\\."
+        }
+      },
+      "rmq-orders": {
+        "queue_type": "RMQ",
+        "message_filter": {
+          "tenant": "^a$"
+        }
+      }
+    }
+  }
+}

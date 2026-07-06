@@ -1,0 +1,38 @@
+# Annotation playground for the broadcast-sync fix.
+#
+# Created on the primary; the operator's broadcast-sync controller pushes it to
+# the remote clusters. Toggle the annotations below to see how the sync handles
+# annotations owned by external tooling.
+#
+# - kubectl.kubernetes.io/last-applied-configuration is always stripped by the
+#   operator, so the copy on the remotes never carries it.
+# - Every other annotation is broadcast to the remotes as-is.
+#
+# Edit, then run:  task multicluster:qr:redeploy
+# Inspect with:    task multicluster:qr:check
+apiVersion: queues.mirrord.metalbear.co/v1alpha
+kind: MirrordWorkloadQueueRegistry
+metadata:
+  name: sqs-annotation-test-registry
+  namespace: test-multicluster
+  annotations:
+    # Simulates the client-side `kubectl apply` snapshot that caused the 409.
+    # The operator strips this before applying to remotes, so the sync succeeds
+    # and the remote copies do not carry it.
+    kubectl.kubernetes.io/last-applied-configuration: '{"simulated":"primary-value"}'
+
+    # A GitOps tracking annotation. Left in, it is broadcast to the remotes.
+    # Add it to multiCluster.syncIgnoredAnnotations to have it stripped instead.
+    # argocd.argoproj.io/tracking-id: "sqs-annotation-test-registry"
+
+    # A custom tooling annotation to experiment with.
+    my-tool.example.com/managed-by: "gitops"
+spec:
+  queues:
+    test-queue:
+      queueType: SQS
+      nameSource:
+        envVar: QUEUE_NAME
+  consumer:
+    name: sqs-consumer
+    workloadType: Deployment

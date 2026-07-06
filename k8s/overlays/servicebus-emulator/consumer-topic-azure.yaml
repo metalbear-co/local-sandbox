@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: servicebus-topic-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: servicebus-topic-consumer
+  template:
+    metadata:
+      labels:
+        app: servicebus-topic-consumer
+    spec:
+      # No emulator init container: the app talks to a real Azure Service Bus
+      # namespace over the internet, so there is no in-cluster service to wait for.
+      containers:
+      - name: consumer
+        image: servicebus-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: SERVICEBUS_TOPIC_NAME
+          value: "test-topic"
+        - name: SERVICEBUS_SUBSCRIPTION_NAME
+          value: "test-sub"
+        - name: SERVICEBUS_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: servicebus-azure-conn
+              key: connection_string

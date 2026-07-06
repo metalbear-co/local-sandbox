@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spanner-source
+  namespace: test-mirrord
+  labels:
+    app: spanner-source
+spec:
+  containers:
+  - name: spanner
+    image: gcr.io/cloud-spanner-emulator/emulator:1.5.23
+    ports:
+    - name: grpc
+      containerPort: 9010
+    - name: rest
+      containerPort: 9020
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spanner-source
+  namespace: test-mirrord
+spec:
+  selector:
+    app: spanner-source
+  ports:
+  # gRPC is what SPANNER_EMULATOR_HOST points the app at; REST is used by the seed step.
+  - name: grpc
+    port: 9010
+    targetPort: 9010
+  - name: rest
+    port: 9020
+    targetPort: 9020
