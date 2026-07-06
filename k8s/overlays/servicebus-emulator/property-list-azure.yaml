@@ -1,0 +1,16 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: servicebus-azure-config
+  namespace: test-mirrord
+spec:
+  properties:
+  # The operator reads the real Azure Service Bus connection string from a
+  # Secret so the SAS key never lands in a tracked manifest. Create it with:
+  #   kubectl create secret generic servicebus-azure-conn -n test-mirrord \
+  #     --from-literal=connection_string="<primaryConnectionString>"
+  - name: connection_string
+    valueFrom:
+      secretKeyRef:
+        name: servicebus-azure-conn
+        key: connection_string

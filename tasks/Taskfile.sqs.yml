@@ -247,6 +247,147 @@ tasks:
       - kubectl delete -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml --ignore-not-found=true
       - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME- 2>/dev/null || true
 
+  split:stale-queue-repro:
+    desc: "Reproduce the 'queue ... not found in resolved params' (QueueNotResolved / StartFailed 500) error via the LEGACY MirrordWorkloadQueueRegistry path. Starts session 1 while only the test-queue registry exists, so the shared split freezes on {test-queue}. Then adds a SECOND registry (orders-queue) and starts session 2, which joins the already-built split and asks for orders-queue - a queue the frozen split never created. PASS = session 2 fails with 'not found in resolved params'. Undo with sqs:split:stale-queue-repro:clean."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+      CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+    cmds:
+      # Legacy env: MirrordWorkloadQueueRegistry only, no MirrordSplitConfig. The
+      # resolver maps the registry to a config in memory, and the connect path
+      # pulls in every registry queue, so the resolved set grows as soon as a new
+      # registry appears - while the running split stays frozen on its old set.
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local {{.ROOT_DIR}}/apps/sqs-consumer"
+      - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack-legacy
+      # A real MirrordSplitConfig wins over the legacy registry and would hide the
+      # path we want to exercise, so remove any left from a prior sqs:deploy.
+      - kubectl delete mirrordsplitconfig --all -n {{.NAMESPACE}} --ignore-not-found=true
+      # orders-queue resolves from ORDERS_QUEUE_NAME; give the deployment the env
+      # and create both source queues so the setup is legitimate.
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME=OrdersQueue
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name OrdersQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      # Start from ONE registry (test-queue) and a clean operator so session 1 does
+      # a fresh init that owns exactly {test-queue}. Clearing the persisted patch
+      # request prevents the operator recovering an older split on restart.
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml --ignore-not-found=true
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/queue-registry.yaml
+      - kubectl delete mirrordclustersplitsession --all -A --ignore-not-found=true --wait=false
+      - |
+        for name in $(kubectl get mirrordclusterworkloadpatchrequest -o json 2>/dev/null \
+            | jq -r '.items[] | select(.spec.workloadRef.name=="sqs-consumer") | .metadata.name'); do
+          kubectl patch mirrordclusterworkloadpatchrequest "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+          kubectl delete mirrordclusterworkloadpatchrequest "$name" --ignore-not-found=true --wait=false 2>/dev/null || true
+        done
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - |
+        echo "waiting for the operator API to serve requests"
+        for i in $(seq 1 30); do
+          if kubectl get --raw '/apis/operator.metalbear.co/v1' >/dev/null 2>&1; then
+            echo "  operator API ready"
+            break
+          fi
+          sleep 2
+        done
+      - task: _wait:localstack
+      - task: _wait:consumer
+      - (cd apps/sqs-consumer && go build -o /tmp/sqs-consumer main.go)
+      - |
+        set -u
+        BIN="${MIRRORD_BIN:-{{.ROOT_DIR}}/../mirrord/target/aarch64-apple-darwin/debug/mirrord}"
+        S1_LOG=$(mktemp)
+        S2_LOG=$(mktemp)
+        S1_PID=""
+        S2_PID=""
+        cleanup() {
+          [ -n "$S1_PID" ] && kill "$S1_PID" 2>/dev/null || true
+          [ -n "$S2_PID" ] && kill "$S2_PID" 2>/dev/null || true
+          wait 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        echo "=== session 1: only the test-queue registry exists (log: $S1_LOG) ==="
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer > "$S1_LOG" 2>&1 &
+        S1_PID=$!
+
+        echo "waiting for session 1's split to build (owns {test-queue})"
+        READY=""
+        for i in $(seq 1 45); do
+          if ! kill -0 "$S1_PID" 2>/dev/null; then
+            echo "session 1 died before its split built:"
+            cat "$S1_LOG"
+            exit 1
+          fi
+          READY=$(kubectl get mirrordclustersplitsession -n {{.NAMESPACE}} \
+            -o jsonpath='{range .items[*]}{.status.ready.tmpResources[*].queueId}{"\n"}{end}' 2>/dev/null \
+            | tr ' ' '\n' | grep -v '^$' | sort -u | tr '\n' ' ')
+          if echo "$READY" | grep -q 'test-queue'; then
+            break
+          fi
+          sleep 2
+        done
+        echo "session 1 resolved queues: [$READY]"
+
+        echo "=== adding the SECOND registry (orders-queue) while session 1 stays live ==="
+        kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml
+        # Give the operator's config reflector time to observe the new registry.
+        sleep 8
+
+        echo "=== session 2: registry set is now {test-queue, orders-queue} (log: $S2_LOG) ==="
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer > "$S2_LOG" 2>&1 &
+        S2_PID=$!
+
+        echo "waiting for session 2 to start or fail"
+        for i in $(seq 1 45); do
+          if ! kill -0 "$S2_PID" 2>/dev/null; then
+            break
+          fi
+          if grep -q 'not found in resolved params' "$S2_LOG"; then
+            break
+          fi
+          sleep 2
+        done
+
+        echo "-----------------------------------------------------------------"
+        echo "session 2 log (tail):"
+        tail -n 25 "$S2_LOG" || true
+        echo "-----------------------------------------------------------------"
+        if grep -q 'not found in resolved params' "$S2_LOG"; then
+          echo "PASS: reproduced QueueNotResolved - session 2 asked for orders-queue, which session 1's frozen split never created."
+          exit 0
+        fi
+        echo "FAIL: did not reproduce the error. Session 2 may have joined cleanly or the split rebuilt."
+        echo "session 1 log (tail):"
+        tail -n 15 "$S1_LOG" || true
+        exit 1
+
+  split:stale-queue-repro:clean:
+    desc: "Undo sqs:split:stale-queue-repro: remove the second registry and the ORDERS_QUEUE_NAME env, and reset split state so the next session starts fresh."
+    cmds:
+      - pkill -f /tmp/sqs-consumer 2>/dev/null || true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/sqs/queue-registry-second.yaml --ignore-not-found=true
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME- 2>/dev/null || true
+      - kubectl delete mirrordclustersplitsession --all -A --ignore-not-found=true --wait=false
+      - |
+        for name in $(kubectl get mirrordclustersplitsession -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          kubectl patch mirrordclustersplitsession "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      - |
+        for name in $(kubectl get mirrordclusterworkloadpatchrequest -o json 2>/dev/null \
+            | jq -r '.items[] | select(.spec.workloadRef.name=="sqs-consumer") | .metadata.name'); do
+          kubectl patch mirrordclusterworkloadpatchrequest "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+          kubectl delete mirrordclusterworkloadpatchrequest "$name" --ignore-not-found=true --wait=false 2>/dev/null || true
+        done
+
   split:multi-type:
     desc: "Split TWO DIFFERENT broker types (SQS test-queue + Kafka kafka-topic) for one workload in a single session, using one MirrordSplitConfig listing both kinds. Prints the resulting QueueSplit and MirrordClusterSplitSession so you can SEE which kinds actually land in one session."
     dir: '{{.ROOT_DIR}}'
@@ -344,6 +485,437 @@ tasks:
     cmds:
       - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config.yaml
       - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} KAFKA_TOPIC_NAME- KAFKA_GROUP_ID- 2>/dev/null || true
+
+  split:sqs-rmq:
+    desc: "Split TWO DIFFERENT broker types (SQS test-queue + RabbitMQ orders) for one workload in a single session, using one MirrordSplitConfig listing both kinds. Brings up LocalStack and a RabbitMQ hello-world cluster, points sqs-consumer at both, and prints the resulting MirrordSplitConfig. Run 'sqs:split:sqs-rmq:session' next, then ':match' / ':unmatch'."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+      CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local {{.ROOT_DIR}}/apps/sqs-consumer"
+      - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack
+      # Bring up a RabbitMQ broker (cluster operator + hello-world cluster). The
+      # operator resolves the RMQ queue name from the pod env; sqs-consumer never
+      # actually consumes RabbitMQ, exactly like the SQS+Kafka multi-type test.
+      - kubectl apply -f "https://github.com/rabbitmq/cluster-operator/releases/download/v2.21.1/cluster-operator.yml"
+      - kubectl wait --for=condition=Available deployment/rabbitmq-cluster-operator -n rabbitmq-system --timeout=120s
+      - kubectl apply -f https://raw.githubusercontent.com/rabbitmq/cluster-operator/main/docs/examples/hello-world/rabbitmq.yaml
+      - kubectl wait --for=condition=ClusterAvailable rabbitmqcluster/{{.RMQ_CLUSTER_NAME}} -n {{.RMQ_CLUSTER_NS}} --timeout=180s
+      # Declare the RMQ source queue and create the rmq-cluster MirrordPropertyList
+      # the operator reads to declare temp queues and run the split.
+      - |
+        set -e
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        HOST="{{.RMQ_CLUSTER_NAME}}.{{.RMQ_CLUSTER_NS}}.svc"
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" declare queue --name {{.ORDERS_QUEUE}} --type classic --durable true
+        cat <<EOF | kubectl apply -f -
+        apiVersion: mirrord.metalbear.co/v1
+        kind: MirrordPropertyList
+        metadata:
+          name: rmq-cluster
+          namespace: {{.NAMESPACE}}
+        spec:
+          properties:
+            - name: scheme
+              value: amqp
+            - name: host
+              value: "$HOST"
+            - name: port
+              value: "5672"
+            - name: username
+              value: "$RMQ_USER"
+            - name: password
+              value: "$RMQ_PASS"
+            - name: vhost
+              value: "/"
+        EOF
+      # sqs-consumer already carries QUEUE_NAME (SQS). Add the RMQ queue env so the
+      # operator can resolve rmq-orders from the pod template too.
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} RABBIT_MQ_ORDERS_QUEUE={{.ORDERS_QUEUE}}
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      # One config, two kinds, same target.
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config-sqs-rmq.yaml
+      - kubectl delete mirrordclustersplitsession --all -n {{.NAMESPACE}} --ignore-not-found=true --wait=false
+      # Clear persisted recovery state for the target so the next session does a
+      # fresh init instead of rebuilding an older single-queue split.
+      - |
+        for name in $(kubectl get mirrordclusterworkloadpatchrequest -o json 2>/dev/null \
+            | jq -r '.items[] | select(.spec.workloadRef.name=="sqs-consumer") | .metadata.name'); do
+          kubectl patch mirrordclusterworkloadpatchrequest "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+          kubectl delete mirrordclusterworkloadpatchrequest "$name" --ignore-not-found=true --wait=false 2>/dev/null || true
+        done
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - |
+        echo "waiting for the operator API to serve requests"
+        for i in $(seq 1 30); do
+          if kubectl get --raw '/apis/operator.metalbear.co/v1' >/dev/null 2>&1; then
+            echo "  operator API ready"
+            break
+          fi
+          sleep 2
+        done
+      - task: _wait:localstack
+      - task: _wait:consumer
+      - echo "one MirrordSplitConfig targeting Deployment/sqs-consumer with TWO kinds:"
+      - kubectl get mirrordsplitconfig sqs-test-split-config -n {{.NAMESPACE}} -o jsonpath='{range .spec.queues[*]}{.id}{" -> "}{.kind}{"\n"}{end}'
+      - echo ""
+      - echo "next - run 'task sqs:split:sqs-rmq:session' (leave it running), then in another shell 'task sqs:split:sqs-rmq:match' and 'task sqs:split:sqs-rmq:unmatch'"
+
+  split:sqs-rmq:session:
+    desc: "Start a local mirrord session splitting BOTH SQS (test-queue) and RabbitMQ (rmq-orders) in the foreground (Ctrl-C to stop). Creates one MirrordClusterSplitSession carrying both brokers. Set MIRRORD_BIN to override the CLI."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord-sqs-rmq.json")}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
+    cmds:
+      - (cd apps/sqs-consumer && go build -o /tmp/sqs-consumer main.go)
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - |
+        BIN="${MIRRORD_BIN:-{{.ROOT_DIR}}/../mirrord/target/aarch64-apple-darwin/debug/mirrord}"
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue RABBIT_MQ_ORDERS_QUEUE={{.ORDERS_QUEUE}} MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- /tmp/sqs-consumer
+
+  split:sqs-rmq:match:
+    desc: "Send MATCHING messages to BOTH source queues so they reach the local session: SQS TestQueue with tenant=Avi.Test and RabbitMQ orders with header tenant=a. FILTERED=N per queue (default 2)."
+    vars:
+      FILTERED: '{{.FILTERED | default "2"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
+    cmds:
+      - |
+        echo "SQS TestQueue (tenant=Avi.Test -> local session):"
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "sqs-match-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' >/dev/null
+          echo "  sent sqs-match-$i"
+        done
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        echo "RabbitMQ {{.ORDERS_QUEUE}} (header tenant=a -> local session):"
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- \
+            rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+              --routing-key "{{.ORDERS_QUEUE}}" \
+              --payload "rmq-match-$i tenant=a" \
+              --properties '{"headers":{"tenant":"a"}}'
+        done
+
+  split:sqs-rmq:match:drifted:
+    desc: "Like sqs:split:sqs-rmq:match but targets the DRIFTED queues (SQS TestQueueV2 + RMQ orders-v2) created by sqs:split:sqs-rmq:drift. Use this after a drift + session restart so matching messages actually reach the re-resolved session. FILTERED=N per queue (default 2)."
+    vars:
+      FILTERED: '{{.FILTERED | default "2"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueueV2"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders-v2"}}'
+    cmds:
+      - |
+        echo "SQS $(basename {{.QUEUE_URL}}) (tenant=Avi.Test -> local session):"
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "sqs-match-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' >/dev/null
+          echo "  sent sqs-match-$i"
+        done
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        echo "RabbitMQ {{.ORDERS_QUEUE}} (header tenant=a -> local session):"
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- \
+            rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+              --routing-key "{{.ORDERS_QUEUE}}" \
+              --payload "rmq-match-$i tenant=a" \
+              --properties '{"headers":{"tenant":"a"}}'
+        done
+
+  split:sqs-rmq:unmatch:
+    desc: "Send NON-matching messages to BOTH source queues so they stay in the cluster: SQS TestQueue with tenant=Basic and RabbitMQ orders with header tenant=b. UNFILTERED=N per queue (default 2)."
+    vars:
+      UNFILTERED: '{{.UNFILTERED | default "2"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
+    cmds:
+      - |
+        echo "SQS TestQueue (tenant=Basic -> stays in cluster):"
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "sqs-unmatch-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Basic"}}' >/dev/null
+          echo "  sent sqs-unmatch-$i"
+        done
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        echo "RabbitMQ {{.ORDERS_QUEUE}} (header tenant=b -> stays in cluster):"
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- \
+            rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+              --routing-key "{{.ORDERS_QUEUE}}" \
+              --payload "rmq-unmatch-$i tenant=b" \
+              --properties '{"headers":{"tenant":"b"}}'
+        done
+
+  split:sqs-rmq:status:
+    desc: "Show the live queue-splitting status for the combined SQS+RMQ session: the resolved queues the operator reports (the 'mirrord queues' view), the persisted MirrordClusterSplitSession, and the source/temp queue depths on both brokers. Resolved queues are gathered ONCE at session start today - run this before and after a mid-session config/env change to watch them go stale (and, once the watcher lands, refresh or fail+reconnect)."
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+    cmds:
+      - echo "=== QueueSplit (the 'mirrord queues' view; only present while a session is live) ==="
+      - |
+        kubectl get queuesplits -n {{.NAMESPACE}} \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"  phase="}{.status.phase}{"  message="}{.status.message}{"\n"}{range .status.queues[*]}{"  resolved -> id="}{.id}{" kind="}{.queueType}{" queue="}{.queue}{" topic="}{.topic}{"\n"}{end}{end}' 2>/dev/null \
+          || echo "(no live session - the queuesplits API is only served while a split session runs)"
+      - echo ""
+      - echo "=== MirrordClusterSplitSession spec.queues (persisted by the connect flow) ==="
+      - kubectl get mirrordclustersplitsession -n {{.NAMESPACE}} -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{range .spec.queues[*]}{"  "}{.id}{" -> "}{.kind}{"\n"}{end}{end}' 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== SQS queues (source + mirrord-* temp) ==="
+      - |
+        for q in $(kubectl exec -n localstack deploy/localstack -- awslocal sqs list-queues --region {{.REGION}} --query 'QueueUrls[]' --output text 2>/dev/null | tr '\t' '\n'); do
+          c=$(kubectl exec -n localstack deploy/localstack -- awslocal sqs get-queue-attributes --queue-url "$q" --region {{.REGION}} --attribute-names ApproximateNumberOfMessages --output json 2>/dev/null | jq -r '.Attributes.ApproximateNumberOfMessages')
+          echo "  $(basename "$q"): ${c:-?} messages"
+        done
+      - echo ""
+      - echo "=== RabbitMQ queues (source + mirrord-* temp) ==="
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d 2>/dev/null)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d 2>/dev/null)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqctl list_queues name messages consumers 2>/dev/null || echo "  (could not list)"
+        else
+          echo "  RabbitMQ not running"
+        fi
+
+  split:sqs-rmq:drift:
+    desc: "Mid-session, change which queues the workload consumes so a FRESH resolve differs from the running split: creates new source queues (SQS TestQueueV2 + RMQ orders-v2) and repoints the consumer's QUEUE_NAME / RABBIT_MQ_ORDERS_QUEUE at them. Run sqs:split:sqs-rmq:status before and after. Today the live session stays frozen on the old queues (the bug the watcher fixes). Undo with sqs:split:sqs-rmq:drift:revert."
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      SQS_NEW: '{{.SQS_NEW | default "TestQueueV2"}}'
+      RMQ_NEW: '{{.RMQ_NEW | default "orders-v2"}}'
+    cmds:
+      - echo "creating new source queues {{.SQS_NEW}} (SQS) and {{.RMQ_NEW}} (RMQ)"
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name {{.SQS_NEW}} --region {{.REGION}} >/dev/null 2>&1 || true
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" declare queue --name {{.RMQ_NEW}} --type classic --durable true
+      - echo "repointing consumer env - QUEUE_NAME={{.SQS_NEW}}, RABBIT_MQ_ORDERS_QUEUE={{.RMQ_NEW}}"
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} QUEUE_NAME={{.SQS_NEW}} RABBIT_MQ_ORDERS_QUEUE={{.RMQ_NEW}}
+      - echo "done - a fresh resolve now targets {{.SQS_NEW}} / {{.RMQ_NEW}}. Run 'task sqs:split:sqs-rmq:status' to compare against the live session."
+
+  split:sqs-rmq:drift:revert:
+    desc: "Undo sqs:split:sqs-rmq:drift: repoint the consumer back to the original queues (QUEUE_NAME=TestQueue, RABBIT_MQ_ORDERS_QUEUE=orders) and delete the drift queues created by the drift task."
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
+      SQS_ORIG: '{{.SQS_ORIG | default "TestQueue"}}'
+      SQS_NEW: '{{.SQS_NEW | default "TestQueueV2"}}'
+      RMQ_NEW: '{{.RMQ_NEW | default "orders-v2"}}'
+    cmds:
+      - echo "repointing consumer env back to QUEUE_NAME={{.SQS_ORIG}}, RABBIT_MQ_ORDERS_QUEUE={{.ORDERS_QUEUE}}"
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} QUEUE_NAME={{.SQS_ORIG}} RABBIT_MQ_ORDERS_QUEUE={{.ORDERS_QUEUE}}
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs delete-queue --queue-url http://localhost:4566/000000000000/{{.SQS_NEW}} --region {{.REGION}} 2>/dev/null || true
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" delete queue --name {{.RMQ_NEW}} --idempotently 2>/dev/null || true
+      - echo "reverted to original queues"
+
+  split:sqs-rmq:clean:
+    desc: "Restore the single-queue SQS split config and remove the RMQ infra added by sqs:split:sqs-rmq (env, rmq-cluster property list, orders queue, mirrord-* temp queues)."
+    vars:
+      RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+      RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+      ORDERS_QUEUE: '{{.ORDERS_QUEUE | default "orders"}}'
+    cmds:
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config.yaml
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} RABBIT_MQ_ORDERS_QUEUE- 2>/dev/null || true
+      - kubectl delete mirrordpropertylist rmq-cluster -n {{.NAMESPACE}} --ignore-not-found=true
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d 2>/dev/null)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d 2>/dev/null)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" delete queue --name {{.ORDERS_QUEUE}} --idempotently 2>/dev/null || true
+          for q in $(kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqctl list_queues name --no-table-headers 2>/dev/null | grep "^mirrord-" || true); do
+            kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqctl delete_queue "$q" 2>/dev/null || true
+            echo "deleted temp queue $q"
+          done
+        fi
+      - echo "restored base SQS split config and removed RMQ infra"
+
+  split:added-queue-repro:
+    desc: "Reproduce the 'queue X not found in resolved params' (StartFailed 500) bug. Session 1 builds a split for only test-queue and stays alive; then orders-queue is ADDED to the MirrordSplitConfig; then session 2 connects and, because the connect flow now asks to split BOTH queues, it joins the still-running split and requests orders-queue, which that split never created. REPRODUCED = session 2 is rejected with the error. Undo with sqs:split:added-queue-repro:clean."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/overlays/sqs-localstack
+      - task: _wait:localstack
+      - task: _wait:consumer
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name OrdersQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      # Start from a single-queue baseline so session 1's split owns only
+      # test-queue. Re-apply the base config, drop old split sessions, and wipe
+      # the persisted workload-patch recovery state so the next session does a
+      # fresh init instead of rebuilding a wider recovered split.
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config.yaml
+      - kubectl delete mirrordclustersplitsession --all -n {{.NAMESPACE}} --ignore-not-found=true --wait=false
+      - |
+        for name in $(kubectl get mirrordclusterworkloadpatchrequest -o json 2>/dev/null \
+            | jq -r '.items[] | select(.spec.workloadRef.name=="sqs-consumer") | .metadata.name'); do
+          kubectl patch mirrordclusterworkloadpatchrequest "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+          kubectl delete mirrordclusterworkloadpatchrequest "$name" --ignore-not-found=true --wait=false 2>/dev/null || true
+        done
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - |
+        echo "waiting for the operator API to serve requests"
+        for i in $(seq 1 30); do
+          if kubectl get --raw '/apis/operator.metalbear.co/v1' >/dev/null 2>&1; then
+            echo "  operator API ready"
+            break
+          fi
+          sleep 2
+        done
+      - task: _wait:consumer
+      - |
+        BIN="${MIRRORD_BIN:-{{.ROOT_DIR}}/../mirrord/target/aarch64-apple-darwin/debug/mirrord}"
+        S1_LOG=$(mktemp)
+        S2_LOG=$(mktemp)
+        echo "session 1 log: $S1_LOG"
+        echo "session 2 log: $S2_LOG"
+
+        # The local command does not affect the split, so a plain sleep keeps the
+        # session (and therefore the shared split) alive without the consumer.
+        echo "starting session 1 (splits test-queue) and keeping it alive"
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- sleep 600 > "$S1_LOG" 2>&1 &
+        S1_PID=$!
+
+        echo "waiting for session 1's split to become ready"
+        READY=0
+        for i in $(seq 1 45); do
+          if ! kill -0 "$S1_PID" 2>/dev/null; then
+            echo "session 1 exited early:"
+            tail -n 20 "$S1_LOG"
+            exit 1
+          fi
+          READY=$(kubectl get mirrordclustersplitsession -n {{.NAMESPACE}} \
+            -o jsonpath='{range .items[*]}{.status.ready.tmpResources[*].queueId}{"\n"}{end}' 2>/dev/null \
+            | tr ' ' '\n' | grep -c 'test-queue' || true)
+          if [ "${READY:-0}" -ge 1 ]; then
+            break
+          fi
+          sleep 2
+        done
+        if [ "${READY:-0}" -lt 1 ]; then
+          echo "session 1 split never became ready:"
+          tail -n 20 "$S1_LOG"
+          kill "$S1_PID" 2>/dev/null || true
+          exit 1
+        fi
+        echo "session 1 split is live with test-queue"
+
+        # Widen the config AFTER the split exists. The running split still owns
+        # only test-queue, and the periodic re-resolve only re-checks owned
+        # queues, so it never picks up the new one.
+        echo "adding orders-queue to the MirrordSplitConfig"
+        kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config-multi-queue.yaml
+        kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME=OrdersQueue >/dev/null
+        sleep 5
+
+        # Session 2 targets the same workload. The connect flow reads the widened
+        # config and asks to split BOTH queues, then joins the existing split and
+        # requests orders-queue, which the frozen split does not have.
+        echo "starting session 2 (connect flow now requests test-queue + orders-queue)"
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          MIRRORD_CHECK_VERSION=false \
+          "$BIN" exec -f {{.MIRRORD_CONFIG}} -- sleep 30 > "$S2_LOG" 2>&1 &
+        S2_PID=$!
+
+        echo "waiting for session 2 to fail or come up"
+        for i in $(seq 1 40); do
+          if grep -q 'not found in resolved params' "$S2_LOG"; then
+            break
+          fi
+          if ! kill -0 "$S2_PID" 2>/dev/null; then
+            break
+          fi
+          sleep 2
+        done
+
+        kill "$S1_PID" "$S2_PID" 2>/dev/null || true
+        wait "$S1_PID" 2>/dev/null || true
+        wait "$S2_PID" 2>/dev/null || true
+
+        echo "================================================================="
+        echo "session 2 log (tail):"
+        tail -n 25 "$S2_LOG"
+        echo "================================================================="
+        if grep -q 'not found in resolved params' "$S2_LOG"; then
+          echo "REPRODUCED: session 2 was rejected with 'not found in resolved params' (StartFailed 500)."
+        else
+          echo "NOT reproduced: session 2 did not hit the error."
+          echo "The running split may have rebuilt with the new queue (bug fixed)."
+          exit 1
+        fi
+
+  split:added-queue-repro:clean:
+    desc: "Undo sqs:split:added-queue-repro: restore the single-queue split config, remove ORDERS_QUEUE_NAME, delete leftover split sessions and OrdersQueue."
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/sqs/split-config.yaml
+      - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME- 2>/dev/null || true
+      - kubectl delete mirrordclustersplitsession --all -n {{.NAMESPACE}} --ignore-not-found=true --wait=false
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs delete-queue --queue-url http://localhost:4566/000000000000/OrdersQueue --region {{.REGION}} 2>/dev/null || true
 
   run:local:aws:
     desc: "Run SQS consumer locally with mirrord (AWS)"

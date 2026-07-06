@@ -28,6 +28,9 @@ includes:
   redis:
     taskfile: ./tasks/Taskfile.redis.yml
     dir: ./tasks
+  spanner:
+    taskfile: ./tasks/Taskfile.spanner.yml
+    dir: ./tasks
   multicluster:
     taskfile: ./tasks/Taskfile.multicluster.yml
     dir: ./tasks
@@ -382,7 +385,6 @@ tasks:
     desc: Install all infrastructure
     cmds:
       - task: infra:argo:rollouts
-      - task: infra:loki
 
   infra:status:
     desc: Check infrastructure status

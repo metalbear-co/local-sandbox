@@ -122,6 +122,15 @@ task operator:download VERSION=3.150.0
 task mirrord:download VERSION=3.195.0
 ```
 
+### Broadcast Sync Controller [Queue Splitting]
+```bash
+task multicluster:setup:all - starts the 2 clusters + operators (already existed; MC_NUM_CLUSTERS=3 for 3).
+task multicluster:qr:deploy - applies the registry to the primary; the sync controller pushes it to the remotes.
+task multicluster:qr:redeploy - deletes then re-applies. Use this after editing annotations so removed ones actually disappear (a plain re-apply won't drop keys). This is your main "test a new annotation set" loop.
+task multicluster:qr:check - prints the registry's annotations on primary and every remote, so you can compare what got stripped vs broadcast.
+task multicluster:qr:delete - removes it everywhere.
+```
+
 ## Running Tests
 
 Each module follows the same pattern:

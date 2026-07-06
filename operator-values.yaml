@@ -12,6 +12,7 @@ operator:
   pgBranching: true
   mongodbBranching: true
   mssqlBranching: true
+  spannerBranching: true
   previewEnv: true
   preview:
     image_pull_policy: "IfNotPresent"

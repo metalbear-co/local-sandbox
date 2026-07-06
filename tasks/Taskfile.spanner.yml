@@ -1,0 +1,399 @@
+version: '3'
+
+# =============================================================================
+# Cloud Spanner Database Branching Tasks
+# =============================================================================
+#
+# QUICK START (emulator source):
+#   task operator:install     # once, to run the operator with spanner branching
+#   task spanner:deploy       # seed the source emulator + deploy the consumer pod
+#   task spanner:run:local    # branch the source and run the app under mirrord
+#
+# QUICK START (real Spanner source):
+#   Create a GCP instance and database first (see local-sandbox/k8s/spanner-real/README.md).
+#   On a GKE cluster with a Workload-Identity-bound SA (no key file needed):
+#     task spanner:real:deploy REAL_PROJECT=... REAL_INSTANCE=... REAL_DATABASE=...
+#     task spanner:run:local
+#   On local minikube (no metadata server, so mount a downloaded SA key):
+#     task spanner:real:deploy:key REAL_PROJECT=... REAL_INSTANCE=... REAL_DATABASE=... KEY_FILE=./sa-key.json
+#     task spanner:run:local
+#
+# The Spanner emulator has no init hook and its image ships no shell, so the
+# source database is seeded from the host over a short-lived `kubectl port-forward`
+# to the REST gateway rather than from inside the pod.
+#
+# For the real-Spanner path there is no emulator: the consumer pod carries the
+# real project/instance/database, and the operator reuses the same GCP credential
+# detection as Postgres/MySQL (Cloud SQL) to give the branch sidecar the app's
+# identity - the pod's service account (Workload Identity), or a mounted key file
+# when running where no metadata server exists - and copies schema/rows over the API.
+#
+# The operator e2e tests provision their own source/target, so they do not need
+# `deploy`; use `spanner:test` for those.
+# =============================================================================
+
+vars:
+  ROOT_DIR:
+    sh: cd .. && pwd
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  SPANNER_DIR: '{{.ROOT_DIR}}/k8s/spanner'
+  OPERATOR_DIR: '{{.ROOT_DIR}}/../operator'
+  GO_APP_DIR: '{{.OPERATOR_DIR}}/crates/operator-db-branching/tests/go-e2e-spanner-branching'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  # Identifiers the consumer pod (consumer.yaml) and the mirrord config both reference.
+  PROJECT: '{{.PROJECT | default "test-project"}}'
+  INSTANCE: '{{.INSTANCE | default "test-instance"}}'
+  DATABASE: '{{.DATABASE | default "test-db"}}'
+  SEED_LOCAL_PORT: '{{.SEED_LOCAL_PORT | default "19020"}}'
+
+tasks:
+  deploy:
+    desc: "Deploy the seeded Spanner source emulator and the consumer pod"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.SPANNER_DIR}}
+      - task: _wait:source
+      - task: seed
+      - task: _wait:consumer
+      - |
+        echo ""
+        echo "Spanner source ready: project={{.PROJECT}}, instance={{.INSTANCE}}, database={{.DATABASE}} (Users=3, Orders=2)."
+        echo "Consumer pod 'spanner-consumer' points at it via SPANNER_EMULATOR_HOST."
+        echo "Branch it and run the app under mirrord with:  task spanner:run:local"
+
+  seed:
+    desc: "Seed the Spanner source emulator (schema + rows) over a temporary port-forward"
+    cmds:
+      - |
+        set -e
+        BASE="http://127.0.0.1:{{.SEED_LOCAL_PORT}}"
+        DBPATH="projects/{{.PROJECT}}/instances/{{.INSTANCE}}/databases/{{.DATABASE}}"
+        echo "Port-forwarding spanner-source REST ({{.SEED_LOCAL_PORT}} -> 9020)..."
+        pkill -f "port-forward.*spanner-source.*{{.SEED_LOCAL_PORT}}:9020" 2>/dev/null || true
+        kubectl port-forward -n {{.NAMESPACE}} pod/spanner-source {{.SEED_LOCAL_PORT}}:9020 >/tmp/spanner-seed-pf.log 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null || true" EXIT
+        echo "Waiting for emulator REST..."
+        for _ in $(seq 1 60); do
+          curl -sf "$BASE/v1/projects/{{.PROJECT}}/instanceConfigs" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+        echo "Creating instance {{.INSTANCE}} (ok if it already exists)..."
+        curl -s -o /dev/null -X POST "$BASE/v1/projects/{{.PROJECT}}/instances" \
+          -H 'content-type: application/json' \
+          -d '{"instanceId":"{{.INSTANCE}}","instance":{"config":"projects/{{.PROJECT}}/instanceConfigs/emulator-config","displayName":"{{.INSTANCE}}","nodeCount":1}}'
+        echo "Creating database {{.DATABASE}} with schema (ok if it already exists)..."
+        curl -s -o /dev/null -X POST "$BASE/v1/projects/{{.PROJECT}}/instances/{{.INSTANCE}}/databases" \
+          -H 'content-type: application/json' \
+          --data-binary '{"createStatement":"CREATE DATABASE `{{.DATABASE}}`","extraStatements":["CREATE TABLE Users (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)","CREATE TABLE Orders (Id INT64 NOT NULL, UserId INT64, Total INT64) PRIMARY KEY (Id)"]}'
+        echo "Waiting for database to be ready..."
+        for _ in $(seq 1 60); do
+          curl -sf "$BASE/v1/$DBPATH" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+        SESSION=$(curl -s -X POST "$BASE/v1/$DBPATH/sessions" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+        echo "Inserting rows..."
+        curl -s -o /dev/null -X POST "$BASE/v1/$SESSION:commit" -H 'content-type: application/json' \
+          --data-binary '{"singleUseTransaction":{"readWrite":{}},"mutations":[{"insertOrUpdate":{"table":"Users","columns":["Id","Name"],"values":[["1","alice"],["2","bob"],["3","carol"]]}},{"insertOrUpdate":{"table":"Orders","columns":["Id","UserId","Total"],"values":[["10","1","500"],["11","2","250"]]}}]}'
+        echo "Seed complete: Users=3, Orders=2"
+
+  run:local:
+    desc: "Branch the source and run the Spanner app locally under mirrord (needs a locally-built mirrord CLI)"
+    vars:
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/spanner/mirrord.json")}}'
+      MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+      HOST_TRIPLE:
+        sh: rustc -vV | awk '/^host:/ {print $2}'
+      # Spanner branching is not in any released CLI yet, so default to the branch debug build.
+      # Override MIRRORD_BIN to use a different CLI.
+      MIRRORD_CLI: '{{.MIRRORD_BIN | default (print .MIRRORD_DIR "/target/" .HOST_TRIPLE "/debug/mirrord")}}'
+    preconditions:
+      - sh: test -f {{.MIRRORD_CONFIG}}
+        msg: "Config file not found at {{.MIRRORD_CONFIG}}"
+      - sh: test -x "{{.MIRRORD_CLI}}"
+        msg: "mirrord CLI not found at {{.MIRRORD_CLI}}. Build it: cd {{.MIRRORD_DIR}} && cargo build -p mirrord (or set MIRRORD_BIN)"
+    cmds:
+      - task: build:app
+      - |
+        LABEL=$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
+        APP="{{.GO_APP_DIR}}/${LABEL}.go_test_app"
+        echo "Using mirrord CLI {{.MIRRORD_CLI}}"
+        echo "Running with mirrord - config {{.MIRRORD_CONFIG}}"
+        "{{.MIRRORD_CLI}}" exec -f {{.MIRRORD_CONFIG}} -- "$APP"
+
+  run:staging:
+    desc: "Run the Spanner app against staging through your locally-run operator (needs KEY matching `cargo xtask run-operator-staging KEY`)"
+    vars:
+      MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+      HOST_TRIPLE:
+        sh: rustc -vV | awk '/^host:/ {print $2}'
+      # Spanner branching is not in any released CLI yet, so default to the branch debug build.
+      MIRRORD_CLI: '{{.MIRRORD_BIN | default (print .MIRRORD_DIR "/target/" .HOST_TRIPLE "/debug/mirrord")}}'
+      COPY_MODE: '{{.COPY_MODE | default "all"}}'
+      STAGING_NS: '{{.STAGING_NS | default "test-mirrord"}}'
+    preconditions:
+      - sh: test -n "{{.KEY}}"
+        msg: "Set KEY to the same value you passed to `cargo xtask run-operator-staging KEY` so the session routes to your operator"
+      - sh: test -x "{{.MIRRORD_CLI}}"
+        msg: "mirrord CLI not found at {{.MIRRORD_CLI}}. Build it: cd {{.MIRRORD_DIR}} && cargo build -p mirrord (or set MIRRORD_BIN)"
+    cmds:
+      - task: build:app
+      - |
+        LABEL=$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
+        APP="{{.GO_APP_DIR}}/${LABEL}.go_test_app"
+        # key + baggage route the session to the operator you started with run-operator-staging;
+        # the config is generated here because both carry the per-run KEY. mirrord requires a
+        # .json/.yaml extension, so name the temp file explicitly rather than via `mktemp -t`
+        # (which appends its own random suffix and drops the extension on macOS).
+        CFG="${TMPDIR:-/tmp}/spanner-staging-$$.json"
+        trap "rm -f $CFG" EXIT
+        cat > "$CFG" <<EOF
+        {
+          "operator": true,
+          "key": "{{.KEY}}",
+          "baggage": "mirrord-session={{.KEY}}",
+          "target": { "path": { "pod": "spanner-consumer" }, "namespace": "{{.STAGING_NS}}" },
+          "feature": {
+            "env": true,
+            "fs": "local",
+            "network": { "incoming": "off", "outgoing": true },
+            "db_branches": [
+              {
+                "id": "spanner-dev-branch",
+                "type": "spanner",
+                "version": "1.5.23",
+                "ttl_secs": 600,
+                "creation_timeout_secs": 180,
+                "connection": {
+                  "params": {
+                    "project": "SPANNER_PROJECT_ID",
+                    "instance": "SPANNER_INSTANCE_ID",
+                    "database_id": "SPANNER_DATABASE_ID"
+                  }
+                },
+                "copy": { "mode": "{{.COPY_MODE}}" }
+              }
+            ]
+          }
+        }
+        EOF
+        echo "Using mirrord CLI {{.MIRRORD_CLI}}"
+        echo "Running app against staging (ns {{.STAGING_NS}}) via operator key {{.KEY}}, copy mode {{.COPY_MODE}}"
+        "{{.MIRRORD_CLI}}" exec -f "$CFG" -- "$APP"
+
+  real:secret:
+    desc: "Create the GCP service-account key secret the branch sidecar reuses to read real Spanner"
+    vars:
+      KEY_FILE: '{{.KEY_FILE | default "sa-key.json"}}'
+      SECRET_NAME: '{{.SECRET_NAME | default "spanner-sa-key"}}'
+    preconditions:
+      - sh: test -f "{{.KEY_FILE}}"
+        msg: "Service-account key not found at {{.KEY_FILE}}. Create one (see k8s/spanner-real/README.md) or set KEY_FILE=path/to/sa-key.json"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # The secret key is always `key.json`; the consumer pod mounts it and points
+      # GOOGLE_APPLICATION_CREDENTIALS at it, and the operator propagates both to the branch.
+      - kubectl create secret generic {{.SECRET_NAME}} -n {{.NAMESPACE}} --from-file=key.json="{{.KEY_FILE}}" --dry-run=client -o yaml | kubectl apply -f -
+
+  real:deploy:
+    desc: "Deploy a consumer pod wired to a REAL Spanner DB using the cluster's Workload Identity SA (needs REAL_PROJECT/REAL_INSTANCE/REAL_DATABASE)"
+    vars:
+      # Kubernetes service account the consumer (and thus the branch) runs as. On GKE it must be
+      # bound to a Google SA that has roles/spanner.databaseReader via Workload Identity. The
+      # operator propagates this SA to the branch pod, so the copy authenticates as that identity
+      # with no key file. Pass GCP_SA to create and annotate the KSA here; otherwise it is assumed
+      # to already exist on the cluster.
+      K8S_SA: '{{.K8S_SA | default "spanner-branch-sa"}}'
+      GCP_SA: '{{.GCP_SA | default ""}}'
+    preconditions:
+      - sh: test -n "{{.REAL_PROJECT}}"
+        msg: "Set REAL_PROJECT to your GCP project id"
+      - sh: test -n "{{.REAL_INSTANCE}}"
+        msg: "Set REAL_INSTANCE to your Spanner instance id"
+      - sh: test -n "{{.REAL_DATABASE}}"
+        msg: "Set REAL_DATABASE to your Spanner database id"
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # Create/annotate the KSA only when a Google SA is supplied; otherwise reuse the one already
+      # bound on the cluster.
+      - |
+        if [ -n "{{.GCP_SA}}" ]; then
+          kubectl create serviceaccount {{.K8S_SA}} -n {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+          kubectl annotate serviceaccount {{.K8S_SA}} -n {{.NAMESPACE}} \
+            iam.gke.io/gcp-service-account={{.GCP_SA}} --overwrite
+        fi
+      - |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: spanner-consumer
+          namespace: {{.NAMESPACE}}
+          labels:
+            app: spanner-consumer
+        spec:
+          # Run as the Workload-Identity-bound SA; the operator copies this onto the branch pod so
+          # the branch reads real Spanner as the same Google identity, no key file involved.
+          serviceAccountName: {{.K8S_SA}}
+          containers:
+          - name: app
+            image: busybox
+            command: ["sh", "-c", "echo 'Spanner real consumer running' && sleep 3600"]
+            env:
+            # No SPANNER_EMULATOR_HOST here: its absence tells the operator the app talks to real
+            # Spanner (copy over ADC), and mirrord sets this var at session time to point the local
+            # app at the branch emulator. No GOOGLE_APPLICATION_CREDENTIALS either: ADC resolves via
+            # the pod's Workload Identity.
+            - name: SPANNER_PROJECT_ID
+              value: "{{.REAL_PROJECT}}"
+            - name: SPANNER_INSTANCE_ID
+              value: "{{.REAL_INSTANCE}}"
+            - name: SPANNER_DATABASE_ID
+              value: "{{.REAL_DATABASE}}"
+        EOF
+      - task: _wait:consumer
+      - |
+        echo ""
+        echo "Consumer wired to real Spanner: project={{.REAL_PROJECT}}, instance={{.REAL_INSTANCE}}, database={{.REAL_DATABASE}}."
+        echo "Running as service account '{{.K8S_SA}}' (Workload Identity); the branch inherits it to copy schema/rows."
+        echo "Branch it and run the app under mirrord with:  task spanner:run:local"
+
+  real:deploy:key:
+    desc: "Deploy a consumer pod wired to a REAL Spanner DB with a mounted SA key (for local minikube; needs REAL_PROJECT/REAL_INSTANCE/REAL_DATABASE + KEY_FILE)"
+    vars:
+      SECRET_NAME: '{{.SECRET_NAME | default "spanner-sa-key"}}'
+      # Directory the SA-key secret mounts into; the key file lands at <dir>/key.json, which is what
+      # GOOGLE_APPLICATION_CREDENTIALS points at.
+      CRED_DIR: '{{.CRED_DIR | default "/var/secrets/google"}}'
+    preconditions:
+      - sh: test -n "{{.REAL_PROJECT}}"
+        msg: "Set REAL_PROJECT to your GCP project id"
+      - sh: test -n "{{.REAL_INSTANCE}}"
+        msg: "Set REAL_INSTANCE to your Spanner instance id"
+      - sh: test -n "{{.REAL_DATABASE}}"
+        msg: "Set REAL_DATABASE to your Spanner database id"
+    cmds:
+      - task: real:secret
+      - |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          name: spanner-consumer
+          namespace: {{.NAMESPACE}}
+          labels:
+            app: spanner-consumer
+        spec:
+          containers:
+          - name: app
+            image: busybox
+            command: ["sh", "-c", "echo 'Spanner real consumer running' && sleep 3600"]
+            env:
+            # No SPANNER_EMULATOR_HOST here: its absence tells the operator the app talks to real
+            # Spanner (copy over ADC), and mirrord sets this var at session time to point the local
+            # app at the branch emulator.
+            - name: SPANNER_PROJECT_ID
+              value: "{{.REAL_PROJECT}}"
+            - name: SPANNER_INSTANCE_ID
+              value: "{{.REAL_INSTANCE}}"
+            - name: SPANNER_DATABASE_ID
+              value: "{{.REAL_DATABASE}}"
+            # The operator detects this on the target pod, then mounts the same key on the branch
+            # sidecar and points ADC at it so the copy authenticates as this service account.
+            - name: GOOGLE_APPLICATION_CREDENTIALS
+              value: "{{.CRED_DIR}}/key.json"
+            volumeMounts:
+            - name: sa-key
+              mountPath: "{{.CRED_DIR}}"
+              readOnly: true
+          volumes:
+          - name: sa-key
+            secret:
+              secretName: {{.SECRET_NAME}}
+        EOF
+      - task: _wait:consumer
+      - |
+        echo ""
+        echo "Consumer wired to real Spanner: project={{.REAL_PROJECT}}, instance={{.REAL_INSTANCE}}, database={{.REAL_DATABASE}}."
+        echo "The branch sidecar will copy its schema/rows using the mounted service-account key."
+        echo "Branch it and run the app under mirrord with:  task spanner:run:local"
+
+  real:clean:
+    desc: "Delete the real-Spanner consumer pod, its key secret and any branches"
+    vars:
+      SECRET_NAME: '{{.SECRET_NAME | default "spanner-sa-key"}}'
+    cmds:
+      - kubectl delete pod spanner-consumer -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete secret {{.SECRET_NAME}} -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete branchdatabase --all -n {{.NAMESPACE}} --ignore-not-found=true 2>/dev/null || true
+
+  query:source:
+    desc: "Run a SQL query against the source database (QUERY='SELECT * FROM Users')"
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM Users"}}'
+    cmds:
+      - |
+        set -e
+        BASE="http://127.0.0.1:{{.SEED_LOCAL_PORT}}"
+        DBPATH="projects/{{.PROJECT}}/instances/{{.INSTANCE}}/databases/{{.DATABASE}}"
+        pkill -f "port-forward.*spanner-source.*{{.SEED_LOCAL_PORT}}:9020" 2>/dev/null || true
+        kubectl port-forward -n {{.NAMESPACE}} pod/spanner-source {{.SEED_LOCAL_PORT}}:9020 >/tmp/spanner-query-pf.log 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null || true" EXIT
+        for _ in $(seq 1 60); do curl -sf "$BASE/v1/$DBPATH" >/dev/null 2>&1 && break; sleep 0.5; done
+        SESSION=$(curl -s -X POST "$BASE/v1/$DBPATH/sessions" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+        curl -s -X POST "$BASE/v1/$SESSION:executeSql" -H 'content-type: application/json' \
+          --data-binary "{\"sql\":\"{{.QUERY}}\"}"
+        echo ""
+
+  status:
+    desc: "Show the Spanner sandbox status"
+    cmds:
+      - echo "=== Source + consumer pods ==="
+      - kubectl get pod -n {{.NAMESPACE}} -l app=spanner-source -o wide 2>/dev/null || echo "no source"
+      - kubectl get pod -n {{.NAMESPACE}} -l app=spanner-consumer -o wide 2>/dev/null || echo "no consumer"
+      - echo ""
+      - echo "=== Branch databases ==="
+      - kubectl get branchdatabase -n {{.NAMESPACE}} 2>/dev/null || echo "no branches"
+
+  clean:
+    desc: "Delete the Spanner sandbox resources (source, consumer, branches)"
+    cmds:
+      - kubectl delete -k {{.SPANNER_DIR}} --ignore-not-found=true
+      - kubectl delete branchdatabase --all -n {{.NAMESPACE}} --ignore-not-found=true 2>/dev/null || true
+
+  build:app:
+    desc: "Build the Spanner e2e Go verification app for the local Go version"
+    cmds:
+      # The tests load the app by Go minor version (GoVersion::LATEST -> `26.go_test_app`), so name
+      # the binary after the local Go, matching scripts/prepare_e2e.sh.
+      - |
+        LABEL=$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
+        cd "{{.GO_APP_DIR}}"
+        echo "Building Spanner Go test app: $(pwd)/${LABEL}.go_test_app"
+        go build -o "${LABEL}.go_test_app"
+
+  test:
+    desc: "Build the Go app and run the Spanner operator e2e tests (needs operator installed)"
+    deps: [build:app]
+    cmds:
+      # `--skip binary` leaves out the testcontainers-only tests; the operator tests run serially
+      # because they share one source emulator pod on a fixed namespace.
+      - cd "{{.OPERATOR_DIR}}" && cargo test -p operator-db-branching --test spanner -- --test-threads=1 --nocapture --skip binary
+
+  test:nobuild:
+    desc: "Run the Spanner operator e2e tests without rebuilding the Go app"
+    cmds:
+      - cd "{{.OPERATOR_DIR}}" && cargo test -p operator-db-branching --test spanner -- --test-threads=1 --nocapture --skip binary
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for spanner-source pod..."
+      - kubectl wait --for=condition=ready pod -l app=spanner-source -n {{.NAMESPACE}} --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for spanner-consumer pod..."
+      - kubectl wait --for=condition=ready pod -l app=spanner-consumer -n {{.NAMESPACE}} --timeout=60s

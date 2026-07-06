@@ -3374,6 +3374,45 @@ tasks:
           kubectl --context {{.REMOTE_CLUSTER_2}} get mirrordworkloadqueueregistries -A
         fi
 
+  qr:deploy:
+    desc: Apply the annotation-test queue registry to the primary (sync controller pushes it to remotes). Edit annotations in k8s/overlays/multicluster-sqs/queue-registry-annotations.yaml first.
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry-annotations.yaml
+      - 'echo "Applied to {{.PRIMARY_CLUSTER}}. Inspect with: task multicluster:qr:check"'
+
+  qr:redeploy:
+    desc: Delete then re-apply the annotation-test registry so removed annotations actually go away (clean slate for a new annotation set)
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry-annotations.yaml --ignore-not-found=true
+      - echo "Waiting for the sync controller to remove it from remotes..."
+      - sleep 5
+      - kubectl --context {{.PRIMARY_CLUSTER}} apply -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry-annotations.yaml
+      - 'echo "Re-applied. Inspect with: task multicluster:qr:check"'
+
+  qr:check:
+    desc: Show the annotation-test registry and its annotations on every cluster
+    cmds:
+      - |
+        NAME=sqs-annotation-test-registry
+        NS=test-multicluster
+        show() {
+          echo "=== $1 ($2) ==="
+          kubectl --context "$2" -n "$NS" get mirrordworkloadqueueregistry "$NAME" \
+            -o jsonpath='{.metadata.annotations}' 2>/dev/null | jq . 2>/dev/null \
+            || echo "(not found)"
+          echo ""
+        }
+        show PRIMARY {{.PRIMARY_CLUSTER}}
+        show REMOTE-1 {{.REMOTE_CLUSTER_1}}
+        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
+          show REMOTE-2 {{.REMOTE_CLUSTER_2}}
+        fi
+
+  qr:delete:
+    desc: Delete the annotation-test registry from the primary (sync controller removes it from remotes)
+    cmds:
+      - kubectl --context {{.PRIMARY_CLUSTER}} delete -f {{.K8S_DIR}}/overlays/multicluster-sqs/queue-registry-annotations.yaml --ignore-not-found=true
+
   sqs:delete:
     desc: Delete SQS resources from all clusters
     cmds:

@@ -1,0 +1,25 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  # Same name as the base sqs-test-split-config so applying this overwrites it,
+  # keeping a single config per target.
+  name: sqs-test-split-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sqs-consumer
+  queues:
+    # One config, two DIFFERENT broker kinds for the same workload.
+    - id: test-queue
+      kind: sqs
+      appConfig:
+        queue:
+          - env: QUEUE_NAME
+    - id: rmq-orders
+      kind: rmq
+      clientConfig: rmq-cluster
+      appConfig:
+        queue:
+          - env: RABBIT_MQ_ORDERS_QUEUE

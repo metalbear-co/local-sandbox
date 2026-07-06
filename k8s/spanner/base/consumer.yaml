@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spanner-consumer
+  namespace: test-mirrord
+  labels:
+    app: spanner-consumer
+spec:
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Spanner consumer running' && sleep 3600"]
+    env:
+    # Points the Spanner client at the source emulator. mirrord overrides this to the branch
+    # emulator during a session; the operator reads its value here to find the source to copy.
+    - name: SPANNER_EMULATOR_HOST
+      value: "spanner-source.test-mirrord.svc.cluster.local:9010"
+    - name: SPANNER_PROJECT_ID
+      value: "test-project"
+    - name: SPANNER_INSTANCE_ID
+      value: "test-instance"
+    - name: SPANNER_DATABASE_ID
+      value: "test-db"
