@@ -1137,6 +1137,78 @@ tasks:
           sleep 2
         done
 
+  preview:mounts:start:
+    desc: Start a preview with both a config_mount (ConfigMap) and a secret_mount (Secret)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      # `from_file` paths in the config are resolved relative to this directory, so run from the
+      # sandbox root (the default).
+      - |
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.ROOT_DIR}}/apps/echo-app/mirrord-preview-mounts.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:mounts:verify:
+    desc: Verify the config_mount landed in a ConfigMap and the secret_mount in a Secret, both mounted in the pod
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}' - run 'task preview:mounts:start' first"
+          exit 1
+        fi
+        echo "preview session: $SESSION"
+        echo
+
+        echo "==> the PreviewSession carries only a reference to the Secret, not the contents:"
+        kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} \
+          -o jsonpath='  secretMounts: {.spec.secretMounts}{"\n"}'
+        echo
+
+        echo "==> config_mounts are stored in a ConfigMap (plaintext):"
+        kubectl get configmap "${SESSION}-config-mounts" -n {{.NAMESPACE}} \
+          -o jsonpath='{.metadata.name} owned-by {.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+        kubectl get configmap "${SESSION}-config-mounts" -n {{.NAMESPACE}} \
+          -o jsonpath='  data: {.data}{"\n"}'
+        echo
+
+        echo "==> secret_mounts are stored in a Secret (base64, RBAC-controllable):"
+        kubectl get secret "${SESSION}-secrets" -n {{.NAMESPACE}} \
+          -o jsonpath='{.metadata.name} owned-by {.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+        kubectl get secret "${SESSION}-secrets" -n {{.NAMESPACE}} \
+          -o jsonpath='  data: {.data}{"\n"}'
+        echo
+
+        echo "==> both files are projected into the preview pod at their mount_at paths:"
+        echo "--- /app/logging.json (from ConfigMap) ---"
+        kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- cat /app/logging.json
+        echo
+        echo "--- /app/appsettings.ci.json (from Secret) ---"
+        kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- cat /app/appsettings.ci.json
+
+  preview:test:mounts:
+    desc: End-to-end - start a preview with config + secret mounts and verify them (needs echo-app deployed)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+    cmds:
+      - task: preview:mounts:start
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - task: preview:mounts:verify
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        echo
+        echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
   test:mysql:
     desc: "Run MySQL test"
     deps: [build:app:mysql, operator:install]
