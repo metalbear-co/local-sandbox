@@ -1,0 +1,201 @@
+version: "3"
+
+# Cloud Spanner database branching (emulator-based).
+#
+#   task spanner:deploy         deploy + seed the source emulator, deploy the consumer pod
+#   task spanner:run:local      run the app locally under mirrord (creates a branch emulator)
+#   task spanner:query:source   query the source (cluster) emulator over its REST gateway
+#   task spanner:query:branch   query the branch emulator via gcloud (endpoint override)
+#
+# The branch config lives in k8s/overlays/spanner/mirrord.json
+# (feature.db_branches, type "spanner" — branch is created when run:local starts).
+# Source ids: project=test-project, instance=test-instance, database=test-db. The
+# emulator image ships no shell, so source queries go over a short-lived
+# `kubectl port-forward` to its REST gateway (9020) instead of `kubectl exec`.
+#
+# Query examples (QUERY= takes Spanner GoogleSQL):
+#   task spanner:query:source QUERY="SELECT * FROM Users"
+#   task spanner:query:source QUERY="INSERT INTO Users (Id, Name) VALUES (99, 'dev')"
+#   task spanner:query:branch QUERY="SELECT count(*) FROM Users"
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  SPANNER_DIR: '{{.ROOT_DIR}}/k8s/spanner'
+  APP_DIR: '{{.ROOT_DIR}}/../operator/crates/operator-db-branching/tests/go-e2e-spanner-branching'
+  SPANNER_MIRRORD_CONFIG: '{{.SPANNER_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/spanner/mirrord.json")}}'
+  SPANNER_PROJECT: '{{.SPANNER_PROJECT | default "test-project"}}'
+  SPANNER_INSTANCE: '{{.SPANNER_INSTANCE | default "test-instance"}}'
+  SPANNER_DATABASE: '{{.SPANNER_DATABASE | default "test-db"}}'
+  SPANNER_SEED_PORT: '{{.SPANNER_SEED_PORT | default "19020"}}'
+  SPANNER_BRANCH_PORT: '{{.SPANNER_BRANCH_PORT | default "19030"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Spanner test env (seeded source emulator + consumer pod)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.SPANNER_DIR}}
+      - task: _wait:source
+      - task: seed
+      - task: _wait:consumer
+      - echo "Spanner source ready (project={{.SPANNER_PROJECT}}, instance={{.SPANNER_INSTANCE}}, database={{.SPANNER_DATABASE}}, Users=3, Orders=2). Branch it with 'task spanner:run:local'."
+
+  seed:
+    desc: Seed the source emulator (schema + rows) over a temporary port-forward
+    cmds:
+      - |
+        set -e
+        BASE="http://127.0.0.1:{{.SPANNER_SEED_PORT}}"
+        DBPATH="projects/{{.SPANNER_PROJECT}}/instances/{{.SPANNER_INSTANCE}}/databases/{{.SPANNER_DATABASE}}"
+        pkill -f "port-forward.*spanner-source.*{{.SPANNER_SEED_PORT}}:9020" 2>/dev/null || true
+        kubectl port-forward -n {{.NAMESPACE}} pod/spanner-source {{.SPANNER_SEED_PORT}}:9020 >/tmp/spanner-seed-pf.log 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null || true" EXIT
+        for _ in $(seq 1 60); do
+          curl -sf "$BASE/v1/projects/{{.SPANNER_PROJECT}}/instanceConfigs" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+        echo "Creating instance + database (ok if they already exist)..."
+        curl -s -o /dev/null -X POST "$BASE/v1/projects/{{.SPANNER_PROJECT}}/instances" \
+          -H 'content-type: application/json' \
+          -d '{"instanceId":"{{.SPANNER_INSTANCE}}","instance":{"config":"projects/{{.SPANNER_PROJECT}}/instanceConfigs/emulator-config","displayName":"{{.SPANNER_INSTANCE}}","nodeCount":1}}'
+        curl -s -o /dev/null -X POST "$BASE/v1/projects/{{.SPANNER_PROJECT}}/instances/{{.SPANNER_INSTANCE}}/databases" \
+          -H 'content-type: application/json' \
+          --data-binary '{"createStatement":"CREATE DATABASE `{{.SPANNER_DATABASE}}`","extraStatements":["CREATE TABLE Users (Id INT64 NOT NULL, Name STRING(MAX)) PRIMARY KEY (Id)","CREATE TABLE Orders (Id INT64 NOT NULL, UserId INT64, Total INT64) PRIMARY KEY (Id)"]}'
+        for _ in $(seq 1 60); do
+          curl -sf "$BASE/v1/$DBPATH" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+        SESSION=$(curl -s -X POST "$BASE/v1/$DBPATH/sessions" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+        curl -s -o /dev/null -X POST "$BASE/v1/$SESSION:commit" -H 'content-type: application/json' \
+          --data-binary '{"singleUseTransaction":{"readWrite":{}},"mutations":[{"insertOrUpdate":{"table":"Users","columns":["Id","Name"],"values":[["1","alice"],["2","bob"],["3","carol"]]}},{"insertOrUpdate":{"table":"Orders","columns":["Id","UserId","Total"],"values":[["10","1","500"],["11","2","250"]]}}]}'
+        echo "Seed complete: Users=3, Orders=2"
+
+  run:local:
+    desc: Run the Spanner app locally under mirrord (creates a branch emulator; Ctrl-C to stop)
+    interactive: true
+    dir: ../operator/crates/operator-db-branching/tests/go-e2e-spanner-branching
+    preconditions:
+      - sh: test -f {{.SPANNER_MIRRORD_CONFIG}}
+        msg: "mirrord config not found at {{.SPANNER_MIRRORD_CONFIG}}"
+    cmds:
+      - go build -o /tmp/spanner-app .
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.SPANNER_MIRRORD_CONFIG}} -- /tmp/spanner-app
+
+  query:source:
+    desc: 'Query the source emulator (QUERY="SELECT * FROM Users")'
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM Users"}}'
+    cmds:
+      - |
+        set -e
+        BASE="http://127.0.0.1:{{.SPANNER_SEED_PORT}}"
+        DBPATH="projects/{{.SPANNER_PROJECT}}/instances/{{.SPANNER_INSTANCE}}/databases/{{.SPANNER_DATABASE}}"
+        pkill -f "port-forward.*spanner-source.*{{.SPANNER_SEED_PORT}}:9020" 2>/dev/null || true
+        kubectl port-forward -n {{.NAMESPACE}} pod/spanner-source {{.SPANNER_SEED_PORT}}:9020 >/tmp/spanner-query-pf.log 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null || true" EXIT
+        for _ in $(seq 1 60); do curl -sf "$BASE/v1/$DBPATH" >/dev/null 2>&1 && break; sleep 0.5; done
+        SESSION=$(curl -s -X POST "$BASE/v1/$DBPATH/sessions" | sed -n 's/.*"name": *"\([^"]*\)".*/\1/p')
+        curl -s -X POST "$BASE/v1/$SESSION:executeSql" -H 'content-type: application/json' \
+          --data-binary "{\"sql\":\"{{.QUERY}}\"}"
+        echo ""
+
+  query:branch:
+    desc: 'Query the branch emulator via gcloud (QUERY="SELECT * FROM Users" [BRANCH=pod-name-fragment])'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM Users"}}'
+      BRANCH: '{{.BRANCH | default "spanner-branch-db-pod"}}'
+    cmds:
+      - |
+        set -e
+        # The branch pod name is generated per branch; find the current one.
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep '{{.BRANCH}}' | head -1 | sed 's|pod/||')
+        if [ -z "$POD" ]; then
+          echo "No running branch pod found. Deploy first, or start one with 'task spanner:run:local'."
+          echo "Existing branches:"
+          kubectl get branchdatabase -n {{.NAMESPACE}} 2>/dev/null || echo "  none"
+          exit 1
+        fi
+        # The branch recreates the app's project/instance/database; read them off the setup sidecar.
+        eval "$(kubectl get pod "$POD" -n {{.NAMESPACE}} -o jsonpath='{range .spec.containers[?(@.name=="spanner-branch-setup")].env[*]}{.name}={.value}{"\n"}{end}' | grep '^SPANNER_' | sed 's/^/export /')"
+        pkill -f "port-forward.*$POD.*{{.SPANNER_BRANCH_PORT}}:9020" 2>/dev/null || true
+        # gcloud (unlike client libraries) ignores SPANNER_EMULATOR_HOST, so port-forward
+        # the REST gateway (9020) and override the API endpoint at it instead.
+        kubectl port-forward -n {{.NAMESPACE}} "pod/$POD" {{.SPANNER_BRANCH_PORT}}:9020 >/tmp/spanner-branch-query-pf.log 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null || true" EXIT
+        for _ in $(seq 1 60); do
+          curl -sf "http://127.0.0.1:{{.SPANNER_BRANCH_PORT}}/v1/projects/$SPANNER_PROJECT_ID/instances/$SPANNER_INSTANCE_ID/databases/$SPANNER_DATABASE_ID" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+        echo "=== branch pod: $POD (project=$SPANNER_PROJECT_ID database=$SPANNER_DATABASE_ID) ==="
+        CLOUDSDK_AUTH_DISABLE_CREDENTIALS=true \
+        CLOUDSDK_API_ENDPOINT_OVERRIDES_SPANNER="http://localhost:{{.SPANNER_BRANCH_PORT}}/" \
+        gcloud spanner databases execute-sql "$SPANNER_DATABASE_ID" \
+          --instance="$SPANNER_INSTANCE_ID" --project="$SPANNER_PROJECT_ID" \
+          --sql="{{.QUERY}}"
+
+  branches:
+    desc: List BranchDatabase CRDs and branch emulator pods
+    cmds:
+      - kubectl get branchdatabase -n {{.NAMESPACE}} 2>/dev/null || echo "No branches"
+      - kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep spanner-branch-db-pod || true
+
+  logs:
+    desc: Tail the source emulator logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=spanner-source --tail=100 -f
+
+  logs:branch:
+    desc: Tail the newest branch emulator pod logs
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep spanner-branch-db-pod | head -1 | sed 's|pod/||')
+        if [ -z "$POD" ]; then echo "No branch pod found."; exit 1; fi
+        kubectl logs -n {{.NAMESPACE}} "$POD" --tail=100 -f
+
+  status:
+    desc: Show source, consumer, branches and branch pods
+    silent: true
+    cmds:
+      - echo "=== source + consumer ==="
+      - kubectl get pod -n {{.NAMESPACE}} -l app=spanner-source -o wide 2>/dev/null || echo "not deployed"
+      - kubectl get pod -n {{.NAMESPACE}} -l app=spanner-consumer -o wide 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== branch CRDs ==="
+      - kubectl get branchdatabase -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== branch pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep spanner-branch-db-pod || echo "none"
+
+  clean:
+    desc: Remove the Spanner test env (source, consumer, branches)
+    cmds:
+      - kubectl delete -k {{.SPANNER_DIR}} --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete branchdatabase --all -n {{.NAMESPACE}} 2>/dev/null || true
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for spanner-source pod..."
+      - kubectl wait --for=condition=ready pod -l app=spanner-source -n {{.NAMESPACE}} --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for spanner-consumer pod..."
+      - kubectl wait --for=condition=ready pod -l app=spanner-consumer -n {{.NAMESPACE}} --timeout=60s

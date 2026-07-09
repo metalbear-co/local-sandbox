@@ -1,0 +1,54 @@
+version: "3"
+
+# mirrord agent image helpers.
+#
+# The operator/agent run with `agent.image: test` + pullPolicy Never
+# (operator-values.yaml and .mirrord/operator-dev.yaml), so the image has to
+# be present inside minikube. These tasks keep it there.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  # Static on purpose: legacy taskfiles define their own AGENT_IMAGE globals
+  # (ghcr latest, mirrord-agent:custom) that can leak across include
+  # namespaces. A CLI override (task mirrord:agent:load AGENT_IMAGE=x) still
+  # takes precedence over this value.
+  AGENT_IMAGE: "test"
+
+tasks:
+  agent:build:
+    desc: Build the agent image from ../mirrord and load it into minikube (AGENT_IMAGE=test)
+    cmds:
+      - cd {{.MIRRORD_DIR}} && {{.CONTAINER_RUNTIME}} build -f mirrord/agent/Dockerfile -t {{.AGENT_IMAGE}} .
+      - task: agent:load
+
+  agent:load:
+    desc: (Re)load the agent image from docker into minikube (AGENT_IMAGE=test)
+    preconditions:
+      - sh: '{{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1'
+        msg: "Image '{{.AGENT_IMAGE}}' not found in docker. Build it first: task mirrord:agent:build"
+    cmds:
+      # Remove the old copy inside minikube first — `image load` does not
+      # overwrite an existing tag, which is how stale agents happen.
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.CLUSTER_NAME}} image load {{.AGENT_IMAGE}}
+      - echo "Agent image '{{.AGENT_IMAGE}}' loaded into minikube."
+
+  agent:status:
+    desc: Show whether the agent image is present in docker and minikube
+    silent: true
+    cmds:
+      - |
+        if {{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1; then
+          echo "docker:   '{{.AGENT_IMAGE}}' present ($({{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} --format '{{`{{.Created}}`}}' 2>/dev/null))"
+        else
+          echo "docker:   '{{.AGENT_IMAGE}}' missing — task mirrord:agent:build"
+        fi
+        if minikube -p {{.CLUSTER_NAME}} image ls 2>/dev/null | grep -q "library/{{.AGENT_IMAGE}}:"; then
+          echo "minikube: '{{.AGENT_IMAGE}}' present"
+        else
+          echo "minikube: '{{.AGENT_IMAGE}}' missing — task mirrord:agent:load"
+        fi

@@ -1,0 +1,181 @@
+version: "3"
+
+# Redis database branching.
+#
+#   task redis:deploy         deploy the source Redis + test app into the cluster
+#   task redis:run:local      run the app locally under mirrord (creates a branch Redis)
+#   task redis:query:source   run a redis-cli command against the source (cluster) Redis
+#   task redis:query:branch   run a redis-cli command against the branch Redis
+#
+# The branch config lives in apps/redis-app/mirrord-local.json
+# (feature.db_branches, type "redis" — branch is created when run:local starts).
+# Branch CRDs use the generic BranchDatabase kind (kubectl get branchdatabases).
+#
+# Query examples (QUERY= takes any redis-cli command; no auth on the test server):
+#   task redis:query:source QUERY="KEYS *"
+#   task redis:query:source QUERY="SET greeting 'hello from source'"
+#   task redis:query:branch QUERY="GET greeting"
+#   or interactively: task redis:shell:source / task redis:shell:branch
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  # Shared with bullmq/redis-pubsub — same literal value in every module.
+  REDIS_NAMESPACE: "redis-test"
+  APP_DIR: '{{.ROOT_DIR}}/apps/redis-app'
+  REDIS_DIR: '{{.ROOT_DIR}}/k8s/redis'
+  REDIS_MIRRORD_CONFIG: '{{.REDIS_MIRRORD_CONFIG | default (print .ROOT_DIR "/apps/redis-app/mirrord-local.json")}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Redis test env (source Redis + test app)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t redis-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load redis-app:latest
+      - kubectl apply -k {{.REDIS_DIR}}
+      - task: _wait:source
+      - task: _wait:app
+
+  run:local:
+    desc: Run the Redis app locally under mirrord (creates a branch Redis; Ctrl-C to stop)
+    interactive: true
+    dir: apps/redis-app
+    preconditions:
+      - sh: test -f {{.REDIS_MIRRORD_CONFIG}}
+        msg: "mirrord config not found at {{.REDIS_MIRRORD_CONFIG}}"
+    cmds:
+      - go build -o /tmp/redis-app .
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8080 {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-main \
+          -n {{.REDIS_NAMESPACE}} \
+          -f {{.REDIS_MIRRORD_CONFIG}} \
+          -- /tmp/redis-app
+
+  query:source:
+    desc: 'Run a redis-cli command against the source Redis (QUERY="KEYS *")'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "KEYS *"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "Source Redis not found. Deploy first with 'task redis:deploy'."; exit 1; fi
+        echo "=== source pod: $POD ==="
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli {{.QUERY}}
+
+  query:branch:
+    desc: 'Run a redis-cli command against a branch Redis (QUERY="..." [BRANCH=...])'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "KEYS *"}}'
+      BRANCH: '{{.BRANCH | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod found. Deploy first, or start one with 'task redis:run:local'."
+          echo "Existing branches:"
+          kubectl get branchdatabases -n {{.REDIS_NAMESPACE}} 2>/dev/null || echo "  none"
+          exit 1
+        fi
+        echo "=== branch pod: $POD ==="
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli {{.QUERY}}
+
+  shell:source:
+    desc: redis-cli shell into the source Redis
+    interactive: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "Source Redis not found. Deploy first with 'task redis:deploy'."; exit 1; fi
+        kubectl exec -it -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli
+
+  shell:branch:
+    desc: redis-cli shell into the newest branch Redis ([BRANCH=...])
+    interactive: true
+    vars:
+      BRANCH: '{{.BRANCH | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod found."; exit 1; fi
+        kubectl exec -it -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli
+
+  branches:
+    desc: List BranchDatabase CRDs and branch pods
+    cmds:
+      - kubectl get branchdatabases -n {{.REDIS_NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode,AGE:.metadata.creationTimestamp 2>/dev/null || echo "No branches"
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l db-owner-name 2>/dev/null || true
+
+  logs:
+    desc: Tail the source Redis logs
+    cmds:
+      - kubectl logs -n {{.REDIS_NAMESPACE}} -l app=redis-main --tail=100 -f
+
+  logs:branch:
+    desc: Tail the newest branch pod logs
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l db-owner-name \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No branch pod found."; exit 1; fi
+        kubectl logs -n {{.REDIS_NAMESPACE}} "$POD" --tail=100 -f
+
+  status:
+    desc: Show source, app, branches and branch pods
+    silent: true
+    cmds:
+      - echo "=== source ==="
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l app=redis-main -o wide 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== app ==="
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l app=redis-app 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== branch CRDs ==="
+      - kubectl get branchdatabases -n {{.REDIS_NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== branch pods ==="
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l db-owner-name 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the Redis test env (deletes the redis-test namespace, shared with bullmq/redis-pubsub)
+    cmds:
+      - kubectl delete -k {{.REDIS_DIR}} --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete branchdatabases --all -n {{.REDIS_NAMESPACE}} 2>/dev/null || true
+      - "{{.CONTAINER_RUNTIME}} rm -f mirrord-redis-6379 2>/dev/null || true"
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source Redis..."
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.REDIS_NAMESPACE}} --timeout=120s || true
+
+  _wait:app:
+    internal: true
+    cmds:
+      - echo "Waiting for Redis app..."
+      - kubectl wait --for=condition=ready pod -l app=redis-app -n {{.REDIS_NAMESPACE}} --timeout=120s || true

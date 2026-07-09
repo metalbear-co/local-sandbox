@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: influx-app
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: influx-app
+  template:
+    metadata:
+      labels:
+        app: influx-app
+    spec:
+      containers:
+        - name: influx-app
+          image: influx-app:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            # URL-shaped var - mirrord rewrites only the host/port fragments via
+            # value_pattern; the scheme and URL shape stay intact.
+            - name: INFLUXDB_URL
+              value: "http://influxdb-main:8086"
+            # The token is deliberately NOT read from this pod's env in the mirrord config -
+            # it comes straight from the influx-creds Secret (direct Secret param source).
+            - name: INFLUXDB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: influx-creds
+                  key: token
+            - name: INFLUXDB_ORG
+              value: "metalbear"
+            - name: INFLUXDB_BUCKET
+              value: "metrics"
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: influx-app
+  namespace: generic-test
+spec:
+  selector:
+    app: influx-app
+  ports:
+    - port: 8080
+      targetPort: 8080

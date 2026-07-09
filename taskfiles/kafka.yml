@@ -1,0 +1,133 @@
+version: "3"
+
+# Kafka queue splitting (single-topic, plain listener).
+#
+#   task kafka:deploy         deploy the Kafka broker + consumer into the cluster
+#   task kafka:run:local      run the consumer locally under mirrord (starts the split)
+#   task kafka:send:match     message with header user_id=test-user -> your local session
+#   task kafka:send:nomatch   message without headers             -> cluster consumer
+#
+# The split filter lives in k8s/overlays/kafka/mirrord.json
+# (Kafka header `user_id` matching test-user on topic test-topic). Messages are
+# produced by kubectl exec-ing kafka-console-producer.sh inside the broker pod.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/kafka-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/kafka'
+  # Overridable via KAFKA_MIRRORD_CONFIG / KAFKA_TOPIC / KAFKA_MATCH_USER_ID in
+  # .env (module-prefixed names so they can't collide with other modules'
+  # globals). The user id must match the `user_id` filter in mirrord.json.
+  KAFKA_MIRRORD_CONFIG: '{{.KAFKA_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/kafka/mirrord.json")}}'
+  TOPIC: '{{.KAFKA_TOPIC | default "test-topic"}}'
+  MATCH_USER_ID: '{{.KAFKA_MATCH_USER_ID | default "test-user"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Kafka test env (broker + consumer)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t kafka-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load kafka-consumer:local
+      - kubectl apply -k {{.OVERLAY}}
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml
+      - task: _wait:kafka
+      - task: _wait:consumer
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/kafka-consumer
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.KAFKA_MIRRORD_CONFIG}} -- /tmp/kafka-consumer"
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          USER_ID: "{{.MATCH_USER_ID}}"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          USER_ID: ""
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Send a message with explicit routing (USER_ID=... MESSAGE=...; empty USER_ID sends no header)'
+    silent: true
+    vars:
+      USER_ID: '{{.USER_ID | default ""}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        if [ -n "{{.USER_ID}}" ]; then
+          printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --property 'parse.headers=true' --property 'headers.delimiter=|'
+        else
+          printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}}
+        fi
+        case "{{.USER_ID}}" in
+          "{{.MATCH_USER_ID}}") echo "sent '{{.MESSAGE}}' (user_id={{.USER_ID}} -> local session)";;
+          "")                   echo "sent '{{.MESSAGE}}' (no header -> stays in cluster)";;
+          *)                    echo "sent '{{.MESSAGE}}' (user_id={{.USER_ID}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=kafka-consumer --tail=100 -f
+
+  logs:kafka:
+    desc: Tail the Kafka broker logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=kafka-cluster --tail=100 -f
+
+  status:
+    desc: Show consumer, broker and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== kafka broker ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafka-cluster 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== topics ==="
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh --list --bootstrap-server localhost:9092
+        else
+          echo "broker not reachable"
+        fi
+
+  clean:
+    desc: Remove the Kafka test env from the cluster
+    cmds:
+      - kubectl delete -k {{.OVERLAY}} --ignore-not-found=true
+      - kubectl delete -f {{.ROOT_DIR}}/k8s/kafka/kafka-client-config.yaml --ignore-not-found=true
+
+  _wait:kafka:
+    internal: true
+    cmds:
+      - echo "Waiting for Kafka broker..."
+      - kubectl wait --for=condition=ready pod -l app=kafka-cluster -n {{.NAMESPACE}} --timeout=300s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Kafka consumer..."
+      - kubectl wait --for=condition=ready pod -l app=kafka-consumer -n {{.NAMESPACE}} --timeout=120s

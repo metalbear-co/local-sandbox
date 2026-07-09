@@ -2,7 +2,7 @@ version: "3"
 
 vars:
   ROOT_DIR:
-    sh: cd .. && pwd
+    sh: git rev-parse --show-toplevel
   # Use unique variable to avoid collision with other Taskfiles
   REDIS_NAMESPACE: 'redis-test'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'

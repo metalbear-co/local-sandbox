@@ -1,0 +1,173 @@
+version: "3"
+
+# Temporal task-queue splitting.
+#
+#   task temporal:deploy         deploy Temporal server + UI + cluster worker + split CRDs
+#   task temporal:run:local      run the worker locally under mirrord (starts the split)
+#   task temporal:send:match     workflow id test-alice-*  -> your local session
+#   task temporal:send:nomatch   workflow id test-other-*  -> cluster worker
+#
+# The split filter lives in k8s/overlays/temporal/mirrord.json
+# (workflow_id matching ^test-alice-). Workflows are started via tctl inside
+# the temporal server pod; MESSAGE becomes the CheckoutWorkflow input.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/temporal-worker'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/temporal'
+  CHARTS_DIR: '{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator'
+  TEMPORAL_MIRRORD_CONFIG: '{{.TEMPORAL_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/temporal/mirrord.json")}}'
+  # Overridable via TEMPORAL_TASK_QUEUE / TEMPORAL_NS in .env (module-prefixed
+  # names so they can't collide with other modules' globals).
+  TEMPORAL_NAMESPACE: "temporal"
+  TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
+  TEMPORAL_NS: '{{.TEMPORAL_NS | default "temporal"}}'
+  TASK_QUEUE: '{{.TEMPORAL_TASK_QUEUE | default "order-checkout"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Temporal test env (server + UI + worker + split CRDs)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t temporal-worker:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load temporal-worker:local
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.TEMPORAL_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY}}/temporal-server.yaml
+      - task: _wait:server
+      - task: _register:namespace
+      - kubectl apply -f {{.OVERLAY}}/temporal-ui.yaml
+      - task: _wait:ui
+      - kubectl apply -f {{.OVERLAY}}/worker.yaml
+      - task: _wait:worker
+      - task: _apply:split-crds
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config.yaml
+
+  run:local:
+    desc: Run the worker locally under mirrord (starts task-queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/temporal-worker
+    cmds:
+      - go build -o /tmp/temporal-worker main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.TEMPORAL_MIRRORD_CONFIG}} -- /tmp/temporal-worker"
+
+  send:match:
+    desc: 'Start a workflow matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          PREFIX: "test-alice-"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Start a workflow NOT matching the filter -> cluster worker (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          PREFIX: "test-other-"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster worker"}}'
+
+  send:
+    desc: 'Start a workflow with explicit routing (PREFIX=... MESSAGE=...)'
+    silent: true
+    vars:
+      PREFIX: '{{.PREFIX | default "test-alice-"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        WF_ID="{{.PREFIX}}$(date +%s)"
+        INPUT=$(printf '%s' "{{.MESSAGE}}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+        POD_IP=$(kubectl get pod -n {{.TEMPORAL_NAMESPACE}} -l app=temporal -o jsonpath='{.items[0].status.podIP}')
+        kubectl exec -n {{.TEMPORAL_NAMESPACE}} deploy/temporal -- \
+          tctl --address "${POD_IP}:7233" --namespace {{.TEMPORAL_NS}} workflow start \
+            --taskqueue {{.TASK_QUEUE}} \
+            --workflow_type CheckoutWorkflow \
+            --workflow_id "$WF_ID" \
+            --input "$INPUT" >/dev/null
+        case "$WF_ID" in
+          test-alice-*) echo "started CheckoutWorkflow $WF_ID input='{{.MESSAGE}}' (-> local session)";;
+          *)            echo "started CheckoutWorkflow $WF_ID input='{{.MESSAGE}}' (-> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster worker logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=temporal-worker --tail=100 -f
+
+  logs:server:
+    desc: Tail the Temporal server logs
+    cmds:
+      - kubectl logs -n {{.TEMPORAL_NAMESPACE}} -l app=temporal --tail=100 -f
+
+  status:
+    desc: Show worker, Temporal server and split state
+    silent: true
+    cmds:
+      - echo "=== worker ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=temporal-worker 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== temporal server ==="
+      - kubectl get pods -n {{.TEMPORAL_NAMESPACE}} -l app=temporal 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split config ==="
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the Temporal test env from the cluster
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/worker.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/temporal-ui.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/temporal-server.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete namespace {{.TEMPORAL_NAMESPACE}} --ignore-not-found=true
+
+  _wait:server:
+    internal: true
+    cmds:
+      - echo "Waiting for Temporal Postgres..."
+      - kubectl wait --for=condition=ready pod -l app=temporal-postgres -n {{.TEMPORAL_NAMESPACE}} --timeout=120s
+      - echo "Waiting for Temporal server (schema setup can take a minute)..."
+      - kubectl wait --for=condition=ready pod -l app=temporal -n {{.TEMPORAL_NAMESPACE}} --timeout=300s
+
+  _wait:ui:
+    internal: true
+    cmds:
+      - echo "Waiting for Temporal UI..."
+      - kubectl wait --for=condition=ready pod -l app=temporal-ui -n {{.TEMPORAL_NAMESPACE}} --timeout=120s
+
+  _wait:worker:
+    internal: true
+    cmds:
+      - echo "Waiting for Temporal worker..."
+      - kubectl wait --for=condition=ready pod -l app=temporal-worker -n {{.NAMESPACE}} --timeout=120s
+
+  _register:namespace:
+    internal: true
+    cmds:
+      - |
+        echo "Registering Temporal namespace {{.TEMPORAL_NS}}..."
+        POD_IP=$(kubectl get pod -n {{.TEMPORAL_NAMESPACE}} -l app=temporal -o jsonpath='{.items[0].status.podIP}')
+        kubectl exec -n {{.TEMPORAL_NAMESPACE}} deploy/temporal -- \
+          tctl --address "${POD_IP}:7233" --namespace {{.TEMPORAL_NS}} namespace register --rd 72h 2>/dev/null || true
+        echo "Namespace {{.TEMPORAL_NS}} ready"
+
+  _apply:split-crds:
+    internal: true
+    cmds:
+      - |
+        echo "Applying MirrordSplitConfig CRD from operator chart..."
+        helm template mirrord-operator {{.CHARTS_DIR}} \
+          -f {{.ROOT_DIR}}/operator-values.yaml \
+          -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -

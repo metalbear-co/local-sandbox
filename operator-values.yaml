@@ -13,6 +13,7 @@ operator:
   mongodbBranching: true
   mssqlBranching: true
   spannerBranching: true
+  genericBranching: true
   previewEnv: true
   preview:
     image_pull_policy: "IfNotPresent"

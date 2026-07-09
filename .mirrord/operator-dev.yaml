@@ -1,0 +1,53 @@
+# mirrord config for running a locally-built operator-service against the
+# local sandbox cluster, stealing traffic from the deployed mirrord-operator.
+#
+# Same idea as operator/.mirrord/operator.yaml (staging), simplified for the
+# single-user local cluster: no baggage/http_filter session keying — we just
+# steal everything the deployed operator receives.
+#
+# Run it via `task operator:dev`, or manually from ../operator:
+#   MIRRORD_CHECK_VERSION=false mirrord exec \
+#     -f ../local-sandbox/.mirrord/operator-dev.yaml -- cargo run -p operator-service
+
+# The session that replaces the operator must not itself go through the operator.
+operator: false
+
+# So you can run `mirrord exec -- cargo run` on the operator-service.
+skip_extra_build_tools:
+  - cargo
+
+skip_sip:
+  - operator-service
+
+target:
+  path: deployment/mirrord-operator
+  namespace: mirrord
+
+agent:
+  log_level: "mirrord=debug"
+  image: test
+  image_pull_policy: Never
+  namespace: mirrord
+  clean_iptables_on_start: true
+
+feature:
+  network:
+    incoming: steal
+  fs:
+    mode: read
+    read_only:
+      - "/var.+"
+      - "/mirrord.+"
+  env:
+    override:
+      RUST_LOG: "operator_service=info,mirrord=info,operator_pod_mutator=debug,operator_queue_splitting=debug"
+
+      # Feature flags for the LOCAL operator. The base env is inherited from
+      # the deployed operator pod, so a flag the deployed chart doesn't render
+      # (e.g. a feature you're developing that isn't released yet) is missing
+      # there — force it here. Full list of OPERATOR_* flags:
+      # operator/crates/operator-proxy/src/config.rs
+      OPERATOR_GENERIC_BRANCHING: "true"
+      # OPERATOR_REDIS_BRANCHING: "true"
+      # OPERATOR_DYNAMODB_BRANCHING: "true"
+      # OPERATOR_CLICKHOUSE_BRANCHING: "true"

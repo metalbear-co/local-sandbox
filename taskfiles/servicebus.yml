@@ -1,0 +1,180 @@
+version: "3"
+
+# Azure Service Bus queue splitting (emulator).
+#
+#   task servicebus:deploy         deploy the SB emulator + consumer into the cluster
+#   task servicebus:run:local      run the consumer locally under mirrord (starts the split)
+#   task servicebus:send:match     message with tenant=test-user -> your local session
+#   task servicebus:send:nomatch   message with tenant=other     -> cluster consumer
+#
+# The split filter lives in k8s/overlays/servicebus-emulator/mirrord.json
+# (application property `tenant` matching ^test). The emulator is only
+# reachable in-cluster, so messages are sent through a one-shot sender pod
+# running the consumer image in SEND_MODE.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/servicebus-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator'
+  SB_MIRRORD_CONFIG: '{{.SB_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/servicebus-emulator/mirrord.json")}}'
+  EMULATOR_NAMESPACE: "servicebus-emulator"
+  # Overridable via SB_QUEUE in .env (module-prefixed name so it can't
+  # collide with other modules' globals).
+  QUEUE: '{{.SB_QUEUE | default "test-queue"}}'
+  CONN_STR: "Endpoint=sb://servicebus-emulator.servicebus-emulator.svc.cluster.local;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=SAS_KEY_VALUE;UseDevelopmentEmulator=true"
+
+tasks:
+  deploy:
+    desc: Deploy the Service Bus test env (emulator + consumer)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t servicebus-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load servicebus-consumer:local
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY}}/namespace.yaml
+      - task: _deploy:emulator
+      - kubectl apply -f {{.OVERLAY}}/consumer.yaml
+      - task: _wait:consumer
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config.yaml
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/servicebus-consumer
+    cmds:
+      - go build -o /tmp/servicebus-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.SB_MIRRORD_CONFIG}} -- /tmp/servicebus-consumer"
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "test-user"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "other"
+          TYPE: "basic"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Send a message with explicit routing (TENANT=... TYPE=... MESSAGE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        BODY='{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"{{.TYPE}}","message":"{{.MESSAGE}}"}'
+        kubectl run sb-sender-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.EMULATOR_NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING={{.CONN_STR}}" \
+          --env="SEND_QUEUE={{.QUEUE}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=tenant={{.TENANT}},type={{.TYPE}}" \
+          -- /app/consumer >/dev/null 2>&1
+        case "{{.TENANT}}" in
+          test*) echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *)     echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-consumer --tail=100 -f
+
+  logs:emulator:
+    desc: Tail the Service Bus emulator logs
+    cmds:
+      - kubectl logs -n {{.EMULATOR_NAMESPACE}} servicebus-emulator --tail=100 -f
+
+  status:
+    desc: Show consumer, emulator and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=servicebus-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== emulator ==="
+      - kubectl get pods -n {{.EMULATOR_NAMESPACE}} 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split config ==="
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the Service Bus test env from the cluster
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterexternalresources --all -A 2>/dev/null || true
+      - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/servicebus-emulator.yaml --ignore-not-found=true
+      - kubectl delete namespace {{.EMULATOR_NAMESPACE}} --ignore-not-found=true
+
+  _deploy:emulator:
+    internal: true
+    # On Apple Silicon the cluster node is arm64, so by default it pulls the
+    # arm64 build of the Service Bus emulator. That build's management gateway
+    # is broken: it cannot create or delete the temporary queues that queue
+    # splitting needs and crashes with "q.qm not found". The amd64 build (the
+    # same one CI runs) works fine here through Rosetta, and the only way to
+    # force it on an arm64 node is to pin the image by its amd64 manifest
+    # digest, resolved at deploy time.
+    cmds:
+      - |
+        set -euo pipefail
+        amd64_digest() {
+          {{.CONTAINER_RUNTIME}} manifest inspect "$1" \
+            | python3 -c 'import sys,json; d=json.load(sys.stdin); print(next(m["digest"] for m in d["manifests"] if m["platform"]["architecture"]=="amd64" and m["platform"]["os"]=="linux"))'
+        }
+        echo "Resolving amd64 image digests..."
+        EMU_DIGEST=$(amd64_digest mcr.microsoft.com/azure-messaging/servicebus-emulator:latest)
+        SQL_DIGEST=$(amd64_digest mcr.microsoft.com/azure-sql-edge:latest)
+        echo "  emulator amd64: ${EMU_DIGEST}"
+        echo "  sql-edge amd64: ${SQL_DIGEST}"
+        echo "Bouncing emulator pods..."
+        kubectl delete pod -n {{.EMULATOR_NAMESPACE}} servicebus-emulator azure-sql-edge --wait=true --ignore-not-found=true
+        echo "Applying {{.OVERLAY}}/servicebus-emulator.yaml pinned to the amd64 build..."
+        sed -e "s#mcr.microsoft.com/azure-messaging/servicebus-emulator:latest#mcr.microsoft.com/azure-messaging/servicebus-emulator@${EMU_DIGEST}#" \
+            -e "s#mcr.microsoft.com/azure-sql-edge:latest#mcr.microsoft.com/azure-sql-edge@${SQL_DIGEST}#" \
+            "{{.OVERLAY}}/servicebus-emulator.yaml" | kubectl apply -f -
+      - task: _wait:sql-edge
+      - task: _wait:emulator
+
+  _wait:sql-edge:
+    internal: true
+    cmds:
+      - echo "Waiting for SQL Edge..."
+      - kubectl wait --for=condition=ready pod azure-sql-edge -n {{.EMULATOR_NAMESPACE}} --timeout=180s
+
+  _wait:emulator:
+    internal: true
+    cmds:
+      - echo "Waiting for Service Bus emulator..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=servicebus-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=180s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Service Bus consumer..."
+      - kubectl wait --for=condition=ready pod -l app=servicebus-consumer -n {{.NAMESPACE}} --timeout=120s

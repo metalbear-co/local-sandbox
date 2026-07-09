@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: generic-app
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: generic-app
+  template:
+    metadata:
+      labels:
+        app: generic-app
+    spec:
+      containers:
+        - name: generic-app
+          image: generic-app:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            # Composite host:port var - mirrord rewrites only the matched fragments
+            # (value_pattern), so the app keeps seeing the host:port shape it expects.
+            - name: VALKEY_ADDR
+              value: "valkey-main:6379"
+            # Secret-backed - resolved off this pod spec by the operator and injected into
+            # the branch container as MIRRORD_PARAM_PASSWORD (as a secretKeyRef, never read).
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: valkey-creds
+                  key: password
+            # Custom `cache_name` extra param, fed to the branch via
+            # $(MIRRORD_PARAM_CACHE_NAME) in the branch args.
+            - name: CACHE_NAME
+              value: "sandbox-cache"
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: generic-app
+  namespace: generic-test
+spec:
+  selector:
+    app: generic-app
+  ports:
+    - port: 8080
+      targetPort: 8080

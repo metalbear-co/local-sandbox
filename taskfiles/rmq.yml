@@ -1,0 +1,233 @@
+version: "3"
+
+# RabbitMQ queue splitting.
+#
+#   task rmq:deploy         deploy RabbitMQ (cluster operator + broker) + consumer target
+#   task rmq:run:local      run the consumer locally under mirrord (starts the split)
+#   task rmq:send:match     message with header tenant=a -> your local session
+#   task rmq:send:nomatch   message with header tenant=b -> cluster consumer
+#
+# The split filter lives in k8s/overlays/rabbitmq/mirrord.json
+# (message header `tenant` matching ^a$). The MirrordWorkloadQueueRegistry and
+# MirrordPropertyList created by deploy tell the operator which broker/queues
+# the rmq-consumer deployment reads from.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/rmq-consumer'
+  # Overridable via RMQ_MIRRORD_CONFIG / RMQ_* in .env (module-prefixed names
+  # so they can't collide with other modules' globals).
+  RMQ_MIRRORD_CONFIG: '{{.RMQ_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/rabbitmq/mirrord.json")}}'
+  RMQ_CLUSTER_NAME: '{{.RMQ_CLUSTER_NAME | default "hello-world"}}'
+  RMQ_CLUSTER_NS: '{{.RMQ_CLUSTER_NS | default "default"}}'
+  RMQ_QUEUE: '{{.RMQ_QUEUE | default "inventory"}}'
+  RMQ_INVENTORY_QUEUE: '{{.RMQ_INVENTORY_QUEUE | default "inventory"}}'
+  RMQ_ORDERS_QUEUE: '{{.RMQ_ORDERS_QUEUE | default "orders"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the RMQ test env (RabbitMQ operator + broker + consumer target)
+    cmds:
+      - kubectl apply -f "https://github.com/rabbitmq/cluster-operator/releases/download/v2.21.1/cluster-operator.yml"
+      - task: _wait:operator
+      - kubectl apply -f https://raw.githubusercontent.com/rabbitmq/cluster-operator/main/docs/examples/hello-world/rabbitmq.yaml
+      - task: _wait:rabbitmq
+      - |
+        set -e
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        HOST="{{.RMQ_CLUSTER_NAME}}.{{.RMQ_CLUSTER_NS}}.svc"
+        # The cluster-operator generates passwords that can contain URL-special
+        # characters (+, /), so encode them before embedding in the AMQP URL.
+        RMQ_USER_ENC=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$RMQ_USER")
+        RMQ_PASS_ENC=$(python3 -c 'import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1],safe=""))' "$RMQ_PASS")
+        AMQP_URL="amqp://$RMQ_USER_ENC:$RMQ_PASS_ENC@$HOST:5672/%2F"
+
+        echo "Declaring broker queues '{{.RMQ_INVENTORY_QUEUE}}' and '{{.RMQ_ORDERS_QUEUE}}'"
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" declare queue --name {{.RMQ_INVENTORY_QUEUE}} --type classic --durable true
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" declare queue --name {{.RMQ_ORDERS_QUEUE}} --type classic --durable true
+
+        kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+
+        cat <<EOF | kubectl apply -f -
+        apiVersion: mirrord.metalbear.co/v1
+        kind: MirrordPropertyList
+        metadata:
+          name: rmq-cluster
+          namespace: {{.NAMESPACE}}
+        spec:
+          properties:
+            - name: scheme
+              value: amqp
+            - name: host
+              value: "$HOST"
+            - name: port
+              value: "5672"
+            - name: username
+              value: "$RMQ_USER"
+            - name: password
+              value: "$RMQ_PASS"
+            - name: vhost
+              value: "/"
+        ---
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: rmq-consumer
+          namespace: {{.NAMESPACE}}
+          labels:
+            app: rmq-consumer
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: rmq-consumer
+          template:
+            metadata:
+              labels:
+                app: rmq-consumer
+            spec:
+              containers:
+                - name: consumer
+                  image: registry.k8s.io/pause:3.9
+                  env:
+                    - name: RABBIT_MQ_INVENTORY_QUEUE
+                      value: "{{.RMQ_INVENTORY_QUEUE}}"
+                    - name: RABBIT_MQ_ORDERS_QUEUE
+                      value: "{{.RMQ_ORDERS_QUEUE}}"
+                    - name: RABBIT_MQ_URL
+                      value: "$AMQP_URL"
+        ---
+        apiVersion: queues.mirrord.metalbear.co/v1alpha
+        kind: MirrordWorkloadQueueRegistry
+        metadata:
+          name: rmq-registry
+          namespace: {{.NAMESPACE}}
+        spec:
+          consumer:
+            name: rmq-consumer
+            workloadType: Deployment
+          queues:
+            inventory-queue:
+              queueType: RMQ
+              clusterProperties: rmq-cluster
+              nameSource:
+                envVar: RABBIT_MQ_INVENTORY_QUEUE
+            orders-queue:
+              queueType: RMQ
+              clusterProperties: rmq-cluster
+              nameSource:
+                envVar: RABBIT_MQ_ORDERS_QUEUE
+        EOF
+      - task: _wait:consumer
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/rmq-consumer
+    cmds:
+      - go build -o /tmp/rmq-consumer .
+      - "{{.MIRRORD_BIN}} exec -f {{.RMQ_MIRRORD_CONFIG}} -- /tmp/rmq-consumer"
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "a"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "b"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Send a message with explicit routing (TENANT=... MESSAGE=... QUEUE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "a"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+      QUEUE: '{{.QUEUE | default .RMQ_QUEUE}}'
+    cmds:
+      - |
+        SECRET="{{.RMQ_CLUSTER_NAME}}-default-user"
+        RMQ_USER=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.username}' | base64 -d)
+        RMQ_PASS=$(kubectl get secret "$SECRET" -n {{.RMQ_CLUSTER_NS}} -o jsonpath='{.data.password}' | base64 -d)
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -c rabbitmq -- \
+          rabbitmqadmin --username "$RMQ_USER" --password "$RMQ_PASS" publish message \
+            --routing-key "{{.QUEUE}}" \
+            --payload '{{.MESSAGE}}' \
+            --properties '{"headers":{"tenant":"{{.TENANT}}"}}' >/dev/null
+        case "{{.TENANT}}" in
+          a) echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *) echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the RabbitMQ broker logs
+    cmds:
+      - kubectl logs -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} --tail=100 -f
+
+  status:
+    desc: Show broker, consumer and split state
+    silent: true
+    cmds:
+      - echo "=== rabbitmq cluster ==="
+      - kubectl get rabbitmqclusters -n {{.RMQ_CLUSTER_NS}} 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== consumer target ==="
+      - kubectl get deployment rmq-consumer -n {{.NAMESPACE}} 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== queue registry ==="
+      - kubectl get mirrordworkloadqueueregistry -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== queues ==="
+      - |
+        POD=$(kubectl get pod -n {{.RMQ_CLUSTER_NS}} -l app.kubernetes.io/component=rabbitmq,app.kubernetes.io/name={{.RMQ_CLUSTER_NAME}} -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.RMQ_CLUSTER_NS}} "$POD" -- rabbitmqctl list_queues name messages consumers 2>/dev/null || echo "could not list queues"
+        else
+          echo "rabbitmq not running"
+        fi
+
+  clean:
+    desc: Remove the RMQ test env from the cluster
+    cmds:
+      - kubectl delete mirrordworkloadqueueregistry rmq-registry -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete deployment rmq-consumer -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete mirrordpropertylist rmq-cluster -n {{.NAMESPACE}} --ignore-not-found=true
+      - kubectl delete rabbitmqcluster {{.RMQ_CLUSTER_NAME}} -n {{.RMQ_CLUSTER_NS}} --ignore-not-found=true
+      - kubectl delete -f "https://github.com/rabbitmq/cluster-operator/releases/download/v2.21.1/cluster-operator.yml" --ignore-not-found=true
+
+  _wait:operator:
+    internal: true
+    cmds:
+      - echo "Waiting for RabbitMQ Cluster Operator..."
+      - kubectl wait --for=condition=Available deployment/rabbitmq-cluster-operator -n rabbitmq-system --timeout=120s
+
+  _wait:rabbitmq:
+    internal: true
+    cmds:
+      - echo "Waiting for RabbitMQ cluster..."
+      - kubectl wait --for=condition=ClusterAvailable rabbitmqcluster/{{.RMQ_CLUSTER_NAME}} -n {{.RMQ_CLUSTER_NS}} --timeout=180s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for RMQ consumer target..."
+      - kubectl rollout status deployment/rmq-consumer -n {{.NAMESPACE}} --timeout=60s

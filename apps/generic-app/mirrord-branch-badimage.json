@@ -1,0 +1,23 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "valkey-generic-branch-badimage",
+                "ttl_secs": 120,
+                "creation_timeout_secs": 120,
+                "image": "valkey/valkey:definitely-not-a-real-tag",
+                "port": 6379,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "VALKEY_ADDR", "value_pattern": "^([^:]+):" },
+                        "port": { "env_var_name": "VALKEY_ADDR", "value_pattern": ":([0-9]+)$" },
+                        "password": "VALKEY_PASSWORD"
+                    }
+                },
+                "args": ["valkey-server", "--requirepass", "$(MIRRORD_PARAM_PASSWORD)"]
+            }
+        ]
+    }
+}

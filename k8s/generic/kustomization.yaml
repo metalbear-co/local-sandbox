@@ -1,0 +1,11 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: generic-test
+
+resources:
+  - namespace.yaml
+  - valkey-deployment.yaml
+  - app-deployment.yaml
+  - influxdb-deployment.yaml
+  - influx-app-deployment.yaml

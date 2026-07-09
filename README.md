@@ -2,35 +2,83 @@
 
 Local testing environment for mirrord operator features.
 
+## Task layout
+
+There are two worlds:
+
+- **Core** (`Taskfile.yml` + `taskfiles/*.yml`) — the small, curated set of
+  day-to-day flows described below. Run `task` with no arguments to see them.
+- **Legacy** (`Taskfile.legacy.yml` + `tasks/*.yml`) — the entire previous
+  task set, unchanged, behind the `legacy:` prefix. Anything not (yet) in
+  the core set lives there: `task legacy:up`, `task legacy:postgres:deploy`,
+  `task legacy:operator:update`, `task legacy:multicluster:...`, etc.
+  `task legacy` lists them all. Pass variables after `--`, e.g.
+  `task legacy:operator:load -- TAG=my-branch`.
+
 ## Quick Start
 
-### First Time
-
 ```bash
-task check          # verify prerequisites, install missing tools
-task license:generate
-task cluster:create
+task check           # health check: tools, cluster, operator, agent image
+task cluster:create  # create/start the minikube cluster
+task operator:use    # deploy a released operator (VERSION=latest|x.y.z|pick)
 ```
 
-### Day-to-Day
+### Operator development — no docker builds
 
-| Command | What it does |
-|---------|-------------|
-| `task menu` | Fuzzy-search all tasks -- type fragments, pick with arrow keys |
-| `task menu:module` | Pick a module first (postgres, sqs, ...), then pick a task |
-| `task up` | Interactive test setup -- pick module, fresh cluster?, build? |
-| `task dashboard` | See everything: cluster, operator, all CRDs, problem pods |
-| `task recent` | Re-run a past task (shows name + args + "2h ago") |
-| `task check` | Validate env, offer to install missing tools |
-
-### Examples
+The operator image is never built locally. A released image runs in the
+cluster, and your local code runs on top of it with mirrord:
 
 ```bash
-task menu                              # forgot the command? fuzzy search
-task up                                # interactive: pick postgres, fresh=no, build=yes
-task up MODULE=postgres                # skip module picker
-task dashboard                         # what's running right now?
-task recent                            # re-run something from earlier
+task operator:use              # released operator into the cluster (loads agent image too)
+task operator:crds             # apply CRDs from your local ../operator chart
+task operator:dev              # run local operator-service under mirrord (steals traffic)
+```
+
+`operator:use` needs `RELEASE_LICENSE_KEY` in `.env`. `operator:dev` applies
+`operator:crds` automatically first. The old build-an-image flow is still
+available as `task legacy:operator:update`.
+
+### Queue splitting — one pattern for every module
+
+Same verbs for `sqs`, `kafka`, `rmq`, `pubsub`, `servicebus`, `redis-pubsub`,
+`temporal`, `bullmq`:
+
+```bash
+task sqs:deploy                        # deploy the test env into the cluster
+task sqs:run:local                     # run the consumer locally under mirrord
+task sqs:send:match                    # message matches the filter -> local session
+task sqs:send:nomatch                  # message doesn't match -> cluster consumer
+task sqs:send:match MESSAGE="hello"    # custom message body
+task sqs:logs / status / clean         # support verbs
+```
+
+### Database branching — one pattern for every DB
+
+Same verbs for `postgres`, `mysql`, `mongodb`, `mssql`, `spanner`, `redis`,
+`generic` (Valkey + Influx demo for RFC 0008):
+
+```bash
+task postgres:deploy                                  # source DB into the cluster
+task postgres:run:local                               # run app under mirrord -> creates a branch DB
+task postgres:query:source QUERY="SELECT * FROM users;"
+task postgres:query:branch QUERY="SELECT count(*) FROM users;"
+task postgres:shell:source / shell:branch             # interactive DB shells
+task postgres:branches / logs / status / clean        # support verbs
+```
+
+Each module's header comment shows DB-specific `INSERT`/`SELECT` examples
+(`mongosh` for mongodb, `sqlcmd` for mssql, `valkey-cli` for generic, ...).
+
+### mirrord agent image
+
+The cluster runs the agent image `test` with `pullPolicy: Never`, so it must
+be loaded into minikube. `operator:use` keeps it loaded automatically;
+manually:
+
+```bash
+task mirrord:agent:build   # build from ../mirrord and load into minikube
+task mirrord:agent:load    # (re)load the docker image into minikube
+task mirrord:agent:status  # where is the image?
 ```
 
 ## Prerequisites
@@ -56,6 +104,17 @@ cp .env.example .env
 task license:generate
 task cluster:create
 ```
+
+---
+
+## Legacy reference
+
+Everything below documents the **legacy** task set. Those tasks all still
+work, but are now behind the `legacy:` prefix, e.g.
+`task legacy:operator:update`, `task legacy:test:postgres`, `task legacy:menu`.
+Pass variables after `--` (`task legacy:operator:load -- TAG=my-branch`).
+(Exceptions: `cluster:*`, `operator:use`, and the per-module core verbs shown
+above exist in the new core set.)
 
 ## Backwards Compatibility Testing
 

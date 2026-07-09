@@ -1,0 +1,175 @@
+version: "3"
+
+# GCP Pub/Sub queue splitting (emulator-based).
+#
+#   task pubsub:deploy         deploy the Pub/Sub emulator + consumer into the cluster
+#   task pubsub:run:local      run the consumer locally under mirrord (starts the split)
+#   task pubsub:send:match     message with tenant=test-user -> your local session
+#   task pubsub:send:nomatch   message with tenant=other     -> cluster consumer
+#
+# The split filter lives in k8s/overlays/pubsub-emulator/mirrord.json
+# (message attribute `tenant` matching ^test). Topic/subscription are created
+# in the emulator at deploy time so the consumer and split config agree.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/pubsub-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/pubsub-emulator'
+  EMULATOR_NAMESPACE: "pubsub-emulator"
+  # Overridable via PUBSUB_MIRRORD_CONFIG / PUBSUB_PROJECT_ID / PUBSUB_TOPIC /
+  # PUBSUB_SUBSCRIPTION in .env (module-prefixed names so they can't collide
+  # with other modules' globals).
+  PUBSUB_MIRRORD_CONFIG: '{{.PUBSUB_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/pubsub-emulator/mirrord.json")}}'
+  PROJECT_ID: '{{.PUBSUB_PROJECT_ID | default "test-project"}}'
+  TOPIC: '{{.PUBSUB_TOPIC | default "test-topic"}}'
+  SUBSCRIPTION: '{{.PUBSUB_SUBSCRIPTION | default "test-subscription"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Pub/Sub test env (emulator + consumer)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t pubsub-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load pubsub-consumer:local
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY}}/namespace.yaml
+      - kubectl apply -f {{.OVERLAY}}/pubsub-emulator.yaml
+      - task: _wait:emulator
+      - task: _setup:topic
+      - kubectl apply -f {{.OVERLAY}}/consumer.yaml
+      - task: _wait:consumer
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config.yaml
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/pubsub-consumer
+    cmds:
+      - go build -o /tmp/pubsub-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.PUBSUB_MIRRORD_CONFIG}} -- /tmp/pubsub-consumer"
+
+  send:match:
+    desc: 'Publish a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "test-user"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Publish a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "other"
+          TYPE: "basic"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Publish a message with explicit routing (TENANT=... TYPE=... MESSAGE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X POST \
+            "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}:publish" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"messages\": [{
+                \"data\": \"$(echo -n '{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"{{.TYPE}}","message":"{{.MESSAGE}}","amount":100}' | base64)\",
+                \"attributes\": {
+                  \"tenant\": \"{{.TENANT}}\",
+                  \"type\": \"{{.TYPE}}\"
+                }
+              }]
+            }" >/dev/null
+        case "{{.TENANT}}" in
+          test*) echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *)     echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=pubsub-consumer --tail=100 -f
+
+  logs:emulator:
+    desc: Tail the Pub/Sub emulator logs
+    cmds:
+      - kubectl logs -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator --tail=100 -f
+
+  status:
+    desc: Show consumer, emulator and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=pubsub-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== emulator ==="
+      - kubectl get pods -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split config ==="
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== topics ==="
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics" 2>/dev/null || echo "emulator not reachable"
+
+  clean:
+    desc: Remove the Pub/Sub test env from the cluster
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/pubsub-emulator.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete namespace {{.EMULATOR_NAMESPACE}} --ignore-not-found=true
+
+  _setup:topic:
+    internal: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        echo "Creating topic {{.TOPIC}}..."
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}" \
+            -H "Content-Type: application/json" || true
+        echo ""
+        echo "Creating subscription {{.SUBSCRIPTION}} on topic {{.TOPIC}}..."
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} $POD -- \
+          curl -s -X PUT "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/subscriptions/{{.SUBSCRIPTION}}" \
+            -H "Content-Type: application/json" \
+            -d "{\"topic\": \"projects/{{.PROJECT_ID}}/topics/{{.TOPIC}}\"}" || true
+        echo ""
+        echo "Topic and subscription created."
+
+  _wait:emulator:
+    internal: true
+    cmds:
+      - echo "Waiting for Pub/Sub emulator..."
+      # Wait on the Deployment rollout, not a label-selected pod: right after
+      # `kubectl apply` the ReplicaSet may not have created the pod yet, and
+      # `kubectl wait pod -l ...` fails with "no matching resources found".
+      - kubectl rollout status deployment/pubsub-emulator -n {{.EMULATOR_NAMESPACE}} --timeout=300s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Pub/Sub consumer..."
+      - kubectl wait --for=condition=ready pod -l app=pubsub-consumer -n {{.NAMESPACE}} --timeout=120s

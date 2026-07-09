@@ -1,0 +1,153 @@
+version: "3"
+
+# SQS queue splitting (LocalStack).
+#
+#   task sqs:deploy         deploy LocalStack + consumer into the cluster
+#   task sqs:run:local      run the consumer locally under mirrord (starts the split)
+#   task sqs:send:match     message with tenant=Avi.Test  -> your local session
+#   task sqs:send:nomatch   message with tenant=Basic     -> cluster consumer
+#
+# The split filter lives in k8s/overlays/sqs-localstack/mirrord.json
+# (message attribute `tenant` matching ^Avi\.). Region is pinned to eu-north-1
+# so the source queue, consumer env and operator (operator-values.yaml) agree.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/sqs-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/sqs-localstack'
+  SQS_MIRRORD_CONFIG: '{{.SQS_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord.json")}}'
+  # Overridable via SQS_REGION / SQS_QUEUE_URL in .env (module-prefixed names
+  # so they can't collide with other modules' globals).
+  REGION: '{{.SQS_REGION | default "eu-north-1"}}'
+  QUEUE_URL: '{{.SQS_QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the SQS test env (LocalStack + consumer)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t sqs-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load sqs-consumer:local
+      - kubectl apply -k {{.OVERLAY}}
+      - task: _wait:localstack
+      - task: _wait:consumer
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/sqs-consumer
+    cmds:
+      - go build -o /tmp/sqs-consumer main.go
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs create-queue --queue-name TestQueue --region {{.REGION}} >/dev/null 2>&1 || true
+      - |
+        AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION={{.REGION}} \
+          QUEUE_NAME=test-queue MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} exec -f {{.SQS_MIRRORD_CONFIG}} -- /tmp/sqs-consumer
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "Avi.Test"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "Basic"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Send a message with explicit routing (TENANT=... MESSAGE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "Avi.Test"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        kubectl exec -n localstack deploy/localstack -- awslocal sqs send-message \
+          --queue-url {{.QUEUE_URL}} \
+          --region {{.REGION}} \
+          --message-body '{{.MESSAGE}}' \
+          --message-attributes 'tenant={StringValue={{.TENANT}},DataType=String}' >/dev/null
+        case "{{.TENANT}}" in
+          Avi.*) echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *)     echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=sqs-consumer --tail=100 -f
+
+  logs:localstack:
+    desc: Tail LocalStack logs
+    cmds:
+      - kubectl logs -n localstack -l app.kubernetes.io/name=localstack --tail=100 -f
+
+  status:
+    desc: Show consumer, LocalStack and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=sqs-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== localstack ==="
+      - kubectl get pods -n localstack -l app.kubernetes.io/name=localstack 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== queues ==="
+      - kubectl exec -n localstack deploy/localstack -- awslocal sqs list-queues --region {{.REGION}} 2>/dev/null || echo "localstack not reachable"
+
+  reset:
+    desc: "Full split reset: kill local consumer, delete split sessions + split queues, restart operator"
+    cmds:
+      - pkill -f /tmp/sqs-consumer 2>/dev/null || true
+      - kubectl delete mirrordclustersplitsession --all -A --wait=false 2>/dev/null || true
+      - kubectl delete mirrordsqssession --all -A --wait=false 2>/dev/null || true
+      - kubectl delete mirrordclustersession --all -n mirrord --wait=false 2>/dev/null || true
+      # Split sessions carry the `mirrord-queue-splitting` finalizer; orphaned
+      # ones never reconcile and stay Terminating forever, so strip it — this
+      # reset wipes the queues and restarts the operator anyway.
+      - |
+        for name in $(kubectl get mirrordclustersplitsession -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+          kubectl patch mirrordclustersplitsession "$name" --type=merge -p '{"metadata":{"finalizers":[]}}' 2>/dev/null || true
+        done
+      - |
+        for q in $(kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs list-queues --region {{.REGION}} --query 'QueueUrls[]' --output text 2>/dev/null \
+            | tr '\t' '\n' | grep mirrord); do
+          echo "deleting split queue $(basename "$q")"
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs delete-queue --queue-url "$q" --region {{.REGION}} 2>/dev/null || true
+        done
+      - kubectl rollout restart deployment/mirrord-operator -n mirrord
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      - echo "reset complete — start fresh with 'task sqs:run:local'"
+
+  clean:
+    desc: Remove the SQS test env from the cluster
+    cmds:
+      - kubectl delete -k {{.OVERLAY}} --ignore-not-found=true
+      - kubectl delete namespace localstack --ignore-not-found=true
+
+  _wait:localstack:
+    internal: true
+    cmds:
+      - echo "Waiting for LocalStack..."
+      - kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=localstack -n localstack --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for SQS consumer..."
+      - kubectl wait --for=condition=ready pod -l app=sqs-consumer -n {{.NAMESPACE}} --timeout=120s

@@ -1,0 +1,152 @@
+version: "3"
+
+# BullMQ queue splitting (Redis).
+#
+#   task bullmq:deploy         deploy Redis + consumer + split CRDs into the cluster
+#   task bullmq:run:local      run the consumer locally under mirrord (starts the split)
+#   task bullmq:send:match     job with tenant=test   -> your local session
+#   task bullmq:send:nomatch   job with tenant=other  -> cluster consumer
+#
+# The split filter lives in k8s/overlays/bullmq/mirrord.json
+# (job data field `tenant` matching ^test). Jobs are pushed straight into
+# Redis with redis-cli, so no local BullMQ client is needed.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  REDIS_NAMESPACE: "redis-test"
+  APP_DIR: '{{.ROOT_DIR}}/apps/bullmq-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/bullmq'
+  CHARTS_DIR: '{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator'
+  BULLMQ_MIRRORD_CONFIG: '{{.BULLMQ_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/bullmq/mirrord.json")}}'
+  # Overridable via BULLMQ_QUEUE / BULLMQ_PREFIX in .env (module-prefixed names
+  # so they can't collide with other modules' globals).
+  BULLMQ_QUEUE: '{{.BULLMQ_QUEUE | default "orders"}}'
+  BULLMQ_PREFIX: '{{.BULLMQ_PREFIX | default "bull"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the BullMQ test env (Redis + consumer + split CRDs)
+    cmds:
+      - cd {{.APP_DIR}} && go mod tidy
+      - "{{.CONTAINER_RUNTIME}} build -t bullmq-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load bullmq-consumer:local
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/namespace.yaml
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/redis-deployment.yaml
+      - kubectl delete deployment redis-app -n {{.REDIS_NAMESPACE}} --ignore-not-found=true
+      - task: _wait:redis
+      - kubectl apply --validate=false -f {{.OVERLAY}}/namespace.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY}}/consumer.yaml
+      - task: _wait:consumer
+      - |
+        echo "Applying CRDs from operator chart..."
+        helm template mirrord-operator {{.CHARTS_DIR}} \
+          -f {{.ROOT_DIR}}/operator-values.yaml \
+          -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
+      - kubectl apply --validate=false -f {{.OVERLAY}}/property-list.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY}}/split-config.yaml
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/bullmq-consumer
+    cmds:
+      - go build -o /tmp/bullmq-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.BULLMQ_MIRRORD_CONFIG}} -- /tmp/bullmq-consumer"
+
+  send:match:
+    desc: 'Send a job matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "test"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a job NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "other"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Send a job with explicit routing (TENANT=... MESSAGE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "test"}}'
+      MESSAGE: '{{.MESSAGE | default "Test job"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        ID=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli INCR "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:id")
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli HSET "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$ID" data "{\"tenant\":\"{{.TENANT}}\",\"body\":\"{{.MESSAGE}}\"}" >/dev/null
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli RPUSH "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:wait" "$ID" >/dev/null
+        case "{{.TENANT}}" in
+          test*) echo "sent job $ID '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *)     echo "sent job $ID '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=bullmq-consumer --tail=100 -f
+
+  logs:redis:
+    desc: Tail Redis logs
+    cmds:
+      - kubectl logs -n {{.REDIS_NAMESPACE}} -l app=redis-main --tail=100 -f
+
+  status:
+    desc: Show consumer, Redis and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=bullmq-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== redis ==="
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l app=redis-main 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split config ==="
+      - kubectl get mirrordsplitconfig -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== queue depth ==="
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [ -z "$POD" ]; then
+          echo "redis not reachable"
+        else
+          for key in wait active delayed; do
+            LEN=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli LLEN "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$key" 2>/dev/null || echo 0)
+            printf "%-30s %s\n" "{{.BULLMQ_PREFIX}}:{{.BULLMQ_QUEUE}}:$key" "$LEN"
+          done
+          echo ""
+          echo "temp queues (mirrord-tmp-*):"
+          kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli KEYS "{{.BULLMQ_PREFIX}}:mirrord-tmp-*" 2>/dev/null | grep . || echo "  (none)"
+        fi
+
+  clean:
+    desc: Remove the BullMQ test env from the cluster
+    cmds:
+      - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true
+
+  _wait:redis:
+    internal: true
+    cmds:
+      - echo "Waiting for Redis..."
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.REDIS_NAMESPACE}} --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for BullMQ consumer..."
+      - kubectl wait --for=condition=ready pod -l app=bullmq-consumer -n {{.NAMESPACE}} --timeout=120s

@@ -1,0 +1,187 @@
+version: "3"
+
+# MongoDB database branching.
+#
+#   task mongodb:deploy         deploy the source DB + branch target into the cluster
+#   task mongodb:run:local      run the app locally under mirrord (creates a branch DB)
+#   task mongodb:query:source   query the source (cluster) database
+#   task mongodb:query:branch   query the branch database
+#
+# The branch config lives in k8s/overlays/mongodb/mirrord.json
+# (feature.db_branches, type "mongodb" — branch is created when run:local starts).
+#
+# Query examples (QUERY= takes any mongosh expression):
+#   task mongodb:query:source QUERY="db.users.find().pretty()"
+#   task mongodb:query:source QUERY="db.users.insertOne({name: 'dev', email: 'dev@example.com'})"
+#   task mongodb:query:branch QUERY="db.getCollectionNames()"
+#   task mongodb:query:branch QUERY="db.users.countDocuments()"
+#   or interactively: task mongodb:shell:source / task mongodb:shell:branch
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/mongodb-app'
+  MONGODB_DIR: '{{.ROOT_DIR}}/k8s/mongodb'
+  SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/mongodb/modular-tests/scenarios'
+  MONGODB_MIRRORD_CONFIG: '{{.MONGODB_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mongodb/mirrord.json")}}'
+  # Connection strings: source requires auth, branch pods run open on localhost.
+  MONGODB_SOURCE_URI: "mongodb://admin:password@localhost:27017/source_db?authSource=admin"
+  MONGODB_BRANCH_URI: "mongodb://localhost:27017/branch_db"
+
+tasks:
+  deploy:
+    desc: Deploy the MongoDB test env (source DB + env-val branch target)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.MONGODB_DIR}}
+      - task: _wait:source
+      # env-val provides the mirrord target pod and a standing
+      # MongoDBBranchDatabase so query:branch works even before run:local.
+      - kubectl apply -k {{.SCENARIOS_DIR}}/env-val
+      - task: _wait:branches
+
+  run:local:
+    desc: Run the MongoDB app locally under mirrord (creates a branch DB; Ctrl-C to stop)
+    interactive: true
+    dir: apps/mongodb-app
+    preconditions:
+      - sh: test -f {{.MONGODB_MIRRORD_CONFIG}}
+        msg: "mirrord config not found at {{.MONGODB_MIRRORD_CONFIG}}"
+    cmds:
+      - go build -o /tmp/mongodb-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.MONGODB_MIRRORD_CONFIG}} -- /tmp/mongodb-app
+
+  query:source:
+    desc: 'Query the source database (QUERY="db.users.find()")'
+    vars:
+      QUERY: '{{.QUERY | default "db.users.find()"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} mongodb-test -- mongosh "{{.MONGODB_SOURCE_URI}}" --quiet --eval "{{.QUERY}}"
+
+  query:branch:
+    desc: 'Query a branch database (QUERY="..." [BRANCH=mongo-test-branch-env-val])'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "db.users.find()"}}'
+      BRANCH: '{{.BRANCH | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod found. Deploy first, or start one with 'task mongodb:run:local'."
+          echo "Existing branches:"
+          kubectl get mongodbbranchdatabases -n {{.NAMESPACE}} 2>/dev/null || echo "  none"
+          exit 1
+        fi
+        echo "=== branch pod: $POD (db: branch_db) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mongosh "{{.MONGODB_BRANCH_URI}}" --quiet --eval "{{.QUERY}}"
+
+  shell:source:
+    desc: mongosh shell into the source database
+    interactive: true
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} mongodb-test -- mongosh "{{.MONGODB_SOURCE_URI}}"
+
+  shell:branch:
+    desc: mongosh shell into the newest branch database ([BRANCH=...])
+    interactive: true
+    vars:
+      BRANCH: '{{.BRANCH | default ""}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod found."; exit 1; fi
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- mongosh "{{.MONGODB_BRANCH_URI}}"
+
+  branches:
+    desc: List MongoDBBranchDatabase CRDs and branch pods
+    cmds:
+      - kubectl get mongodbbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode,AGE:.metadata.creationTimestamp 2>/dev/null || echo "No branches"
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || true
+
+  logs:
+    desc: Tail the source database logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} mongodb-test --tail=100 -f
+
+  logs:branch:
+    desc: Tail the newest branch pod logs
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No branch pod found."; exit 1; fi
+        kubectl logs -n {{.NAMESPACE}} "$POD" --tail=100 -f
+
+  status:
+    desc: Show source, branches and branch pods
+    silent: true
+    cmds:
+      - echo "=== source ==="
+      - kubectl get pod mongodb-test -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== branch CRDs ==="
+      - kubectl get mongodbbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== branch pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the MongoDB test env
+    cmds:
+      - kubectl delete -k {{.SCENARIOS_DIR}}/env-val --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.MONGODB_DIR}} --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete mongodbbranchdatabases --all -n {{.NAMESPACE}} 2>/dev/null || true
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source database..."
+      - kubectl wait --for=condition=ready pod mongodb-test -n {{.NAMESPACE}} --timeout=180s
+      - |
+        # Wait for MongoDB to actually accept connections
+        for i in $(seq 1 30); do
+          if kubectl exec -n {{.NAMESPACE}} mongodb-test -- mongosh --quiet --eval "db.adminCommand('ping')" 2>/dev/null | grep -q ok; then
+            echo "MongoDB source database ready."
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "MongoDB did not accept connections; check 'task mongodb:status'"
+        exit 1
+
+  _wait:branches:
+    internal: true
+    cmds:
+      - echo "Waiting for branch pods..."
+      - |
+        for i in $(seq 1 60); do
+          READY=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$READY" -ge 1 ]; then echo "Branch pod is running."; exit 0; fi
+          sleep 2
+        done
+        echo "Branch pod did not come up; check 'task mongodb:status'"
+        exit 1

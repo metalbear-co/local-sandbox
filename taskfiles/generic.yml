@@ -1,0 +1,267 @@
+version: "3"
+
+# GENERIC database branching (RFC 0008).
+#
+#   task generic:deploy               deploy Valkey + InfluxDB + both apps into the cluster
+#   task generic:run:local            run the Valkey app locally under mirrord (creates a generic branch)
+#   task generic:seed                 seed keys into the source (cluster) Valkey
+#   task generic:query:source         query the source Valkey
+#   task generic:query:branch         query the branch Valkey
+#   task generic:verify               RFC 0008 checks: MIRRORD_PARAM_* env + secretKeyRef passthrough
+#   task generic:influx:run:local     run the InfluxDB app locally under mirrord (InfluxDB branch)
+#
+# The branched service is Valkey - Redis-compatible, but a different image than mirrord's
+# built-in Redis dialect assumes, which is exactly the generic feature's use case. The setup
+# exercises the full generic surface:
+#   - user-supplied image + args with $(MIRRORD_PARAM_*) references
+#   - Secret-backed password resolved off the target pod (secretKeyRef passthrough -
+#     the operator never reads the value)
+#   - a custom `cache_name` extra param
+#   - composite VALKEY_ADDR=host:port var rewritten in place via value_pattern
+# The InfluxDB variant (the RFC's canonical example) adds env-based bootstrap
+# (DOCKER_INFLUXDB_INIT_*), a direct Kubernetes Secret param source, a URL-shaped
+# var rewritten by pattern, and the http_get readiness probe.
+#
+# Requires the operator to run with OPERATOR_GENERIC_BRANCHING=true
+# (operator-values.yaml: genericBranching: true).
+#
+# Query examples (QUERY= takes any valkey-cli command):
+#   task generic:query:source QUERY="KEYS *"
+#   task generic:query:source QUERY="SET greeting 'written to source'"
+#   task generic:query:branch QUERY="GET greeting"
+#   task generic:query:branch QUERY="MGET greeting counter source"
+#   task generic:influx:query:source
+#   task generic:influx:query:branch
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/generic-app'
+  INFLUX_APP_DIR: '{{.ROOT_DIR}}/apps/influx-app'
+  GENERIC_NAMESPACE: 'generic-test'
+  VALKEY_PASSWORD: 'branch-me-if-you-can'
+  INFLUX_TOKEN: 'sandbox-super-secret-token'
+  INFLUX_ORG: 'metalbear'
+  INFLUX_BUCKET: 'metrics'
+
+tasks:
+  deploy:
+    desc: Deploy the generic test env (Valkey + InfluxDB + both apps)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t generic-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load generic-app:latest
+      - "{{.CONTAINER_RUNTIME}} build -t influx-app:latest {{.INFLUX_APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load influx-app:latest
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/generic
+      - task: _wait:valkey
+      - task: _wait:app
+      - task: _wait:influx
+
+  run:local:
+    desc: Run the Valkey app locally under mirrord (creates a generic branch; Ctrl-C to stop)
+    interactive: true
+    dir: apps/generic-app
+    cmds:
+      - go mod tidy && go build -o generic-app .
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8080 {{.MIRRORD_BIN}} exec \
+          -t deploy/generic-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch.json \
+          -- ./generic-app
+
+  seed:
+    desc: Seed test data into the source (cluster) Valkey
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l app=valkey-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- valkey-cli -a '{{.VALKEY_PASSWORD}}' MSET \
+          greeting "Hello from the SOURCE valkey!" \
+          counter "42" \
+          source "cluster"
+        echo "Seeded 3 keys into the source Valkey"
+
+  query:source:
+    desc: 'Query the source (cluster) Valkey (QUERY="KEYS *")'
+    vars:
+      QUERY: '{{.QUERY | default "KEYS *"}}'
+    cmds:
+      - |
+        set -f  # no globbing, so QUERY="KEYS *" passes the * through to valkey-cli
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l app=valkey-main -o jsonpath='{.items[0].metadata.name}')
+        echo ""
+        echo "=== SOURCE VALKEY (cluster) ==="
+        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- valkey-cli -a '{{.VALKEY_PASSWORD}}' {{.QUERY}}
+
+  query:branch:
+    desc: 'Query the branch Valkey with the app''s password (QUERY="KEYS *")'
+    vars:
+      QUERY: '{{.QUERY | default "KEYS *"}}'
+    cmds:
+      - |
+        set -f  # no globbing, so QUERY="KEYS *" passes the * through to valkey-cli
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="valkey-generic-branch")]}{.metadata.name}{end}')
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
+        if [ -z "$POD" ]; then echo "No Valkey branch pod found. Run 'task generic:run:local' first."; exit 1; fi
+        echo ""
+        echo "=== BRANCH VALKEY ($POD) ==="
+        echo '(authenticating with the SAME password the app uses - the MIRRORD_PARAM_PASSWORD bootstrap)'
+        kubectl exec -n {{.GENERIC_NAMESPACE}} ${POD#pod/} -- valkey-cli -a '{{.VALKEY_PASSWORD}}' {{.QUERY}}
+        echo ""
+        echo "A fresh branch starts EMPTY - keys appear here once the mirrord-run app writes."
+
+  verify:
+    desc: "Verify the branch: MIRRORD_PARAM_* env, secretKeyRef passthrough, empty start"
+    cmds:
+      - task: verify:params
+      - task: query:branch
+
+  verify:params:
+    desc: Show the branch pod's MIRRORD_PARAM_* env (password must be a secretKeyRef, not a value)
+    cmds:
+      - |
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="valkey-generic-branch")]}{.metadata.name}{end}')
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
+        if [ -z "$POD" ]; then echo "No Valkey branch pod found. Run 'task generic:run:local' first."; exit 1; fi
+        echo "=== Branch pod: $POD ==="
+        echo ""
+        echo "--- image + args ---"
+        kubectl get -n {{.GENERIC_NAMESPACE}} $POD -o jsonpath='{.spec.containers[0].image}{"\n"}{.spec.containers[0].args}{"\n"}'
+        echo ""
+        echo "--- env (MIRRORD_PARAM_PASSWORD must show secretKeyRef, no plaintext) ---"
+        kubectl get -n {{.GENERIC_NAMESPACE}} $POD -o jsonpath='{.spec.containers[0].env}' | python3 -m json.tool
+
+  branches:
+    desc: Show BranchDatabase CRDs + branch status via the CLI
+    cmds:
+      - kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o wide 2>/dev/null || echo "No BranchDatabase CRDs"
+      - '{{.MIRRORD_BIN}} db-branches -n {{.GENERIC_NAMESPACE}} status 2>/dev/null || true'
+
+  logs:
+    desc: Tail the generic app logs
+    cmds:
+      - kubectl logs -n {{.GENERIC_NAMESPACE}} -l app=generic-app --tail=100 -f
+
+  logs:branch:
+    desc: Tail the branch Valkey pod logs
+    cmds:
+      - |
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="valkey-generic-branch")]}{.metadata.name}{end}')
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
+        if [ -z "$POD" ]; then echo "No Valkey branch pod found."; exit 1; fi
+        kubectl logs -n {{.GENERIC_NAMESPACE}} ${POD#pod/} --tail=100 -f
+
+  status:
+    desc: Show generic test environment status
+    silent: true
+    cmds:
+      - echo "=== Source Valkey ==="
+      - kubectl get pods -n {{.GENERIC_NAMESPACE}} -l app=valkey-main 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== App ==="
+      - kubectl get pods -n {{.GENERIC_NAMESPACE}} -l app=generic-app 2>/dev/null || echo "Not deployed"
+      - echo ""
+      - echo "=== Branch pods ==="
+      - kubectl get pods -n {{.GENERIC_NAMESPACE}} -l db-owner-name 2>/dev/null || echo "None"
+      - echo ""
+      - echo "=== BranchDatabase CRDs ==="
+      - kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} 2>/dev/null || echo "None"
+
+  clean:
+    desc: Remove the generic test env from the cluster
+    cmds:
+      - kubectl delete branchdatabases -n {{.GENERIC_NAMESPACE}} --all --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/generic --ignore-not-found=true
+
+  # --- InfluxDB variant (the RFC's canonical example) -------------------------------------
+  # Exercises the surface the Valkey test doesn't: env-based bootstrap (DOCKER_INFLUXDB_INIT_*),
+  # a DIRECT Kubernetes Secret param source (token comes from influx-creds, not from the pod
+  # env), a URL-shaped var rewritten by pattern, and the http_get readiness probe.
+
+  influx:run:local:
+    desc: Run the InfluxDB app locally under mirrord (creates an InfluxDB branch; Ctrl-C to stop)
+    interactive: true
+    dir: apps/influx-app
+    cmds:
+      - go build -o influx-app .
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8090 {{.MIRRORD_BIN}} exec \
+          -t deploy/influx-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch.json \
+          -- ./influx-app
+
+  influx:seed:
+    desc: Write a point into the SOURCE InfluxDB
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l app=influxdb-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- influx write \
+          --org {{.INFLUX_ORG}} --bucket {{.INFLUX_BUCKET}} --token '{{.INFLUX_TOKEN}}' \
+          "sandbox,writer=cluster value=42"
+        echo "Seeded 1 point into the source InfluxDB"
+
+  influx:query:source:
+    desc: Query the SOURCE InfluxDB (last hour of points)
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l app=influxdb-main -o jsonpath='{.items[0].metadata.name}')
+        echo ""
+        echo "=== SOURCE INFLUXDB (cluster) ==="
+        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- influx query \
+          --org {{.INFLUX_ORG}} --token '{{.INFLUX_TOKEN}}' \
+          'from(bucket:"{{.INFLUX_BUCKET}}") |> range(start:-1h)'
+
+  influx:query:branch:
+    desc: Query the BRANCH InfluxDB with the app's token (proves the setup-mode bootstrap)
+    cmds:
+      - |
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="influx-generic-branch")]}{.metadata.name}{end}')
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
+        if [ -z "$POD" ]; then echo "No InfluxDB branch pod found. Run 'task generic:influx:run:local' first."; exit 1; fi
+        echo ""
+        echo "=== BRANCH INFLUXDB ($POD) ==="
+        echo '(same org/bucket/token the app already uses - bootstrapped via MIRRORD_PARAM_*)'
+        kubectl exec -n {{.GENERIC_NAMESPACE}} ${POD#pod/} -- influx query \
+          --org {{.INFLUX_ORG}} --token '{{.INFLUX_TOKEN}}' \
+          'from(bucket:"{{.INFLUX_BUCKET}}") |> range(start:-1h)' || echo "(no points yet - branch starts empty)"
+
+  # ----------------------------------------------------------------------------------------
+
+  _wait:valkey:
+    internal: true
+    cmds:
+      - echo "Waiting for Valkey..."
+      - kubectl wait --for=condition=ready pod -l app=valkey-main -n {{.GENERIC_NAMESPACE}} --timeout=120s || true
+
+  _wait:app:
+    internal: true
+    cmds:
+      - echo "Waiting for generic app..."
+      - kubectl wait --for=condition=ready pod -l app=generic-app -n {{.GENERIC_NAMESPACE}} --timeout=120s || true
+
+  _wait:influx:
+    internal: true
+    cmds:
+      - echo "Waiting for InfluxDB + app..."
+      - kubectl wait --for=condition=ready pod -l app=influxdb-main -n {{.GENERIC_NAMESPACE}} --timeout=180s || true
+      - kubectl wait --for=condition=ready pod -l app=influx-app -n {{.GENERIC_NAMESPACE}} --timeout=120s || true
