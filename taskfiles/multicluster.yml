@@ -369,9 +369,10 @@ tasks:
   #   task multicluster:servicebus:preview:logs / status / stop
 
   servicebus:preview:start:
-    desc: "Start a preview env for the topic consumer via the PRIMARY operator (PREVIEW_KEY=... PREVIEW_IMAGE=...)"
+    desc: "Start a preview env (NAME=prev-1 gives it its OWN filter tenant=^prev-1 so you can run several and target each; without NAME uses the default ^test filter)"
     interactive: true
     vars:
+      NAME: '{{.NAME | default ""}}'
       PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-asb-preview"}}'
       PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "servicebus-consumer:local"}}'
       PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
@@ -381,6 +382,23 @@ tasks:
         msg: "Target consumer missing on {{.REMOTE}} — run 'task multicluster:servicebus:deploy' first"
     cmds:
       - |
+        CFG="{{.MC_SB_PREVIEW_CONFIG}}"
+        KEY="{{.PREVIEW_KEY}}"
+        # NAME=prev-1: generate a per-preview config whose split filter only
+        # matches tenants starting with that name. Each named preview then
+        # receives ONLY its own messages (task multicluster:servicebus:send:to
+        # NAME=prev-1), and previews don't compete with each other.
+        if [ -n "{{.NAME}}" ]; then
+          KEY="{{.NAME}}"
+          CFG="/tmp/mirrord-preview-{{.NAME}}.json"
+          python3 - <<'PY'
+        import json
+        c = json.load(open("{{.MC_SB_PREVIEW_CONFIG}}"))
+        c["feature"]["split_queues"]["test-topic-sub"]["message_filter"] = {"tenant": "^{{.NAME}}"}
+        json.dump(c, open("/tmp/mirrord-preview-{{.NAME}}.json", "w"), indent=2)
+        PY
+          echo "preview '{{.NAME}}': filter tenant=^{{.NAME}} (config $CFG)"
+        fi
         # Same marker rule as run:local — with operator:dev running, the
         # preview session must be labeled so YOUR operator handles it.
         if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
@@ -389,22 +407,37 @@ tasks:
         fi
         MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
           {{.MIRRORD_BIN}} preview start \
-            -f {{.MC_SB_PREVIEW_CONFIG}} \
+            -f "$CFG" \
             -i "{{.PREVIEW_IMAGE}}" \
-            -k "{{.PREVIEW_KEY}}" \
+            -k "$KEY" \
             --timeout {{.PREVIEW_TIMEOUT}}
 
+  servicebus:send:to:
+    desc: 'Send a message to ONE named preview env (NAME=prev-1 [MESSAGE=...])'
+    preconditions:
+      - sh: test -n "{{.NAME}}"
+        msg: "NAME is required, e.g. task multicluster:servicebus:send:to NAME=prev-1"
+    cmds:
+      - task: servicebus:send
+        vars:
+          TENANT: "{{.NAME}}-user"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default (print "hello preview " .NAME)}}'
+
   servicebus:preview:stop:
-    desc: "Stop the preview env (PREVIEW_KEY=mc-asb-preview)"
+    desc: "Stop a preview env (NAME=prev-1, or PREVIEW_KEY for the default one)"
     vars:
+      NAME: '{{.NAME | default ""}}'
       PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-asb-preview"}}'
     cmds:
       - |
+        KEY="{{.NAME}}"
+        [ -z "$KEY" ] && KEY="{{.PREVIEW_KEY}}"
         if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
           export OPERATOR_ISOLATION_MARKER=local-dev
         fi
         MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
-          {{.MIRRORD_BIN}} preview stop -k "{{.PREVIEW_KEY}}" || true
+          {{.MIRRORD_BIN}} preview stop -k "$KEY" || true
 
   servicebus:preview:status:
     desc: Show preview sessions, preview pods and split state on both clusters

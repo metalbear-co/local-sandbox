@@ -123,6 +123,28 @@ the target on the remote; the preview image defaults to
 here too: with `operator:dev` running, preview sessions are labeled `local-dev`
 so your local operator manages them.
 
+### Multiple named previews
+
+`NAME=` gives each preview its **own split filter** (`tenant: ^<NAME>`) and its
+own session key, so several previews coexist and each receives only its own
+messages:
+
+```bash
+task multicluster:servicebus:preview:start NAME=prev-1   # filter tenant=^prev-1
+task multicluster:servicebus:preview:start NAME=prev-2   # filter tenant=^prev-2
+
+task multicluster:servicebus:send:to NAME=prev-1         # -> only prev-1's pod
+task multicluster:servicebus:send:to NAME=prev-2 MESSAGE="hi"
+task multicluster:servicebus:send:nomatch                # -> deployed consumer
+
+task multicluster:servicebus:preview:status              # all sessions/pods
+task multicluster:servicebus:preview:stop NAME=prev-1
+task multicluster:servicebus:preview:clean               # nuke everything
+```
+
+The generated configs land in `/tmp/mirrord-preview-<NAME>.json`. `send:to`
+sends `tenant=<NAME>-user`, which matches only that preview's `^<NAME>` filter.
+
 ## Gotchas
 
 - **hostNetwork vs operator:dev**: the legacy installer puts both operators on
