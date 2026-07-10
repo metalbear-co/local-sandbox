@@ -2,7 +2,7 @@ version: '3'
 
 vars:
   ROOT_DIR:
-    sh: cd .. && pwd
+    sh: git rev-parse --show-toplevel
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
@@ -916,6 +916,198 @@ tasks:
       - kubectl set env deployment/sqs-consumer -n {{.NAMESPACE}} ORDERS_QUEUE_NAME- 2>/dev/null || true
       - kubectl delete mirrordclustersplitsession --all -n {{.NAMESPACE}} --ignore-not-found=true --wait=false
       - kubectl exec -n localstack deploy/localstack -- awslocal sqs delete-queue --queue-url http://localhost:4566/000000000000/OrdersQueue --region {{.REGION}} 2>/dev/null || true
+
+  # =============================================================================
+  # SQS Preview Environment Tasks
+  #
+  # A preview environment splits queues through a namespaced PreviewSession that
+  # owns a cluster-scoped MirrordClusterSplitSession. `preview:verify-cleanup`
+  # is the automated start/stop/check for the fix: after `preview stop` the split
+  # session and its temp SQS queues must be gone. Before the fix the split session
+  # (with a namespaced owner Kubernetes GC won't act on) and the temp queues
+  # lived on forever.
+  # =============================================================================
+
+  preview:deploy:
+    desc: "Deploy the SQS LocalStack env (consumer + split config) for preview testing"
+    cmds:
+      - task: deploy
+      - echo ""
+      - echo "SQS preview environment ready. Run 'task sqs:preview:start' to create a preview session."
+
+  preview:start:
+    desc: "Start an SQS preview environment (tenant=^Avi. filter on test-queue). Runs in the foreground; stop it with 'task sqs:preview:stop' from another shell."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-sqs-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "sqs-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord-preview.json")}}'
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.MIRRORD_CONFIG}} \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  preview:stop:
+    desc: "Stop an SQS preview environment (the split session and temp queues should then be cleaned up)."
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-sqs-preview"}}'
+    cmds:
+      - "{{.MIRRORD_BIN}} preview stop -k \"{{.PREVIEW_KEY}}\" || true"
+
+  preview:status:
+    desc: "Show SQS preview state: preview sessions, preview pods, split sessions, external resources, and temp SQS queues."
+    vars:
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - echo "=== PreviewSessions ==="
+      - kubectl get previewsessions -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== Preview pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== MirrordClusterSplitSessions (name / spec.namespace / preview-session-ref) ==="
+      - |
+        kubectl get mirrordclustersplitsession -o json 2>/dev/null \
+          | jq -r '.items[] | .metadata.name + "  ns=" + .spec.namespace + "  preview-ref=" + (.metadata.annotations["operator.metalbear.co/preview-session-ref"] // "-") + "  owners=" + ((.metadata.ownerReferences // []) | length | tostring)' \
+          || echo "(none)"
+      - echo ""
+      - echo "=== MirrordClusterExternalResources ==="
+      - kubectl get mirrordclusterexternalresources 2>/dev/null || echo "(none)"
+      - echo ""
+      - echo "=== Temp SQS queues (mirrord-*) ==="
+      - |
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues --region {{.REGION}} --query 'QueueUrls[]' --output text 2>/dev/null \
+          | tr '\t' '\n' | grep mirrord | sed 's#.*/#  #' || echo "  (none)"
+
+  preview:logs:
+    desc: "Follow the SQS preview pod logs."
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview --tail=100 -f
+
+  preview:send:
+    desc: "Send messages to the SQS source queue while a preview is running. FILTERED=N (tenant=Avi.Test) reach the preview pod; UNFILTERED=N (tenant=Basic) stay on the target pod."
+    vars:
+      FILTERED: '{{.FILTERED | default "2"}}'
+      UNFILTERED: '{{.UNFILTERED | default "1"}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+      QUEUE_URL: '{{.QUEUE_URL | default "http://localhost:4566/000000000000/TestQueue"}}'
+    cmds:
+      - |
+        for i in $(seq 1 {{.FILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "preview-filtered-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Avi.Test"}}' >/dev/null
+          echo "sent preview-filtered-$i  (tenant=Avi.Test -> preview pod)"
+        done
+        for i in $(seq 1 {{.UNFILTERED}}); do
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs send-message --region {{.REGION}} --queue-url {{.QUEUE_URL}} \
+              --message-body "preview-unfiltered-$i" \
+              --message-attributes '{"tenant":{"DataType":"String","StringValue":"Basic"}}' >/dev/null
+          echo "sent preview-unfiltered-$i  (tenant=Basic -> target pod)"
+        done
+
+  preview:verify-cleanup:
+    desc: "Automated start/stop check for the preview split-session cleanup fix. Deploys the SQS env, starts a preview (which creates a cluster-scoped MirrordClusterSplitSession and temp SQS queues), then runs `preview stop` and asserts the split session AND the temp queues are gone. PASS = fix works; FAIL = the orphaned split session / temp queues leaked."
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-sqs-preview-cleanup"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "sqs-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+      MIRRORD_CONFIG: '{{.MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/sqs-localstack/mirrord-preview.json")}}'
+      REGION: '{{.REGION | default "eu-north-1"}}'
+    cmds:
+      - task: deploy
+      - |
+        set -u
+        KEY="{{.PREVIEW_KEY}}"
+        NS="{{.NAMESPACE}}"
+        REGION="{{.REGION}}"
+        START_LOG=$(mktemp)
+
+        temp_queue_count() {
+          kubectl exec -n localstack deploy/localstack -- \
+            awslocal sqs list-queues --region "$REGION" --query 'QueueUrls[]' --output text 2>/dev/null \
+            | tr '\t' '\n' | grep -c mirrord || true
+        }
+
+        echo "=== starting preview env (key=$KEY, log: $START_LOG) ==="
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.MIRRORD_CONFIG}} -i "{{.PREVIEW_IMAGE}}" -k "$KEY" \
+          --timeout {{.PREVIEW_TIMEOUT}} > "$START_LOG" 2>&1 &
+        START_PID=$!
+        cleanup() { kill "$START_PID" 2>/dev/null || true; }
+        trap cleanup EXIT
+
+        echo "waiting for the MirrordClusterSplitSession to be created for this preview"
+        SESSION=""
+        for i in $(seq 1 90); do
+          SESSION=$(kubectl get mirrordclustersplitsession -o json 2>/dev/null \
+            | jq -r --arg ns "$NS" '.items[] | select(.spec.namespace==$ns) | .metadata.name' | head -1)
+          [ -n "$SESSION" ] && break
+          if ! kill -0 "$START_PID" 2>/dev/null; then
+            echo "FAIL: 'preview start' exited before a split session appeared:"
+            tail -n 30 "$START_LOG"
+            exit 1
+          fi
+          sleep 2
+        done
+        if [ -z "$SESSION" ]; then
+          echo "FAIL: no MirrordClusterSplitSession was created for the preview"
+          tail -n 30 "$START_LOG"
+          exit 1
+        fi
+
+        echo "-----------------------------------------------------------------"
+        echo "split session created: $SESSION"
+        echo "  ownerReferences: $(kubectl get mirrordclustersplitsession "$SESSION" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null)"
+        echo "  preview-session-ref: $(kubectl get mirrordclustersplitsession "$SESSION" -o jsonpath='{.metadata.annotations.operator\.metalbear\.co/preview-session-ref}' 2>/dev/null)"
+        TEMP_BEFORE=$(temp_queue_count)
+        echo "  temp mirrord-* queues while preview is up: ${TEMP_BEFORE:-0}"
+        echo "-----------------------------------------------------------------"
+
+        echo "=== stopping preview env ==="
+        {{.MIRRORD_BIN}} preview stop -k "$KEY" || true
+
+        echo "waiting for the split session and temp queues to be cleaned up (up to 120s)"
+        GONE=0
+        for i in $(seq 1 60); do
+          STILL=$(kubectl get mirrordclustersplitsession "$SESSION" -o name 2>/dev/null || true)
+          TEMP_NOW=$(temp_queue_count)
+          if [ -z "$STILL" ] && [ "${TEMP_NOW:-0}" -eq 0 ]; then
+            GONE=1
+            break
+          fi
+          sleep 2
+        done
+
+        echo "================================================================="
+        if [ "$GONE" -eq 1 ]; then
+          echo "PASS: after 'preview stop' the MirrordClusterSplitSession and temp SQS queues were cleaned up."
+          exit 0
+        fi
+        echo "FAIL: cleanup did not happen within the timeout."
+        echo "  split session still present: $(kubectl get mirrordclustersplitsession "$SESSION" -o name 2>/dev/null || echo none)"
+        echo "  temp queues remaining:"
+        kubectl exec -n localstack deploy/localstack -- \
+          awslocal sqs list-queues --region "$REGION" --query 'QueueUrls[]' --output text 2>/dev/null \
+          | tr '\t' '\n' | grep mirrord | sed 's#.*/#    #' || echo "    (none)"
+        exit 1
+
+  preview:clean:
+    desc: "Delete SQS preview sessions and pods, then clean up any leftover split sessions and temp queues."
+    cmds:
+      - echo "deleting preview sessions"
+      - kubectl delete previewsessions --all -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+      - echo "deleting preview pods"
+      - kubectl delete pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "(none)"
+      - task: split:reset
 
   run:local:aws:
     desc: "Run SQS consumer locally with mirrord (AWS)"

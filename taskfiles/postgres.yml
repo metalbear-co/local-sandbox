@@ -1,0 +1,175 @@
+version: "3"
+
+# PostgreSQL database branching.
+#
+#   task postgres:deploy         deploy the source DB + branch target into the cluster
+#   task postgres:run:local      run the app locally under mirrord (creates a branch DB)
+#   task postgres:query:source   query the source (cluster) database
+#   task postgres:query:branch   query the branch database
+#
+# The branch config lives in k8s/overlays/postgres/mirrord.json
+# (feature.db_branches, type "pg" — branch is created when run:local starts).
+#
+# Query examples (QUERY= takes any SQL):
+#   task postgres:query:source QUERY="SELECT * FROM users;"
+#   task postgres:query:source QUERY="INSERT INTO users (name, email, age) VALUES ('dev', 'dev@example.com', 30);"
+#   task postgres:query:branch QUERY="SELECT count(*) FROM users;"
+#   task postgres:query:branch QUERY="\dt"          # list tables
+#   or interactively: task postgres:shell:source / task postgres:shell:branch
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/postgres-app'
+  POSTGRES_DIR: '{{.ROOT_DIR}}/k8s/postgres'
+  SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/postgres/modular-tests/scenarios'
+  POSTGRES_MIRRORD_CONFIG: '{{.POSTGRES_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres/mirrord.json")}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Postgres test env (source DB + env-val branch target)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.POSTGRES_DIR}}
+      - task: _wait:source
+      # env-val provides the mirrord target pod (pg-server-env-val) and a
+      # standing PgBranchDatabase so query:branch works even before run:local.
+      - kubectl apply -k {{.SCENARIOS_DIR}}/env-val
+      - task: _wait:branches
+
+  run:local:
+    desc: Run the Postgres app locally under mirrord (creates a branch DB; Ctrl-C to stop)
+    interactive: true
+    dir: apps/postgres-app
+    preconditions:
+      - sh: test -f {{.POSTGRES_MIRRORD_CONFIG}}
+        msg: "mirrord config not found at {{.POSTGRES_MIRRORD_CONFIG}}"
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.POSTGRES_MIRRORD_CONFIG}} -- /tmp/postgres-app
+
+  query:source:
+    desc: 'Query the source database (QUERY="SELECT * FROM users;")'
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} postgres-test -- psql -U postgres -d source_db -c '{{.QUERY}}'
+
+  query:branch:
+    desc: 'Query a branch database (QUERY="..." [BRANCH=pg-test-branch-env-val] [DB=branch_db])'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+      BRANCH: '{{.BRANCH | default ""}}'
+      DB: '{{.DB | default "branch_db"}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod found. Deploy first, or start one with 'task postgres:run:local'."
+          echo "Existing branches:"
+          kubectl get pgbranchdatabases -n {{.NAMESPACE}} 2>/dev/null || echo "  none"
+          exit 1
+        fi
+        echo "=== branch pod: $POD (db: {{.DB}}) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d {{.DB}} -c '{{.QUERY}}'
+
+  shell:source:
+    desc: psql shell into the source database
+    interactive: true
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} postgres-test -- psql -U postgres -d source_db
+
+  shell:branch:
+    desc: psql shell into the newest branch database ([BRANCH=...] [DB=branch_db])
+    interactive: true
+    vars:
+      BRANCH: '{{.BRANCH | default ""}}'
+      DB: '{{.DB | default "branch_db"}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod found."; exit 1; fi
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d {{.DB}}
+
+  branches:
+    desc: List PgBranchDatabase CRDs and branch pods
+    cmds:
+      - kubectl get pgbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode,AGE:.metadata.creationTimestamp 2>/dev/null || echo "No branches"
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || true
+
+  logs:
+    desc: Tail the source database logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} postgres-test --tail=100 -f
+
+  logs:branch:
+    desc: Tail the newest branch pod logs
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No branch pod found."; exit 1; fi
+        kubectl logs -n {{.NAMESPACE}} "$POD" --tail=100 -f
+
+  status:
+    desc: Show source, branches and branch pods
+    silent: true
+    cmds:
+      - echo "=== source ==="
+      - kubectl get pod postgres-test -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== branch CRDs ==="
+      - kubectl get pgbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.copy.mode 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== branch pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the Postgres test env (deletes the whole test namespace)
+    cmds:
+      - kubectl delete -k {{.SCENARIOS_DIR}}/env-val --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.POSTGRES_DIR}} --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete pgbranchdatabases --all -n {{.NAMESPACE}} 2>/dev/null || true
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source database..."
+      - kubectl wait --for=condition=ready pod postgres-test -n {{.NAMESPACE}} --timeout=180s
+
+  _wait:branches:
+    internal: true
+    cmds:
+      - echo "Waiting for branch pods..."
+      - |
+        for i in $(seq 1 60); do
+          READY=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$READY" -ge 1 ]; then echo "Branch pod is running."; exit 0; fi
+          sleep 2
+        done
+        echo "Branch pod did not come up; check 'task postgres:status'"
+        exit 1

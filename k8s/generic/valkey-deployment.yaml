@@ -1,0 +1,67 @@
+# The "source" Valkey the app normally talks to. It requires the password from the
+# valkey-creds Secret - the same Secret the generic branch will be bootstrapped with via
+# $(MIRRORD_PARAM_PASSWORD), so the app's untouched credentials stay valid against the branch.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: valkey-creds
+  namespace: generic-test
+type: Opaque
+stringData:
+  password: "branch-me-if-you-can"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: valkey-main
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: valkey-main
+  template:
+    metadata:
+      labels:
+        app: valkey-main
+    spec:
+      containers:
+        - name: valkey
+          image: valkey/valkey:8-alpine
+          # Same $(VAR) expansion the generic branch uses - kubelet resolves the
+          # secretKeyRef-backed env var before building the args.
+          args:
+            - valkey-server
+            - --requirepass
+            - $(VALKEY_PASSWORD)
+            - --dbfilename
+            - $(CACHE_NAME).rdb
+          env:
+            - name: VALKEY_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: valkey-creds
+                  key: password
+            - name: CACHE_NAME
+              value: "sandbox-cache"
+          ports:
+            - containerPort: 6379
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: valkey-main
+  namespace: generic-test
+spec:
+  selector:
+    app: valkey-main
+  ports:
+    - port: 6379
+      targetPort: 6379

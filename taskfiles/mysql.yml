@@ -1,0 +1,192 @@
+version: "3"
+
+# MySQL database branching.
+#
+#   task mysql:deploy         deploy the source DB + branch target into the cluster
+#   task mysql:run:local      run the app locally under mirrord (creates a branch DB)
+#   task mysql:query:source   query the source (cluster) database
+#   task mysql:query:branch   query the branch database
+#
+# The branch config lives in k8s/overlays/mysql/mirrord.json
+# (feature.db_branches, type "mysql" — branch is created when run:local starts).
+#
+# Query examples (QUERY= takes any SQL):
+#   task mysql:query:source QUERY="SELECT * FROM users;"
+#   task mysql:query:source QUERY="INSERT INTO users (name, email) VALUES ('dev', 'dev@example.com');"
+#   task mysql:query:branch QUERY="SELECT COUNT(*) FROM users;"
+#   task mysql:query:branch QUERY="SHOW TABLES;"
+#   or interactively: task mysql:shell:source / task mysql:shell:branch
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/mysql-app'
+  MYSQL_DIR: '{{.ROOT_DIR}}/k8s/mysql/modular-tests'
+  SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/mysql/modular-tests/scenarios'
+  MYSQL_MIRRORD_CONFIG: '{{.MYSQL_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mysql/mirrord.json")}}'
+  # Root passwords baked into the manifests (source pod) and the operator
+  # (branch pods) — not secrets, just test fixtures.
+  MYSQL_SOURCE_PASSWORD: "examplepassword"
+  MYSQL_BRANCH_PASSWORD: "mysql-branch-pod-root-password"
+
+tasks:
+  deploy:
+    desc: Deploy the MySQL test env (source DB + env-val branch target)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # The operator needs the mysql overlay patch for branch pods to work.
+      - kubectl patch deployment mirrord-operator -n mirrord --patch-file {{.ROOT_DIR}}/k8s/overlays/mysql/operator-patch.yaml --type=strategic || true
+      - kubectl apply -k {{.MYSQL_DIR}}/base
+      - task: _wait:source
+      # env-val provides the mirrord target pod (server-env-val) and a
+      # standing MySqlBranchDatabase so query:branch works even before run:local.
+      - kubectl apply -k {{.SCENARIOS_DIR}}/env-val
+      - task: _wait:branches
+
+  run:local:
+    desc: Run the MySQL app locally under mirrord (creates a branch DB; Ctrl-C to stop)
+    interactive: true
+    dir: apps/mysql-app
+    preconditions:
+      - sh: test -f {{.MYSQL_MIRRORD_CONFIG}}
+        msg: "mirrord config not found at {{.MYSQL_MIRRORD_CONFIG}}"
+    cmds:
+      - go build -o /tmp/mysql-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.MYSQL_MIRRORD_CONFIG}} -- /tmp/mysql-app
+
+  query:source:
+    desc: 'Query the source database (QUERY="SELECT * FROM users;")'
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} mysql-test -- mysql -uroot -p{{.MYSQL_SOURCE_PASSWORD}} user -e "{{.QUERY}}"
+
+  query:branch:
+    desc: 'Query a branch database (QUERY="..." [BRANCH=mysql-test-branch-env-val] [DB=user])'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+      BRANCH: '{{.BRANCH | default ""}}'
+      DB: '{{.DB | default "user"}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod found. Deploy first, or start one with 'task mysql:run:local'."
+          echo "Existing branches:"
+          kubectl get mysqlbranchdatabases -n {{.NAMESPACE}} 2>/dev/null || echo "  none"
+          exit 1
+        fi
+        echo "=== branch pod: $POD (db: {{.DB}}) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_BRANCH_PASSWORD}} {{.DB}} -e "{{.QUERY}}"
+
+  shell:source:
+    desc: mysql shell into the source database
+    interactive: true
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} mysql-test -- mysql -uroot -p{{.MYSQL_SOURCE_PASSWORD}} user
+
+  shell:branch:
+    desc: mysql shell into the newest branch database ([BRANCH=...] [DB=user])
+    interactive: true
+    vars:
+      BRANCH: '{{.BRANCH | default ""}}'
+      DB: '{{.DB | default "user"}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod found."; exit 1; fi
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -- mysql -uroot -p{{.MYSQL_BRANCH_PASSWORD}} {{.DB}}
+
+  branches:
+    desc: List MySqlBranchDatabase CRDs and branch pods
+    cmds:
+      - kubectl get mysqlbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,BRANCH_ID:.spec.id,PHASE:.status.phase,EXPIRES:.status.expireTime 2>/dev/null || echo "No branches"
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || true
+
+  logs:
+    desc: Tail the source database logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} mysql-test --tail=100 -f
+
+  logs:branch:
+    desc: Tail the newest branch pod logs
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No branch pod found."; exit 1; fi
+        kubectl logs -n {{.NAMESPACE}} "$POD" --tail=100 -f
+
+  status:
+    desc: Show source, branches and branch pods
+    silent: true
+    cmds:
+      - echo "=== source ==="
+      - kubectl get pod mysql-test -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== branch CRDs ==="
+      - kubectl get mysqlbranchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,EXPIRES:.status.expireTime 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== branch pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the MySQL test env (source, scenarios and branches)
+    cmds:
+      - kubectl delete -k {{.SCENARIOS_DIR}}/env-val --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.MYSQL_DIR}}/base --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete mysqlbranchdatabases --all -n {{.NAMESPACE}} 2>/dev/null || true
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source database..."
+      - kubectl wait --for=condition=ready pod -l app=mysql-test -n {{.NAMESPACE}} --timeout=300s
+      - |
+        echo "Waiting for MySQL to accept connections..."
+        for i in $(seq 1 30); do
+          if kubectl exec -n {{.NAMESPACE}} mysql-test -- mysql -uroot -p{{.MYSQL_SOURCE_PASSWORD}} -e "SELECT 1" >/dev/null 2>&1; then
+            echo "MySQL ready"
+            exit 0
+          fi
+          sleep 2
+        done
+        echo "MySQL failed to become ready"
+        exit 1
+
+  _wait:branches:
+    internal: true
+    cmds:
+      - echo "Waiting for branch pods..."
+      - |
+        for i in $(seq 1 60); do
+          READY=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$READY" -ge 1 ]; then echo "Branch pod is running."; exit 0; fi
+          sleep 2
+        done
+        echo "Branch pod did not come up; check 'task mysql:status'"
+        exit 1

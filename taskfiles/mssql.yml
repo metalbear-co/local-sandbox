@@ -1,0 +1,195 @@
+version: "3"
+
+# MSSQL database branching.
+#
+#   task mssql:deploy         deploy the source DB + branch target into the cluster
+#   task mssql:run:local      run the app locally under mirrord (creates a branch DB)
+#   task mssql:query:source   query the source (cluster) database
+#   task mssql:query:branch   query the branch database
+#
+# The branch config lives in k8s/overlays/mssql/mirrord.json
+# (feature.db_branches, type "mssql" — branch is created when run:local starts).
+#
+# Query examples (QUERY= takes any T-SQL, run via sqlcmd):
+#   task mssql:query:source QUERY="SELECT * FROM users;"
+#   task mssql:query:source QUERY="INSERT INTO users (name, email) VALUES ('dev', 'dev@example.com');"
+#   task mssql:query:branch QUERY="SELECT name FROM sys.tables;"
+#   task mssql:query:branch QUERY="SELECT COUNT(*) AS cnt FROM users;"
+#   or interactively: task mssql:shell:source / task mssql:shell:branch
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/mssql-app'
+  MSSQL_DIR: '{{.ROOT_DIR}}/k8s/mssql/modular-tests'
+  SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/mssql/modular-tests/scenarios'
+  MSSQL_MIRRORD_CONFIG: '{{.MSSQL_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mssql/mirrord.json")}}'
+  # sqlcmd credentials (source uses SA_PASSWORD, branch pods use their own)
+  SQLCMD: /opt/mssql-tools18/bin/sqlcmd
+  SA_PASSWORD: "TestP@ssw0rd!"
+  BRANCH_PASSWORD: "Mssql-Branch-P@ss1"
+  MSSQL_IMAGE: mcr.microsoft.com/mssql/server:2022-latest
+  SQLPACKAGE_IMAGE: vladrbg/sqlpackage:latest
+  MSSQL_TOOLS_IMAGE: ghcr.io/metalbear-co/mssql-tools:latest
+
+tasks:
+  deploy:
+    desc: Deploy the MSSQL test env (source DB + env-val branch target)
+    cmds:
+      # the operator spawns branch init containers from this tools image
+      - kubectl patch deployment mirrord-operator -n mirrord --patch '{"spec":{"template":{"spec":{"containers":[{"name":"mirrord-operator","env":[{"name":"MSSQL_TOOLS_IMAGE","value":"{{.MSSQL_TOOLS_IMAGE}}"}]}]}}}}' --type=strategic || true
+      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=300s || true
+      # preload heavy images so branch pods don't stall pulling inside minikube
+      - |
+        for img in {{.MSSQL_IMAGE}} {{.SQLPACKAGE_IMAGE}} {{.MSSQL_TOOLS_IMAGE}}; do
+          {{.CONTAINER_RUNTIME}} pull "$img" || true
+          minikube -p {{.CLUSTER_NAME}} image load "$img"
+        done
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.MSSQL_DIR}}/base
+      - task: _wait:source
+      # env-val provides the mirrord target pod (mssql-server-env-val) and a
+      # standing BranchDatabase so query:branch works even before run:local.
+      - kubectl apply -k {{.SCENARIOS_DIR}}/env-val
+      - task: _wait:branches
+
+  run:local:
+    desc: Run the MSSQL app locally under mirrord (creates a branch DB; Ctrl-C to stop)
+    interactive: true
+    dir: apps/mssql-app
+    preconditions:
+      - sh: test -f {{.MSSQL_MIRRORD_CONFIG}}
+        msg: "mirrord config not found at {{.MSSQL_MIRRORD_CONFIG}}"
+    cmds:
+      - go build -o /tmp/mssql-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.MSSQL_MIRRORD_CONFIG}} -- /tmp/mssql-app
+
+  query:source:
+    desc: 'Query the source database (QUERY="SELECT * FROM users;")'
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+    cmds:
+      - kubectl exec -n {{.NAMESPACE}} mssql-test -- {{.SQLCMD}} -S localhost -U sa -P '{{.SA_PASSWORD}}' -d source_db -C -Q "{{.QUERY}}"
+
+  query:branch:
+    desc: 'Query a branch database (QUERY="..." [BRANCH=mssql-test-branch-env-val] [DB=source_db])'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM users;"}}'
+      BRANCH: '{{.BRANCH | default ""}}'
+      DB: '{{.DB | default "source_db"}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod found. Deploy first, or start one with 'task mssql:run:local'."
+          echo "Existing branches:"
+          kubectl get branchdatabases -n {{.NAMESPACE}} 2>/dev/null || echo "  none"
+          exit 1
+        fi
+        echo "=== branch pod: $POD (db: {{.DB}}) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -c mssql -- {{.SQLCMD}} -S localhost -U sa -P '{{.BRANCH_PASSWORD}}' -d {{.DB}} -C -Q "{{.QUERY}}"
+
+  shell:source:
+    desc: sqlcmd shell into the source database
+    interactive: true
+    cmds:
+      - kubectl exec -it -n {{.NAMESPACE}} mssql-test -- {{.SQLCMD}} -S localhost -U sa -P '{{.SA_PASSWORD}}' -d source_db -C
+
+  shell:branch:
+    desc: sqlcmd shell into the newest branch database ([BRANCH=...] [DB=source_db])
+    interactive: true
+    vars:
+      BRANCH: '{{.BRANCH | default ""}}'
+      DB: '{{.DB | default "source_db"}}'
+    cmds:
+      - |
+        if [ -n "{{.BRANCH}}" ]; then
+          SELECTOR="db-owner-name={{.BRANCH}}"
+        else
+          SELECTOR="db-owner-name"
+        fi
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "$SELECTOR" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod found."; exit 1; fi
+        kubectl exec -it -n {{.NAMESPACE}} "$POD" -c mssql -- {{.SQLCMD}} -S localhost -U sa -P '{{.BRANCH_PASSWORD}}' -d {{.DB}} -C
+
+  branches:
+    desc: List BranchDatabase CRDs and branch pods
+    cmds:
+      - kubectl get branchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.mssqlOptions.copy.mode,AGE:.metadata.creationTimestamp 2>/dev/null || echo "No branches"
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || true
+
+  logs:
+    desc: Tail the source database logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} mssql-test --tail=100 -f
+
+  logs:branch:
+    desc: Tail the newest branch pod logs
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No branch pod found."; exit 1; fi
+        kubectl logs -n {{.NAMESPACE}} "$POD" -c mssql --tail=100 -f
+
+  status:
+    desc: Show source, branches and branch pods
+    silent: true
+    cmds:
+      - echo "=== source ==="
+      - kubectl get pod mssql-test -n {{.NAMESPACE}} -o wide 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== branch CRDs ==="
+      - kubectl get branchdatabases -n {{.NAMESPACE}} -o custom-columns=NAME:.metadata.name,PHASE:.status.phase,COPY_MODE:.spec.mssqlOptions.copy.mode 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== branch pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l db-owner-name 2>/dev/null || echo "none"
+
+  clean:
+    desc: Remove the MSSQL test env from the cluster
+    cmds:
+      - kubectl delete -k {{.SCENARIOS_DIR}}/env-val --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -k {{.MSSQL_DIR}}/base --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete branchdatabases --all -n {{.NAMESPACE}} 2>/dev/null || true
+
+  _wait:source:
+    internal: true
+    cmds:
+      - echo "Waiting for source database..."
+      - kubectl wait --for=condition=ready pod mssql-test -n {{.NAMESPACE}} --timeout=180s
+      - echo "Waiting for MSSQL to run its init scripts..."
+      - sleep 30
+
+  _wait:branches:
+    internal: true
+    cmds:
+      - echo "Waiting for branch pods (MSSQL branches can take 2-3 minutes)..."
+      - |
+        for i in $(seq 1 150); do
+          READY=$(kubectl get pods -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$READY" -ge 1 ]; then echo "Branch pod is running."; exit 0; fi
+          sleep 2
+        done
+        echo "Branch pod did not come up; check 'task mssql:status'"
+        exit 1

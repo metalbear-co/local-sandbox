@@ -1,0 +1,32 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "elasticsearch-generic-branch",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 300,
+                "image": "docker.elastic.co/elasticsearch/elasticsearch:8.17.4",
+                "port": 9200,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "ELASTICSEARCH_URL", "value_pattern": "https?://(?P<host>[^:/]+)" },
+                        "port": { "env_var_name": "ELASTICSEARCH_URL", "value_pattern": ":(?P<port>[0-9]+)$" },
+                        "password": "ELASTICSEARCH_PASSWORD"
+                    }
+                },
+                "env": {
+                    "discovery.type": "single-node",
+                    "ELASTIC_PASSWORD": "$(MIRRORD_PARAM_PASSWORD)",
+                    "xpack.security.http.ssl.enabled": "false",
+                    "ES_JAVA_OPTS": "-Xms512m -Xmx512m"
+                },
+                "readiness": {
+                    "type": "exec",
+                    "command": ["sh", "-c", "curl -s -u \"elastic:$ELASTIC_PASSWORD\" http://localhost:9200 > /dev/null"]
+                }
+            }
+        ]
+    }
+}

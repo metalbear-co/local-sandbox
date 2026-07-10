@@ -2,7 +2,7 @@ version: "3"
 
 vars:
   ROOT_DIR:
-    sh: cd .. && pwd
+    sh: git rev-parse --show-toplevel
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'

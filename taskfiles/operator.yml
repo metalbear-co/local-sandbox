@@ -1,0 +1,261 @@
+version: "3"
+
+# Operator workflow — no docker builds.
+#
+#   task operator:use     deploy a released operator into the cluster
+#                         (VERSION=latest by default, VERSION=3.152.0, or
+#                          VERSION=pick for an fzf list of releases)
+#   task operator:crds    apply the CRDs rendered from your local ../operator
+#                         chart on top of whatever operator is deployed
+#   task operator:dev     run your local operator-service under mirrord,
+#                         stealing traffic from the deployed operator
+#
+# The old build-an-image flow still exists as `task legacy:operator:update`.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  OPERATOR_DIR: '{{.OPERATOR_DIR | default (print .ROOT_DIR "/../operator")}}'
+  CHARTS_DIR: '{{.CHARTS_DIR | default (print .ROOT_DIR "/../operator/public/charts/mirrord-operator")}}'
+  SCRIPTS_DIR: '{{.SCRIPTS_DIR | default (print .ROOT_DIR "/scripts")}}'
+  VERSIONS_DIR: '{{.ROOT_DIR}}/.versions'
+  VALUES_FILE: '{{.ROOT_DIR}}/operator-values.yaml'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  # Static on purpose — see taskfiles/mirrord.yml. CLI override still wins.
+  AGENT_IMAGE: "test"
+
+tasks:
+  use:
+    desc: "Deploy a released operator (no docker build). VERSION=latest|x.y.z|pick"
+    vars:
+      VERSION: '{{.VERSION | default "latest"}}'
+    preconditions:
+      - sh: test -n "$RELEASE_LICENSE_KEY"
+        msg: "RELEASE_LICENSE_KEY is required for released operators. Set it in .env (get a key from https://app.metalbear.co)"
+    cmds:
+      - |
+        set -euo pipefail
+        VERSION="{{.VERSION}}"
+        CACHE="{{.VERSIONS_DIR}}/operator"
+        mkdir -p "$CACHE"
+
+        helm repo add metalbear https://metalbear-co.github.io/charts >/dev/null 2>&1 || true
+        helm repo update metalbear >/dev/null
+
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(helm search repo metalbear/mirrord-operator | awk 'NR==2 {print $2}')
+          echo "Latest released operator: $VERSION"
+        elif [ "$VERSION" = "pick" ]; then
+          VERSION=$(helm search repo metalbear/mirrord-operator --versions | awk 'NR>1 {print $2}' \
+            | fzf --height=40% --reverse --border --border-label=" operator:use " \
+                  --prompt="version> " --header="Pick an operator release. Esc to cancel.")
+          [ -n "$VERSION" ] || { echo "Cancelled."; exit 0; }
+        fi
+        echo "Using operator $VERSION"
+
+        # Cache image + chart under .versions so they survive a docker purge.
+        if [ ! -f "$CACHE/$VERSION.tar" ]; then
+          echo "Downloading image ghcr.io/metalbear-co/operator:$VERSION..."
+          {{.CONTAINER_RUNTIME}} pull ghcr.io/metalbear-co/operator:$VERSION
+          {{.CONTAINER_RUNTIME}} save ghcr.io/metalbear-co/operator:$VERSION -o "$CACHE/$VERSION.tar"
+        fi
+        if [ ! -f "$CACHE/$VERSION-chart.tgz" ]; then
+          echo "Downloading helm chart $VERSION..."
+          helm pull metalbear/mirrord-operator --version $VERSION -d "$CACHE"
+          mv "$CACHE/mirrord-operator-$VERSION.tgz" "$CACHE/$VERSION-chart.tgz"
+        fi
+
+        echo "Loading image into minikube..."
+        {{.CONTAINER_RUNTIME}} load -i "$CACHE/$VERSION.tar" 2>/dev/null || true
+        minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi ghcr.io/metalbear-co/operator:$VERSION --force" 2>/dev/null || true
+        minikube -p {{.CLUSTER_NAME}} image load ghcr.io/metalbear-co/operator:$VERSION
+
+        echo "Installing helm chart $VERSION..."
+        helm upgrade --install mirrord-operator "$CACHE/$VERSION-chart.tgz" \
+          --namespace mirrord --create-namespace \
+          -f {{.VALUES_FILE}} \
+          --set operator.image=ghcr.io/metalbear-co/operator \
+          --set operator.imageTag=$VERSION \
+          --set image.pullPolicy=IfNotPresent \
+          --set license.key="$RELEASE_LICENSE_KEY" \
+          --set license.pemRef=""
+      - task: _agent:ensure
+      - task: restart
+      - echo "Released operator deployed. Apply your local CRDs with 'task operator:crds', then 'task operator:dev'."
+
+  crds:
+    desc: "Apply CRDs rendered from the local ../operator chart (server-side apply). CLUSTER=<kube-context> targets another cluster."
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+      KCTX: '{{if .CLUSTER}}--context {{.CLUSTER}}{{end}}'
+    preconditions:
+      - sh: test -d "{{.CHARTS_DIR}}"
+        msg: "Local operator chart not found at {{.CHARTS_DIR}} (clone ../operator or set CHARTS_DIR in .env)"
+    cmds:
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} -s templates/crd.yaml | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
+      # Multi-cluster CRDs only render when the feature is enabled in values,
+      # and `helm -s` errors on an empty render, so apply them best-effort.
+      - |
+        MC=$(helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} --set operator.multiCluster.enabled=true -s templates/multi-cluster-crd.yaml 2>/dev/null || true)
+        if [ -n "$MC" ]; then
+          echo "$MC" | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
+        fi
+      - echo "CRDs from the local chart applied{{if .CLUSTER}} to {{.CLUSTER}}{{end}}."
+
+  dev:
+    desc: "Run the local operator under mirrord (steals from the deployed operator). Applies local CRDs first. CLUSTER=<kube-context> picks the cluster and its .mirrord/operator-dev.<cluster>.yaml config if present; CONFIG=<path> overrides; SANDBOX_LICENSE=1 to trust the sandbox license issuer."
+    interactive: true
+    vars:
+      ISOLATION_MARKER: '{{.ISOLATION_MARKER | default "local-dev"}}'
+      CLUSTER: '{{.CLUSTER | default ""}}'
+      KCTX: '{{if .CLUSTER}}--context {{.CLUSTER}}{{end}}'
+      CONFIG: '{{.CONFIG | default ""}}'
+    env:
+      OPERATOR_ISOLATION_MARKER: "{{.ISOLATION_MARKER}}"
+    cmds:
+      - task: crds
+        vars: { CLUSTER: "{{.CLUSTER}}" }
+      # Clear stale agent pods and give the deployed operator a clean start so
+      # the steal session attaches to a fresh pod. Force-delete instead of a
+      # rolling restart: the multicluster operators run with hostNetwork, so a
+      # surge pod can never bind the node ports while the old pod is alive —
+      # `rollout restart` wedges on "1 old replicas are pending termination".
+      - kubectl {{.KCTX}} delete pods -n mirrord -l app=mirrord --force --grace-period=0 2>/dev/null || true
+      - kubectl {{.KCTX}} delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl {{.KCTX}} delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl {{.KCTX}} delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      - |
+        if ! kubectl {{.KCTX}} wait --for=condition=available deployment/mirrord-operator -n mirrord --timeout=180s; then
+          echo ""
+          echo "Operator did not become available. State:"
+          kubectl {{.KCTX}} get pods -n mirrord || true
+          exit 1
+        fi
+      # cd in the shell rather than task-level `dir:` — dir templates resolve
+      # before dynamic vars like ROOT_DIR, which mangles the path.
+      #
+      # A released cluster operator runs on a production license, which a local
+      # source build validates with its default issuer key. Only when the
+      # cluster runs the sandbox-built operator (legacy flow, self-signed
+      # license) does the local binary need the sandbox issuer key too.
+      - |
+        cd {{.OPERATOR_DIR}}
+        cargo build -p operator-service
+        codesign -f -s - ./target/debug/operator-service
+        rm -rf /tmp/mirrord
+
+        # Config resolution: CONFIG=<path> wins; else a per-cluster file
+        # (.mirrord/operator-dev.<cluster>.yaml) if it exists; else the base
+        # .mirrord/operator-dev.yaml. Relative CONFIG paths are taken from the
+        # sandbox root.
+        CONFIG="{{.CONFIG}}"
+        if [ -n "$CONFIG" ] && [ ! -f "$CONFIG" ] && [ -f "{{.ROOT_DIR}}/$CONFIG" ]; then
+          CONFIG="{{.ROOT_DIR}}/$CONFIG"
+        fi
+        if [ -z "$CONFIG" ] && [ -n "{{.CLUSTER}}" ] && [ -f "{{.ROOT_DIR}}/.mirrord/operator-dev.{{.CLUSTER}}.yaml" ]; then
+          CONFIG="{{.ROOT_DIR}}/.mirrord/operator-dev.{{.CLUSTER}}.yaml"
+        fi
+        if [ -z "$CONFIG" ]; then
+          CONFIG="{{.ROOT_DIR}}/.mirrord/operator-dev.yaml"
+        fi
+        echo "mirrord config: ${CONFIG#{{.ROOT_DIR}}/}"
+
+        if [ "{{.SANDBOX_LICENSE}}" = "1" ]; then
+          export OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)"
+        fi
+        if [ -n "{{.CLUSTER}}" ]; then
+          export MIRRORD_KUBE_CONTEXT="{{.CLUSTER}}"
+          echo "kube context:   {{.CLUSTER}}"
+        fi
+        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f "$CONFIG" -- \
+          ./target/debug/operator-service
+
+  restart:
+    desc: Force-restart the operator pod (clears leader lease) and wait until ready
+    cmds:
+      - kubectl delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      - task: _wait
+
+  status:
+    desc: Show deployed operator version, pods and license
+    silent: true
+    cmds:
+      - |
+        if ! kubectl get deploy mirrord-operator -n mirrord >/dev/null 2>&1; then
+          echo "Operator is not installed. Run 'task operator:use'."
+          exit 0
+        fi
+        echo "image:    $(kubectl get deploy mirrord-operator -n mirrord -o jsonpath='{.spec.template.spec.containers[0].image}')"
+        echo "helm:     $(helm list -n mirrord -o json 2>/dev/null | sed -n 's/.*"chart":"\([^"]*\)".*/\1/p' | head -1)"
+        echo ""
+        kubectl get pods -n mirrord -l app=mirrord-operator
+        echo ""
+        echo "mirrord CRDs in cluster:"
+        kubectl get crd -o name 2>/dev/null | grep 'mirrord\.metalbear\.co' | sed 's|customresourcedefinition.apiextensions.k8s.io/|  |' || echo "  none"
+
+  logs:
+    desc: Tail operator logs
+    cmds:
+      - kubectl logs -n mirrord -l app=mirrord-operator --tail=100 -f
+
+  uninstall:
+    desc: Uninstall the operator and delete the mirrord namespace
+    cmds:
+      - helm uninstall mirrord-operator -n mirrord || true
+      - kubectl delete namespace mirrord --ignore-not-found=true
+
+  versions:
+    desc: List released operator versions cached under .versions/operator
+    silent: true
+    cmds:
+      - |
+        CACHE="{{.VERSIONS_DIR}}/operator"
+        if ! ls "$CACHE"/*.tar >/dev/null 2>&1; then
+          echo "No cached operator versions. 'task operator:use' caches what it deploys."
+          exit 0
+        fi
+        echo "Cached released operators ($CACHE):"
+        for f in "$CACHE"/*.tar; do
+          case "$f" in */branches/*) continue;; esac
+          V=$(basename "$f" .tar)
+          SIZE=$(du -h "$f" | cut -f1)
+          printf "  %-12s %s\n" "$V" "$SIZE"
+        done
+
+  _agent:ensure:
+    internal: true
+    silent: true
+    cmds:
+      # The mirrord agent image ('test' by default) must exist inside minikube
+      # with pullPolicy Never. If the image exists in the local docker daemon,
+      # (re)load it so the cluster always has the freshest build.
+      - |
+        if {{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1; then
+          echo "Loading agent image '{{.AGENT_IMAGE}}' into minikube..."
+          minikube -p {{.CLUSTER_NAME}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+          minikube -p {{.CLUSTER_NAME}} image load {{.AGENT_IMAGE}}
+        elif minikube -p {{.CLUSTER_NAME}} image ls 2>/dev/null | grep -q "library/{{.AGENT_IMAGE}}:"; then
+          echo "Agent image '{{.AGENT_IMAGE}}' already in minikube (not in local docker, keeping as-is)."
+        else
+          echo "WARNING: agent image '{{.AGENT_IMAGE}}' is neither in docker nor minikube."
+          echo "         Build it with: task mirrord:agent:build"
+        fi
+
+  _wait:
+    internal: true
+    cmds:
+      # Wait on the Deployment's Available condition, not `rollout status`:
+      # after a force-deleted pod the rollout status is stale-complete and
+      # returns immediately. Available flips False->True through readiness.
+      - |
+        if ! kubectl wait --for=condition=available deployment/mirrord-operator -n mirrord --timeout=300s; then
+          echo ""
+          echo "Operator did not become available within the timeout. State:"
+          kubectl get pods -n mirrord -l app=mirrord-operator || true
+          kubectl get events -n mirrord --sort-by=.lastTimestamp 2>/dev/null | tail -n 15 || true
+          exit 1
+        fi
+        echo "Operator is deployed and ready."

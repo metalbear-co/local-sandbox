@@ -1,0 +1,40 @@
+version: "3"
+
+# Minikube cluster lifecycle.
+
+vars:
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+
+tasks:
+  create:
+    desc: Create (or start) the minikube cluster and point kubectl at it
+    cmds:
+      - minikube -p {{.CLUSTER_NAME}} start --driver={{.CONTAINER_RUNTIME}}
+      - minikube -p {{.CLUSTER_NAME}} addons enable metrics-server
+      - kubectl config use-context {{.CLUSTER_NAME}}
+
+  start:
+    desc: Start the cluster only if it is stopped (no-op when running)
+    silent: true
+    cmds:
+      - |
+        if minikube -p {{.CLUSTER_NAME}} status 2>/dev/null | grep -q 'host: Running'; then
+          kubectl config use-context {{.CLUSTER_NAME}} 2>/dev/null || true
+          echo "Cluster '{{.CLUSTER_NAME}}' is already running."
+          exit 0
+        fi
+        echo "Starting minikube profile '{{.CLUSTER_NAME}}'..."
+        minikube -p {{.CLUSTER_NAME}} start --driver={{.CONTAINER_RUNTIME}}
+        kubectl config use-context {{.CLUSTER_NAME}}
+
+  delete:
+    desc: Delete the minikube cluster
+    cmds:
+      - minikube -p {{.CLUSTER_NAME}} delete
+
+  status:
+    desc: Show cluster status and nodes
+    cmds:
+      - minikube -p {{.CLUSTER_NAME}} status || true
+      - kubectl get nodes 2>/dev/null || true

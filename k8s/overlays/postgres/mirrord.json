@@ -15,17 +15,14 @@
     },
     "db_branches": [
       {
-        "id": "pg-dev-random-id10",
+        "id": "pg-dev-random-id101133",
         "name": "my_database_name_etc",
         "type": "pg",
         "version": "17",
         "ttl_secs": 600,
         "creation_timeout_secs": 90,
         "connection": {
-          "url": {
-            "type": "env",
-            "variable": "DATABASE_URL"
-          }
+          "url": "DATABASE_URL222"
         },
         "copy": {
           "mode": "empty"

@@ -1,0 +1,28 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "valkey-generic-branch",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 120,
+                "image": "valkey/valkey:8-alpine",
+                "port": 6379,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "VALKEY_ADDR", "value_pattern": "^(?P<host>[^:]+):" },
+                        "port": { "env_var_name": "VALKEY_ADDR", "value_pattern": ":(?P<port>[0-9]+)$" },
+                        "password": "VALKEY_PASSWORD",
+                        "cache_name": "CACHE_NAME"
+                    }
+                },
+                "args": [
+                    "valkey-server",
+                    "--requirepass", "$(MIRRORD_PARAM_PASSWORD)",
+                    "--dbfilename", "$(MIRRORD_PARAM_CACHE_NAME).rdb"
+                ]
+            }
+        ]
+    }
+}

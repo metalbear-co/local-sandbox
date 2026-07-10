@@ -1,0 +1,495 @@
+version: "3"
+
+# Local multicluster: 2 minikube clusters (primary + remote) with RELEASED
+# operators — no docker builds. The primary operator runs multiCluster.enabled
+# and proxies sessions to the remote (default) cluster. Everything is local
+# except the message service: real Azure Service Bus topics.
+#
+#   task multicluster:up                        create both clusters + operators
+#   task operator:dev CLUSTER=mirrord-primary   run YOUR local operator against the primary
+#   task multicluster:servicebus:secret CONN='Endpoint=sb://...'
+#   task multicluster:servicebus:deploy         topic consumer on the REMOTE cluster
+#   task multicluster:servicebus:run:local      local consumer via the PRIMARY operator
+#   task multicluster:servicebus:send:match     tenant=test-user -> your local session
+#   task multicluster:servicebus:send:nomatch   tenant=other     -> remote cluster consumer
+#
+# The heavy lifting (apiserver cert SANs, docker network cross-connect,
+# hostNetwork/hostAliases patches, bearer-token credential secrets) is proxied
+# to the proven legacy tasks in tasks/Taskfile.multicluster.yml.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  PRIMARY: '{{.MC_PRIMARY | default "mirrord-primary"}}'
+  REMOTE: '{{.MC_REMOTE_1 | default "mirrord-remote-1"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  CHARTS_DIR: '{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator'
+  MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+  # The same locally-built agent image the single-cluster flow uses.
+  MC_AGENT_IMAGE: '{{.MC_AGENT_IMAGE | default "test"}}'
+  SB_OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/servicebus-emulator'
+  MC_SB_MIRRORD_CONFIG: '{{.MC_SB_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/servicebus-emulator/mirrord-topic.json")}}'
+  SB_TOPIC: '{{.MC_SB_TOPIC | default "test-topic"}}'
+  # Helm flags shared by every released-operator install/re-apply.
+  MC_RELEASE_COMMON_FLAGS: "--set image.pullPolicy=IfNotPresent --set license.pemRef= --set operator.azureServiceBusSplitting=true"
+
+tasks:
+  up:
+    desc: "Create 2 local clusters + released operators (VERSION=latest|x.y.z). No operator docker builds."
+    preconditions:
+      - sh: test -n "$RELEASE_LICENSE_KEY"
+        msg: "RELEASE_LICENSE_KEY is required for released operators. Set it in .env"
+    cmds:
+      - task: _agent:ensure
+      - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:clusters:create
+      - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:agent:load AGENT_IMAGE={{.MC_AGENT_IMAGE}}
+      - task: _operators:install
+        vars: { VERSION: '{{.VERSION | default "latest"}}' }
+      - kubectl config use-context {{.PRIMARY}}
+      - task: _up:summary
+
+  _agent:ensure:
+    internal: true
+    # The agent image must exist in the local docker daemon so it can be
+    # loaded into both clusters. Build it from ../mirrord if it's missing
+    # (agent builds are fine — only operator image builds are avoided).
+    cmds:
+      - |
+        if ! {{.CONTAINER_RUNTIME}} image inspect {{.MC_AGENT_IMAGE}} >/dev/null 2>&1; then
+          echo "Agent image '{{.MC_AGENT_IMAGE}}' not in docker — building from {{.MIRRORD_DIR}}..."
+          cd {{.MIRRORD_DIR}} && {{.CONTAINER_RUNTIME}} build -f mirrord/agent/Dockerfile -t {{.MC_AGENT_IMAGE}} .
+        fi
+
+  _operators:install:
+    internal: true
+    # Released operators on both clusters via the proven legacy install
+    # (image load into both clusters + primary multiCluster install + remote
+    # member install + credential secrets). Everything is baked into ONE helm
+    # install per cluster: a post-install `helm upgrade` would re-render the
+    # chart's sysctls and collide with the hostNetwork patch the installer
+    # applies (sysctls + hostNetwork are mutually exclusive). That's also why
+    # azureServiceBusSplitting rides along here instead of a second pass —
+    # the legacy values files predate it.
+    vars:
+      VERSION: '{{.VERSION | default "latest"}}'
+    cmds:
+      - |
+        VERSION="{{.VERSION}}"
+        if [ "$VERSION" = "latest" ]; then
+          helm repo add metalbear https://metalbear-co.github.io/charts >/dev/null 2>&1 || true
+          helm repo update metalbear >/dev/null
+          VERSION=$(helm search repo metalbear/mirrord-operator | awk 'NR==2 {print $2}')
+          echo "Latest released operator: $VERSION"
+        fi
+        task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:operator:release:load:images VERSION=$VERSION
+        task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:operator:install:all \
+          AGENT_IMAGE={{.MC_AGENT_IMAGE}} \
+          EXTRA_HELM_ARGS="--set operator.image=ghcr.io/metalbear-co/operator --set operator.imageTag=$VERSION {{.MC_RELEASE_COMMON_FLAGS}} --set-string license.key=$RELEASE_LICENSE_KEY"
+      # The legacy installer puts the operators on hostNetwork, which breaks
+      # operator:dev stealing (loopback bypass) — undo it. See operator:podnetwork.
+      - task: operator:podnetwork
+
+  _up:summary:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "Multicluster is up:"
+        echo "  primary: {{.PRIMARY}} (multiCluster enabled, sessions default to {{.REMOTE}})"
+        echo "  remote:  {{.REMOTE}}"
+        echo ""
+        echo "Per-cluster operator:dev configs (edit freely):"
+        echo "  .mirrord/operator-dev.{{.PRIMARY}}.yaml"
+        echo "  .mirrord/operator-dev.{{.REMOTE}}.yaml"
+        echo ""
+        echo "Next:"
+        echo "  task multicluster:operator:primary            # your local operator against primary"
+        echo "  task multicluster:operator:remote-1           # ...or against the remote"
+        echo "  task multicluster:servicebus:deploy           # azure SB topic test on the remote"
+
+  operator:primary:
+    desc: Run YOUR local operator under mirrord against the PRIMARY cluster (= operator:dev CLUSTER=mirrord-primary)
+    interactive: true
+    cmds:
+      - task: :operator:dev
+        vars: { CLUSTER: "{{.PRIMARY}}" }
+
+  operator:remote:
+    desc: Run YOUR local operator under mirrord against the REMOTE cluster (= operator:dev CLUSTER=mirrord-remote-1)
+    aliases: [operator:remote-1]
+    interactive: true
+    cmds:
+      - task: :operator:dev
+        vars: { CLUSTER: "{{.REMOTE}}" }
+
+  operator:podnetwork:
+    desc: "Move both operators off hostNetwork onto the pod network (keeps cross-cluster reachability via hostAliases + NAT). Required for operator:dev: with hostNetwork, apiserver->operator traffic rides loopback on the single node and BYPASSES the mirrord steal, so local sessions never receive anything."
+    cmds:
+      - |
+        set -euo pipefail
+        PRIMARY_IP=$(docker inspect {{.PRIMARY}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
+        REMOTE_IP=$(docker inspect {{.REMOTE}} --format '{{`{{index .NetworkSettings.Networks "mirrord-primary" "IPAddress"}}`}}')
+        HOST_ALIASES="[{\"ip\":\"$PRIMARY_IP\",\"hostnames\":[\"{{.PRIMARY}}\"]},{\"ip\":\"$REMOTE_IP\",\"hostnames\":[\"{{.REMOTE}}\"]}]"
+        echo "hostAliases: {{.PRIMARY}}=$PRIMARY_IP {{.REMOTE}}=$REMOTE_IP"
+        for CTX in {{.PRIMARY}} {{.REMOTE}}; do
+          echo "=== $CTX: switching operator to pod network ==="
+          # The chart's sysctl (stripped when hostNetwork was added) is needed
+          # again so the pod can bind 443 as non-root on the pod network.
+          kubectl --context "$CTX" patch deployment mirrord-operator -n mirrord --type=strategic -p "{
+            \"spec\":{\"template\":{\"spec\":{
+              \"hostNetwork\":null,
+              \"dnsPolicy\":\"ClusterFirst\",
+              \"hostAliases\":$HOST_ALIASES,
+              \"securityContext\":{\"sysctls\":[{\"name\":\"net.ipv4.ip_unprivileged_port_start\",\"value\":\"443\"}]}
+            }}}}"
+          kubectl --context "$CTX" delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
+          kubectl --context "$CTX" delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+          kubectl --context "$CTX" wait --for=condition=available deployment/mirrord-operator -n mirrord --timeout=180s
+        done
+        echo ""
+        echo "Checking primary -> remote connectivity..."
+        sleep 5
+        kubectl --context {{.PRIMARY}} get mirrordoperators operator -o jsonpath='{.status}' 2>/dev/null | head -c 400 || true
+        echo ""
+
+  operator:apply:
+    desc: "Re-apply the multicluster values files (multicluster/*.yaml) to BOTH deployed operators after editing them. Keeps the currently deployed released version; also refreshes remote credentials."
+    preconditions:
+      - sh: test -n "$RELEASE_LICENSE_KEY"
+        msg: "RELEASE_LICENSE_KEY is required. Set it in .env"
+      - sh: kubectl --context {{.PRIMARY}} get deploy mirrord-operator -n mirrord >/dev/null 2>&1
+        msg: "No operator on {{.PRIMARY}} — run 'task multicluster:up' first"
+    cmds:
+      - |
+        IMG=$(kubectl --context {{.PRIMARY}} get deploy mirrord-operator -n mirrord -o jsonpath='{.spec.template.spec.containers[0].image}')
+        echo "Re-applying multicluster values with operator image $IMG"
+        task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:operator:install:all \
+          AGENT_IMAGE={{.MC_AGENT_IMAGE}} \
+          EXTRA_HELM_ARGS="--set operator.image=${IMG%:*} --set operator.imageTag=${IMG##*:} {{.MC_RELEASE_COMMON_FLAGS}} --set-string license.key=$RELEASE_LICENSE_KEY"
+      # The legacy installer re-adds hostNetwork — undo it (see operator:podnetwork).
+      - task: operator:podnetwork
+
+  crds:
+    desc: Apply local-chart CRDs to BOTH clusters
+    cmds:
+      - task: :operator:crds
+        vars: { CLUSTER: "{{.PRIMARY}}" }
+      - task: :operator:crds
+        vars: { CLUSTER: "{{.REMOTE}}" }
+
+  status:
+    desc: Show operators, remote connectivity and split state on both clusters
+    silent: true
+    cmds:
+      - echo "=== operator pods ==="
+      - 'echo "[{{.PRIMARY}}]" && kubectl --context {{.PRIMARY}} get pods -n mirrord 2>/dev/null || echo "  not reachable"'
+      - 'echo "[{{.REMOTE}}]" && kubectl --context {{.REMOTE}} get pods -n mirrord 2>/dev/null || echo "  not reachable"'
+      - echo ""
+      - echo "=== remote cluster credentials (on primary) ==="
+      - kubectl --context {{.PRIMARY}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== connectivity (mirrordoperators on primary) ==="
+      - kubectl --context {{.PRIMARY}} get mirrordoperators operator -o jsonpath='{.status}' 2>/dev/null | head -c 800 || echo "no status"
+      - echo ""
+      - echo ""
+      - echo "=== split sessions ==="
+      - 'echo "[{{.PRIMARY}}]" && kubectl --context {{.PRIMARY}} get mirrordclustersplitsession -A 2>/dev/null || echo "  none"'
+      - 'echo "[{{.REMOTE}}]" && kubectl --context {{.REMOTE}} get mirrordclustersplitsession -A 2>/dev/null || echo "  none"'
+
+  logs:
+    desc: Tail the PRIMARY operator logs (CLUSTER=... overrides)
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+    cmds:
+      - kubectl --context {{.CLUSTER | default .PRIMARY}} logs -n mirrord -l app.kubernetes.io/name=mirrord-operator --tail=100 -f
+
+  secrets:refresh:
+    desc: Refresh the remote-cluster bearer tokens (they expire; default 10m)
+    cmds:
+      - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:secrets:refresh:restart
+
+  destroy:
+    desc: Delete both minikube clusters
+    cmds:
+      - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:clusters:delete
+
+  # ── Azure Service Bus topic test (real Azure, local clusters) ─────────────
+  # Consumer runs on the REMOTE cluster; your mirrord session connects through
+  # the PRIMARY operator, which proxies to the remote (its default cluster).
+  # The split filter is tenant=^test on subscription split id `test-topic-sub`
+  # (k8s/overlays/servicebus-emulator/mirrord-topic.json + split-config-topic-azure.yaml).
+
+  servicebus:secret:
+    desc: "Store the Azure connection string on BOTH clusters. CONN='Endpoint=sb://...' explicitly, or set AZURE_SB_RG + AZURE_SB_NAMESPACE in .env to auto-fetch via az."
+    silent: true
+    vars:
+      AZ_RG: '{{.AZURE_SB_RG | default ""}}'
+      AZ_NS: '{{.AZURE_SB_NAMESPACE | default ""}}'
+    cmds:
+      - |
+        CONN='{{.CONN}}'
+
+        # No CONN given: fetch the RootManageSharedAccessKey connection string
+        # with the az CLI, and make sure the topic + subscription the consumer
+        # expects (test-topic / test-sub) exist in the namespace.
+        if [ -z "$CONN" ]; then
+          if [ -z "{{.AZ_RG}}" ] || [ -z "{{.AZ_NS}}" ] || ! az account show >/dev/null 2>&1; then
+            echo "Either pass the connection string:"
+            echo "  task multicluster:servicebus:secret CONN='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=...'"
+            echo "  (Azure Portal -> Service Bus namespace -> Shared access policies -> RootManageSharedAccessKey -> Primary Connection String)"
+            echo ""
+            echo "Or let az fetch it: set AZURE_SB_RG + AZURE_SB_NAMESPACE in .env and run 'az login'."
+            exit 1
+          fi
+          echo "Fetching connection string for namespace {{.AZ_NS}} (rg {{.AZ_RG}})..."
+          CONN=$(az servicebus namespace authorization-rule keys list \
+            --resource-group {{.AZ_RG}} --namespace-name {{.AZ_NS}} \
+            --name RootManageSharedAccessKey --query primaryConnectionString -o tsv)
+          echo "Ensuring topic '{{.SB_TOPIC}}' + subscription 'test-sub' exist..."
+          az servicebus topic create --resource-group {{.AZ_RG}} --namespace-name {{.AZ_NS}} \
+            --name {{.SB_TOPIC}} -o none 2>/dev/null || true
+          az servicebus topic subscription create --resource-group {{.AZ_RG}} --namespace-name {{.AZ_NS}} \
+            --topic-name {{.SB_TOPIC}} --name test-sub -o none 2>/dev/null || true
+        fi
+
+        for CTX in {{.PRIMARY}} {{.REMOTE}}; do
+          kubectl --context "$CTX" create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl --context "$CTX" apply -f - >/dev/null
+          kubectl --context "$CTX" create secret generic servicebus-azure-conn -n {{.NAMESPACE}} \
+            --from-literal=connection_string="$CONN" \
+            --dry-run=client -o yaml | kubectl --context "$CTX" apply -f - >/dev/null
+          echo "Secret servicebus-azure-conn updated on $CTX"
+        done
+
+  servicebus:deploy:
+    desc: "Deploy the topic consumer (real Azure SB). CLUSTERS=remote|primary|both (default: remote). Creates the secret via az if missing."
+    vars:
+      CLUSTERS: '{{.CLUSTERS | default "remote"}}'
+    cmds:
+      - |
+        if ! kubectl --context {{.REMOTE}} get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1; then
+          echo "Azure connection secret missing — creating it..."
+          task multicluster:servicebus:secret
+        fi
+      - "{{.CONTAINER_RUNTIME}} build -t servicebus-consumer:local {{.ROOT_DIR}}/apps/servicebus-consumer"
+      - |
+        case "{{.CLUSTERS}}" in
+          remote)  CTXS="{{.REMOTE}}";;
+          primary) CTXS="{{.PRIMARY}}";;
+          both)    CTXS="{{.PRIMARY}} {{.REMOTE}}";;
+          *) echo "CLUSTERS must be remote|primary|both (got '{{.CLUSTERS}}')"; exit 1;;
+        esac
+        for CTX in $CTXS; do
+          echo "=== deploying topic consumer to $CTX ==="
+          minikube -p "$CTX" image load servicebus-consumer:local
+          kubectl --context "$CTX" create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl --context "$CTX" apply -f -
+          kubectl --context "$CTX" apply -f {{.SB_OVERLAY}}/property-list-azure.yaml
+          kubectl --context "$CTX" apply -f {{.SB_OVERLAY}}/consumer-topic-azure.yaml
+          kubectl --context "$CTX" apply -f {{.SB_OVERLAY}}/split-config-topic-azure.yaml
+          kubectl --context "$CTX" rollout restart deploy/servicebus-topic-consumer -n {{.NAMESPACE}}
+          kubectl --context "$CTX" rollout status deploy/servicebus-topic-consumer -n {{.NAMESPACE}} --timeout=120s
+        done
+
+  servicebus:run:local:
+    desc: Run the topic consumer locally under mirrord via the PRIMARY operator (Ctrl-C to stop)
+    interactive: true
+    dir: apps/servicebus-consumer
+    cmds:
+      - go build -o /tmp/servicebus-consumer-topic main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so YOUR operator handles the session.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} exec -f {{.MC_SB_MIRRORD_CONFIG}} -- /tmp/servicebus-consumer-topic
+
+  servicebus:send:match:
+    desc: 'Publish a topic message matching the filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: servicebus:send
+        vars:
+          TENANT: "test-user"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session (mc azure)"}}'
+
+  servicebus:send:nomatch:
+    desc: 'Publish a topic message NOT matching the filter -> remote cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: servicebus:send
+        vars:
+          TENANT: "other"
+          TYPE: "basic"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello remote consumer (mc azure)"}}'
+
+  servicebus:send:
+    desc: 'Publish to the Azure topic with explicit routing (TENANT=... TYPE=... MESSAGE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "test-user"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    preconditions:
+      - sh: kubectl --context {{.REMOTE}} get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret missing on {{.REMOTE}}. Create it first: task multicluster:servicebus:secret CONN='Endpoint=sb://...'"
+    cmds:
+      - |
+        CONN=$(kubectl --context {{.REMOTE}} get secret servicebus-azure-conn -n {{.NAMESPACE}} -o jsonpath='{.data.connection_string}' | base64 -d)
+        BODY='{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"{{.TYPE}}","message":"{{.MESSAGE}}"}'
+        kubectl --context {{.REMOTE}} run sb-sender-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING=$CONN" \
+          --env="SEND_TOPIC={{.SB_TOPIC}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=tenant={{.TENANT}},type={{.TYPE}}" \
+          -- /app/consumer >/dev/null 2>&1
+        case "{{.TENANT}}" in
+          test*) echo "published '{{.MESSAGE}}' to {{.SB_TOPIC}} (tenant={{.TENANT}} -> local session)";;
+          *)     echo "published '{{.MESSAGE}}' to {{.SB_TOPIC}} (tenant={{.TENANT}} -> remote consumer)";;
+        esac
+
+  # ── Preview environment (real Azure SB topics, multicluster) ──────────────
+  # Instead of running the consumer locally, the operator spins up a PREVIEW
+  # POD from an image on the target's cluster (the remote, via the primary's
+  # default-cluster routing) and routes filter-matching messages to it.
+  # Config: k8s/overlays/servicebus-emulator/mirrord-preview-topic.json
+  # (feature.preview + split filter tenant=^test on test-topic-sub).
+  #
+  #   task multicluster:servicebus:deploy            # target consumer first
+  #   task multicluster:servicebus:preview:start     # preview pod on the remote
+  #   task multicluster:servicebus:send:match        # -> preview pod
+  #   task multicluster:servicebus:send:nomatch      # -> deployed consumer
+  #   task multicluster:servicebus:preview:logs / status / stop
+
+  servicebus:preview:start:
+    desc: "Start a preview env (NAME=prev-1 gives it its OWN filter tenant=^prev-1 so you can run several and target each; without NAME uses the default ^test filter)"
+    interactive: true
+    vars:
+      NAME: '{{.NAME | default ""}}'
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-asb-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "servicebus-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+      MC_SB_PREVIEW_CONFIG: '{{.MC_SB_PREVIEW_CONFIG | default (print .ROOT_DIR "/k8s/overlays/servicebus-emulator/mirrord-preview-topic.json")}}'
+    preconditions:
+      - sh: kubectl --context {{.REMOTE}} get deploy servicebus-topic-consumer -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Target consumer missing on {{.REMOTE}} — run 'task multicluster:servicebus:deploy' first"
+    cmds:
+      - |
+        CFG="{{.MC_SB_PREVIEW_CONFIG}}"
+        KEY="{{.PREVIEW_KEY}}"
+        # NAME=prev-1: generate a per-preview config whose split filter only
+        # matches tenants starting with that name. Each named preview then
+        # receives ONLY its own messages (task multicluster:servicebus:send:to
+        # NAME=prev-1), and previews don't compete with each other.
+        if [ -n "{{.NAME}}" ]; then
+          KEY="{{.NAME}}"
+          CFG="/tmp/mirrord-preview-{{.NAME}}.json"
+          python3 - <<'PY'
+        import json
+        c = json.load(open("{{.MC_SB_PREVIEW_CONFIG}}"))
+        c["feature"]["split_queues"]["test-topic-sub"]["message_filter"] = {"tenant": "^{{.NAME}}"}
+        json.dump(c, open("/tmp/mirrord-preview-{{.NAME}}.json", "w"), indent=2)
+        PY
+          echo "preview '{{.NAME}}': filter tenant=^{{.NAME}} (config $CFG)"
+        fi
+        # Same marker rule as run:local — with operator:dev running, the
+        # preview session must be labeled so YOUR operator handles it.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} preview start \
+            -f "$CFG" \
+            -i "{{.PREVIEW_IMAGE}}" \
+            -k "$KEY" \
+            --timeout {{.PREVIEW_TIMEOUT}}
+
+  servicebus:send:to:
+    desc: 'Send a message to ONE named preview env (NAME=prev-1 [MESSAGE=...])'
+    preconditions:
+      - sh: test -n "{{.NAME}}"
+        msg: "NAME is required, e.g. task multicluster:servicebus:send:to NAME=prev-1"
+    cmds:
+      - task: servicebus:send
+        vars:
+          TENANT: "{{.NAME}}-user"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default (print "hello preview " .NAME)}}'
+
+  servicebus:preview:stop:
+    desc: "Stop a preview env (NAME=prev-1, or PREVIEW_KEY for the default one)"
+    vars:
+      NAME: '{{.NAME | default ""}}'
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-asb-preview"}}'
+    cmds:
+      - |
+        KEY="{{.NAME}}"
+        [ -z "$KEY" ] && KEY="{{.PREVIEW_KEY}}"
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+        fi
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} preview stop -k "$KEY" || true
+
+  servicebus:preview:status:
+    desc: Show preview sessions, preview pods and split state on both clusters
+    silent: true
+    cmds:
+      - |
+        for CTX in {{.PRIMARY}} {{.REMOTE}}; do
+          echo "=== $CTX ==="
+          echo "preview sessions:"
+          kubectl --context "$CTX" get previewsessions -A 2>/dev/null || echo "  none"
+          echo "preview pods:"
+          kubectl --context "$CTX" get pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "  none"
+          echo "split sessions:"
+          kubectl --context "$CTX" get mirrordclustersplitsessions -A 2>/dev/null || echo "  none"
+          echo ""
+        done
+
+  servicebus:preview:logs:
+    desc: Tail the preview pod logs (it runs on the remote cluster)
+    cmds:
+      - kubectl --context {{.REMOTE}} logs -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview --tail=100 -f
+
+  servicebus:preview:clean:
+    desc: Delete all preview sessions + preview pods on both clusters
+    cmds:
+      - |
+        for CTX in {{.PRIMARY}} {{.REMOTE}}; do
+          echo "=== cleaning previews on $CTX ==="
+          kubectl --context "$CTX" delete previewsessions --all -A 2>/dev/null || true
+          kubectl --context "$CTX" delete pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || true
+        done
+
+  servicebus:logs:
+    desc: Tail the remote-cluster topic consumer logs
+    cmds:
+      - kubectl --context {{.REMOTE}} logs -n {{.NAMESPACE}} -l app=servicebus-topic-consumer --tail=100 -f
+
+  servicebus:clean:
+    desc: "Remove the topic consumer + CRDs (keeps secrets). CLUSTERS=remote|primary|both (default: both)"
+    vars:
+      CLUSTERS: '{{.CLUSTERS | default "both"}}'
+    cmds:
+      - |
+        case "{{.CLUSTERS}}" in
+          remote)  CTXS="{{.REMOTE}}";;
+          primary) CTXS="{{.PRIMARY}}";;
+          both)    CTXS="{{.PRIMARY}} {{.REMOTE}}";;
+          *) echo "CLUSTERS must be remote|primary|both (got '{{.CLUSTERS}}')"; exit 1;;
+        esac
+        for CTX in $CTXS; do
+          echo "=== cleaning topic consumer from $CTX ==="
+          kubectl --context "$CTX" delete -f {{.SB_OVERLAY}}/split-config-topic-azure.yaml --ignore-not-found=true
+          kubectl --context "$CTX" delete -f {{.SB_OVERLAY}}/property-list-azure.yaml --ignore-not-found=true
+          kubectl --context "$CTX" delete -f {{.SB_OVERLAY}}/consumer-topic-azure.yaml --ignore-not-found=true
+        done

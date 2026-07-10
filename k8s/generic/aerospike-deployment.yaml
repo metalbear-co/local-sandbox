@@ -1,0 +1,47 @@
+# The "source" Aerospike (community edition) the app normally talks to. CE ships a default
+# in-memory `test` namespace and no authentication - together with the default TCP readiness
+# probe this makes the branch config near-minimal (image + port + host/port patterns).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aerospike-main
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aerospike-main
+  template:
+    metadata:
+      labels:
+        app: aerospike-main
+    spec:
+      containers:
+        - name: aerospike
+          image: aerospike/aerospike-server:latest
+          ports:
+            - containerPort: 3000
+          readinessProbe:
+            tcpSocket:
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aerospike-main
+  namespace: generic-test
+spec:
+  selector:
+    app: aerospike-main
+  ports:
+    - port: 3000
+      targetPort: 3000

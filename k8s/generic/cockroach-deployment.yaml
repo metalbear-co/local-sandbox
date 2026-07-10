@@ -1,0 +1,54 @@
+# The "source" CockroachDB the app normally talks to - insecure single-node dev mode, no
+# credentials, so this pair exercises the MINIMAL generic branch config (image + port +
+# args + host/port patterns only; nothing to bootstrap).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cockroach-main
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cockroach-main
+  template:
+    metadata:
+      labels:
+        app: cockroach-main
+    spec:
+      containers:
+        - name: cockroach
+          image: cockroachdb/cockroach:v24.1.5
+          args: ["start-single-node", "--insecure"]
+          ports:
+            - containerPort: 26257
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /health?ready=1
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "500m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroach-main
+  namespace: generic-test
+spec:
+  selector:
+    app: cockroach-main
+  ports:
+    - name: sql
+      port: 26257
+      targetPort: 26257
+    - name: http
+      port: 8080
+      targetPort: 8080

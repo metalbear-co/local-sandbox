@@ -2,7 +2,7 @@ version: "3"
 
 vars:
   ROOT_DIR:
-    sh: cd .. && pwd
+    sh: git rev-parse --show-toplevel
   RMQ_NAMESPACE: '{{.RMQ_NAMESPACE | default "rabbitmq-system"}}'
   WORKER_NAMESPACE: '{{.WORKER_NAMESPACE | default "test-mirrord"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'

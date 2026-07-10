@@ -34,7 +34,7 @@ version: '3'
 
 vars:
   ROOT_DIR:
-    sh: cd .. && pwd
+    sh: git rev-parse --show-toplevel
   NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
   SPANNER_DIR: '{{.ROOT_DIR}}/k8s/spanner'
   OPERATOR_DIR: '{{.ROOT_DIR}}/../operator'
@@ -129,8 +129,11 @@ tasks:
         sh: rustc -vV | awk '/^host:/ {print $2}'
       # Spanner branching is not in any released CLI yet, so default to the branch debug build.
       MIRRORD_CLI: '{{.MIRRORD_BIN | default (print .MIRRORD_DIR "/target/" .HOST_TRIPLE "/debug/mirrord")}}'
-      COPY_MODE: '{{.COPY_MODE | default "all"}}'
       STAGING_NS: '{{.STAGING_NS | default "test-mirrord"}}'
+      # Copy schema for every table, then copy only the rows of FILTER_TABLE matching FILTER (a
+      # Spanner SQL WHERE clause), instead of all rows. Override to branch a different subset.
+      FILTER_TABLE: '{{.FILTER_TABLE | default "Users"}}'
+      FILTER: '{{.FILTER | default "Id = 1"}}'
     preconditions:
       - sh: test -n "{{.KEY}}"
         msg: "Set KEY to the same value you passed to `cargo xtask run-operator-staging KEY` so the session routes to your operator"
@@ -171,6 +174,69 @@ tasks:
                     "database_id": "SPANNER_DATABASE_ID"
                   }
                 },
+                "copy": {
+                  "mode": "schema",
+                  "tables": {
+                    "{{.FILTER_TABLE}}": { "filter": "{{.FILTER}}" }
+                  }
+                }
+              }
+            ]
+          }
+        }
+        EOF
+        echo "Using mirrord CLI {{.MIRRORD_CLI}}"
+        echo "Running app against staging (ns {{.STAGING_NS}}) via operator key {{.KEY}}, copy mode schema + filter {{.FILTER_TABLE}}: {{.FILTER}}"
+        # The locally-run operator (`run-operator-staging KEY`) watches only branches labeled with
+        # its isolation marker. The CLI reads OPERATOR_ISOLATION_MARKER from its own env to stamp
+        # that label on the branch it creates, so it must match the operator's marker (the KEY).
+        OPERATOR_ISOLATION_MARKER="{{.KEY}}" "{{.MIRRORD_CLI}}" exec -f "$CFG" -- "$APP"
+
+  run:staging:shared:
+    desc: "Run the Spanner app against staging through the DEPLOYED in-cluster operator (no key, no local operator, no lease)"
+    vars:
+      MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+      HOST_TRIPLE:
+        sh: rustc -vV | awk '/^host:/ {print $2}'
+      # Spanner branching is not in any released CLI yet, so default to the branch debug build.
+      MIRRORD_CLI: '{{.MIRRORD_BIN | default (print .MIRRORD_DIR "/target/" .HOST_TRIPLE "/debug/mirrord")}}'
+      COPY_MODE: '{{.COPY_MODE | default "all"}}'
+      STAGING_NS: '{{.STAGING_NS | default "test-mirrord"}}'
+    preconditions:
+      - sh: test -x "{{.MIRRORD_CLI}}"
+        msg: "mirrord CLI not found at {{.MIRRORD_CLI}}. Build it: cd {{.MIRRORD_DIR}} && cargo build -p mirrord (or set MIRRORD_BIN)"
+    cmds:
+      - task: build:app
+      - |
+        LABEL=$(go env GOVERSION | sed -E 's/^go1\.([0-9]+).*/\1/')
+        APP="{{.GO_APP_DIR}}/${LABEL}.go_test_app"
+        # No key/baggage: the session and its branch are handled by the deployed in-cluster operator,
+        # not a locally-run one. mirrord requires a .json/.yaml extension, so name the temp file
+        # explicitly rather than via `mktemp -t` (which drops the extension on macOS).
+        CFG="${TMPDIR:-/tmp}/spanner-staging-shared-$$.json"
+        trap "rm -f $CFG" EXIT
+        cat > "$CFG" <<EOF
+        {
+          "operator": true,
+          "target": { "path": { "pod": "spanner-consumer" }, "namespace": "{{.STAGING_NS}}" },
+          "feature": {
+            "env": true,
+            "fs": "local",
+            "network": { "incoming": "off", "outgoing": true },
+            "db_branches": [
+              {
+                "id": "spanner-dev-branch",
+                "type": "spanner",
+                "version": "1.5.23",
+                "ttl_secs": 600,
+                "creation_timeout_secs": 180,
+                "connection": {
+                  "params": {
+                    "project": "SPANNER_PROJECT_ID",
+                    "instance": "SPANNER_INSTANCE_ID",
+                    "database_id": "SPANNER_DATABASE_ID"
+                  }
+                },
                 "copy": { "mode": "{{.COPY_MODE}}" }
               }
             ]
@@ -178,7 +244,7 @@ tasks:
         }
         EOF
         echo "Using mirrord CLI {{.MIRRORD_CLI}}"
-        echo "Running app against staging (ns {{.STAGING_NS}}) via operator key {{.KEY}}, copy mode {{.COPY_MODE}}"
+        echo "Running app against staging (ns {{.STAGING_NS}}) via the deployed operator, copy mode {{.COPY_MODE}}"
         "{{.MIRRORD_CLI}}" exec -f "$CFG" -- "$APP"
 
   real:secret:
@@ -345,6 +411,65 @@ tasks:
         curl -s -X POST "$BASE/v1/$SESSION:executeSql" -H 'content-type: application/json' \
           --data-binary "{\"sql\":\"{{.QUERY}}\"}"
         echo ""
+
+  query:branch:
+    desc: "Query the branch Spanner emulator via gcloud (QUERY='SELECT * FROM Users')"
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM Users"}}'
+      BRANCH_PF_PORT: '{{.BRANCH_PF_PORT | default "19030"}}'
+    cmds:
+      - |
+        set -e
+        # The branch pod name is generated per branch; find the current one.
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -o name | grep spanner-branch-db-pod | head -1 | sed 's|pod/||')
+        if [ -z "$POD" ]; then echo "No spanner branch pod in {{.NAMESPACE}} (is a branch session running?)"; exit 1; fi
+        # The branch recreates the app's project/instance/database; read them off the setup sidecar.
+        eval "$(kubectl get pod "$POD" -n {{.NAMESPACE}} -o jsonpath='{range .spec.containers[?(@.name=="spanner-branch-setup")].env[*]}{.name}={.value}{"\n"}{end}' | grep '^SPANNER_' | sed 's/^/export /')"
+        pkill -f "port-forward.*$POD.*{{.BRANCH_PF_PORT}}:9020" 2>/dev/null || true
+        # gcloud (unlike client libraries) ignores SPANNER_EMULATOR_HOST, so port-forward the REST
+        # gateway (9020) and override the API endpoint at it instead.
+        kubectl port-forward -n {{.NAMESPACE}} "pod/$POD" {{.BRANCH_PF_PORT}}:9020 >/tmp/spanner-branch-query-pf.log 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null || true" EXIT
+        for _ in $(seq 1 60); do
+          curl -sf "http://127.0.0.1:{{.BRANCH_PF_PORT}}/v1/projects/$SPANNER_PROJECT_ID/instances/$SPANNER_INSTANCE_ID/databases/$SPANNER_DATABASE_ID" >/dev/null 2>&1 && break
+          sleep 0.5
+        done
+        echo "Branch: project=$SPANNER_PROJECT_ID instance=$SPANNER_INSTANCE_ID database=$SPANNER_DATABASE_ID"
+        CLOUDSDK_AUTH_DISABLE_CREDENTIALS=true \
+        CLOUDSDK_API_ENDPOINT_OVERRIDES_SPANNER="http://localhost:{{.BRANCH_PF_PORT}}/" \
+        gcloud spanner databases execute-sql "$SPANNER_DATABASE_ID" \
+          --instance="$SPANNER_INSTANCE_ID" --project="$SPANNER_PROJECT_ID" \
+          --sql="{{.QUERY}}"
+
+  query:real:
+    desc: "Query the REAL source Spanner DB the consumer points at, via gcloud (QUERY='SELECT * FROM Users')"
+    vars:
+      QUERY: '{{.QUERY | default "SELECT * FROM Users"}}'
+      # Personal accounts usually lack serviceusage.services.use on the Spanner project. Impersonate
+      # the service account the consumer already runs as (it has Spanner read); requires you to hold
+      # roles/iam.serviceAccountTokenCreator on it. Set to "" to use your own account instead.
+      IMPERSONATE: '{{.IMPERSONATE | default "spanner-branch-test@metalbear-staging.iam.gserviceaccount.com"}}'
+      # Quota/billing project for the API call. Defaults to the resource project; override if you
+      # only have serviceusage.services.use on a different project.
+      BILLING_PROJECT: '{{.BILLING_PROJECT | default ""}}'
+    cmds:
+      - |
+        set -e
+        # Read the real identifiers from the consumer pod's env.
+        eval "$(kubectl get pod spanner-consumer -n {{.NAMESPACE}} -o jsonpath='{range .spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}' | grep '^SPANNER_' | sed 's/^/export /')"
+        echo "Real: project=$SPANNER_PROJECT_ID instance=$SPANNER_INSTANCE_ID database=$SPANNER_DATABASE_ID"
+        ARGS=""
+        if [ -n "{{.IMPERSONATE}}" ]; then
+          echo "Impersonating {{.IMPERSONATE}}"
+          ARGS="$ARGS --impersonate-service-account={{.IMPERSONATE}}"
+        fi
+        if [ -n "{{.BILLING_PROJECT}}" ]; then
+          ARGS="$ARGS --billing-project={{.BILLING_PROJECT}}"
+        fi
+        gcloud spanner databases execute-sql "$SPANNER_DATABASE_ID" \
+          --instance="$SPANNER_INSTANCE_ID" --project="$SPANNER_PROJECT_ID" \
+          --sql="{{.QUERY}}" $ARGS
 
   status:
     desc: "Show the Spanner sandbox status"

@@ -1,0 +1,33 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "influx-generic-branch",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 180,
+                "image": "influxdb:2.7-alpine",
+                "port": 8086,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "INFLUXDB_URL", "value_pattern": "https?://(?P<host>[^:/]+)" },
+                        "port": { "env_var_name": "INFLUXDB_URL", "value_pattern": ":(?P<port>[0-9]+)$" },
+                        "token": { "secret": "influx-creds", "key": "token" },
+                        "org": "INFLUXDB_ORG",
+                        "bucket": "INFLUXDB_BUCKET"
+                    }
+                },
+                "env": {
+                    "DOCKER_INFLUXDB_INIT_MODE": "setup",
+                    "DOCKER_INFLUXDB_INIT_USERNAME": "admin",
+                    "DOCKER_INFLUXDB_INIT_PASSWORD": "mirrord-branch",
+                    "DOCKER_INFLUXDB_INIT_ADMIN_TOKEN": "$(MIRRORD_PARAM_TOKEN)",
+                    "DOCKER_INFLUXDB_INIT_ORG": "$(MIRRORD_PARAM_ORG)",
+                    "DOCKER_INFLUXDB_INIT_BUCKET": "$(MIRRORD_PARAM_BUCKET)"
+                },
+                "readiness": { "type": "http_get", "path": "/health" }
+            }
+        ]
+    }
+}

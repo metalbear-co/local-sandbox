@@ -1,0 +1,5 @@
+{
+  "level": "debug",
+  "format": "json",
+  "note": "non-sensitive config_mounts file - the operator stores this in a ConfigMap"
+}

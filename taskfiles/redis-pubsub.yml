@@ -1,0 +1,145 @@
+version: "3"
+
+# Redis Pub/Sub channel splitting.
+#
+#   task redis-pubsub:deploy         deploy Redis + consumer + split CRDs into the cluster
+#   task redis-pubsub:run:local      run the consumer locally under mirrord (starts the split)
+#   task redis-pubsub:send:match     message with tenant=test   -> your local session
+#   task redis-pubsub:send:nomatch   message with tenant=other  -> cluster consumer
+#
+# The split filter lives in k8s/overlays/redis-pubsub/mirrord.json
+# (message property `tenant` matching ^test). Messages are JSON published on
+# the source channel; the operator forwards matches to a temp channel that
+# only your mirrord session subscribes to.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/redis-pubsub-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/redis-pubsub'
+  # Redis server lives in its own namespace (k8s/redis manifests pin it there).
+  REDIS_NAMESPACE: "redis-test"
+  # Overridable via REDIS_PUBSUB_MIRRORD_CONFIG / REDIS_PUBSUB_CHANNEL in .env
+  # (module-prefixed names so they can't collide with other modules' globals).
+  REDIS_PUBSUB_MIRRORD_CONFIG: '{{.REDIS_PUBSUB_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/redis-pubsub/mirrord.json")}}'
+  CHANNEL: '{{.REDIS_PUBSUB_CHANNEL | default "orders.events"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the Redis Pub/Sub test env (Redis + consumer + split CRDs)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t redis-pubsub-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load redis-pubsub-consumer:local
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/namespace.yaml
+      - kubectl apply --validate=false -f {{.ROOT_DIR}}/k8s/redis/redis-deployment.yaml
+      - kubectl delete deployment redis-app -n {{.REDIS_NAMESPACE}} --ignore-not-found=true
+      - task: _wait:redis
+      - kubectl apply --validate=false -f {{.OVERLAY}}/namespace.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY}}/consumer.yaml
+      - task: _wait:consumer
+      - kubectl apply --validate=false -f {{.OVERLAY}}/property-list.yaml
+      - kubectl apply --validate=false -f {{.OVERLAY}}/split-config.yaml
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts channel splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/redis-pubsub-consumer
+    cmds:
+      - go build -o /tmp/redis-pubsub-consumer main.go
+      # mirrord.json sets experimental.sip_utils=false for locally-built CLI binaries on macOS.
+      - "{{.MIRRORD_BIN}} exec -f {{.REDIS_PUBSUB_MIRRORD_CONFIG}} -- /tmp/redis-pubsub-consumer"
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "test"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "other"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Publish a message with explicit routing (TENANT=... MESSAGE=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "test"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBLISH {{.CHANNEL}} '{"tenant":"{{.TENANT}}","body":"{{.MESSAGE}}"}' >/dev/null
+        case "{{.TENANT}}" in
+          test*) echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *)     echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=redis-pubsub-consumer --tail=100 -f
+
+  logs:redis:
+    desc: Tail the Redis server logs
+    cmds:
+      - kubectl logs -n {{.REDIS_NAMESPACE}} -l app=redis-main --tail=100 -f
+
+  status:
+    desc: Show consumer, Redis and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=redis-pubsub-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== redis ==="
+      - kubectl get pods -n {{.REDIS_NAMESPACE}} -l app=redis-main 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== active pub/sub channels (need at least one subscriber) ==="
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l app=redis-main -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+        if [ -z "$POD" ]; then
+          echo "redis not reachable"
+        else
+          CHANNELS=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB CHANNELS '*' 2>/dev/null || true)
+          if [ -z "$CHANNELS" ]; then
+            echo "(none - start a mirrord session or cluster consumer first)"
+          else
+            for ch in $CHANNELS; do
+              count=$(kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli PUBSUB NUMSUB "$ch" 2>/dev/null | tail -1)
+              printf "%-40s %12s\n" "$ch" "${count:-0}"
+            done
+          fi
+        fi
+
+  clean:
+    desc: Remove the Redis Pub/Sub test env from the cluster
+    cmds:
+      - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/namespace.yaml --ignore-not-found=true
+
+  _wait:redis:
+    internal: true
+    cmds:
+      - echo "Waiting for Redis..."
+      - kubectl wait --for=condition=ready pod -l app=redis-main -n {{.REDIS_NAMESPACE}} --timeout=120s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for Redis Pub/Sub consumer..."
+      - kubectl wait --for=condition=ready pod -l app=redis-pubsub-consumer -n {{.NAMESPACE}} --timeout=120s

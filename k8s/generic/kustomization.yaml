@@ -1,0 +1,23 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: generic-test
+
+resources:
+  - namespace.yaml
+  - valkey-deployment.yaml
+  - app-deployment.yaml
+  - influxdb-deployment.yaml
+  - influx-app-deployment.yaml
+  - opensearch-deployment.yaml
+  - opensearch-app-deployment.yaml
+  - elasticsearch-deployment.yaml
+  - elasticsearch-app-deployment.yaml
+  - cockroach-deployment.yaml
+  - cockroach-app-deployment.yaml
+  - cassandra-deployment.yaml
+  - cassandra-app-deployment.yaml
+  - aerospike-deployment.yaml
+  - aerospike-app-deployment.yaml
+  - couchbase-deployment.yaml
+  - couchbase-app-deployment.yaml

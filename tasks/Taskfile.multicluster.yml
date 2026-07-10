@@ -48,7 +48,7 @@ version: "3"
 vars:
   # ROOT_DIR is local-sandbox/ (parent of tasks/) - same pattern as other taskfiles
   ROOT_DIR:
-    sh: cd .. && pwd
+    sh: git rev-parse --show-toplevel
   CHARTS_DIR: "{{.ROOT_DIR}}/../operator/public/charts/mirrord-operator"
   APPS_DIR: "{{.ROOT_DIR}}/apps"
   K8S_DIR: "{{.ROOT_DIR}}/k8s"

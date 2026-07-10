@@ -1,0 +1,80 @@
+# mirrord config for operator:dev against the multicluster REMOTE.
+#
+# `task operator:dev CLUSTER=mirrord-remote-1` (or multicluster:operator:remote-1)
+# picks this file automatically because its name matches the cluster context:
+#   .mirrord/operator-dev.<kube-context>.yaml
+# Tweak anything here per-cluster (flags, log levels) without touching the
+# base operator-dev.yaml.
+
+operator: false
+
+skip_extra_build_tools:
+  - cargo
+
+skip_sip:
+  - operator-service
+
+kube_context: mirrord-remote-1
+
+target:
+  path: deployment/mirrord-operator
+  namespace: mirrord
+
+agent:
+  log_level: "mirrord=debug"
+  image: test
+  image_pull_policy: Never
+  namespace: mirrord
+  clean_iptables_on_start: true
+
+feature:
+  network:
+    incoming:
+      mode: steal
+      # Distinct LOCAL port so the primary and remote operator:dev sessions
+      # can run at the same time (both would otherwise bind 443). Local 3444
+      # listens, remote 443 is stolen. OPERATOR_ADVERTISED_API_PORT below
+      # keeps dynamically registered webhooks pointing at the Service's 443.
+      port_mapping:
+        - [3444, 443]
+      # NOTE: `ports` is checked against the MAPPED (remote) port, not the
+      # local bind port (layer/src/socket/ops.rs) — listing 3444 here silently
+      # disables the steal altogether.
+      ports:
+        - 443
+  fs:
+    mode: read
+    read_only:
+      # Only the pod's service-account files — NOT bare "/var.+": the fs filter
+      # checks read_only BEFORE local, and on macOS the operator writes remote
+      # cluster tokens under /var/folders/... which must stay local.
+      - "^/var/run.+"
+      - "^/mirrord.+"
+    # Read the sandbox's local config files from the LOCAL disk instead of the
+    # deployed pod (used for the generic branch pod config below).
+    local:
+      - ".*/local-sandbox/configs/.*"
+      # macOS temp dir where the operator writes remote-cluster token files.
+      # Both forms: the layer may canonicalize /var -> /private/var, and
+      # mirrord's built-in default-local set only covers ^/var/folders.
+      - "/var/folders/.*"
+      - "/private/var/folders/.*"
+  env:
+    override:
+      # The remote executes the actual workload sessions/splits — splitting
+      # logs matter most here.
+      RUST_LOG: "operator_service=info,mirrord=info,operator_pod_mutator=debug,operator_queue_splitting=debug"
+
+      # Force flags the deployed released chart doesn't render (see
+      # operator/crates/operator-proxy/src/config.rs for the full list).
+      OPERATOR_GENERIC_BRANCHING: "true"
+      OPERATOR_AZURE_SERVICE_BUS_SPLITTING: "true"
+      # Relative to ../operator (operator:dev runs the binary from there).
+      OPERATOR_GENERIC_BRANCH_CONFIG: "../local-sandbox/configs/generic-branch-config.yaml"
+
+      # Unique local bind ports so both operator:dev sessions can run at once;
+      # the advertised port stays 443 so webhook registrations remain valid.
+      OPERATOR_ADDR: "0.0.0.0:3444"
+      OPERATOR_FALLBACK_ADDR: "0.0.0.0:3444"
+      OPERATOR_METRICS_ADDR: "0.0.0.0:9002"
+      OPERATOR_ADVERTISED_API_PORT: "443"

@@ -1,0 +1,89 @@
+version: "3"
+
+# mirrord agent image helpers.
+#
+# The operator/agent run with `agent.image: test` + pullPolicy Never
+# (operator-values.yaml and .mirrord/operator-dev.yaml), so the image has to
+# be present inside minikube. These tasks keep it there.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  # Static on purpose: legacy taskfiles define their own AGENT_IMAGE globals
+  # (ghcr latest, mirrord-agent:custom) that can leak across include
+  # namespaces. A CLI override (task mirrord:agent:load AGENT_IMAGE=x) still
+  # takes precedence over this value.
+  AGENT_IMAGE: "test"
+
+tasks:
+  agent:build:
+    desc: Build the agent image from ../mirrord and load it into minikube (AGENT_IMAGE=test)
+    cmds:
+      - cd {{.MIRRORD_DIR}} && {{.CONTAINER_RUNTIME}} build -f mirrord/agent/Dockerfile -t {{.AGENT_IMAGE}} .
+      - task: agent:load
+
+  agent:load:
+    desc: (Re)load the agent image from docker into minikube (AGENT_IMAGE=test)
+    preconditions:
+      - sh: '{{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1'
+        msg: "Image '{{.AGENT_IMAGE}}' not found in docker. Build it first: task mirrord:agent:build"
+    cmds:
+      # Remove the old copy inside minikube first — `image load` does not
+      # overwrite an existing tag, which is how stale agents happen.
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.CLUSTER_NAME}} image load {{.AGENT_IMAGE}}
+      - echo "Agent image '{{.AGENT_IMAGE}}' loaded into minikube."
+
+  agent:status:
+    desc: Show whether the agent image is present in docker and minikube
+    silent: true
+    cmds:
+      - |
+        if {{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1; then
+          echo "docker:   '{{.AGENT_IMAGE}}' present ($({{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} --format '{{`{{.Created}}`}}' 2>/dev/null))"
+        else
+          echo "docker:   '{{.AGENT_IMAGE}}' missing — task mirrord:agent:build"
+        fi
+        if minikube -p {{.CLUSTER_NAME}} image ls 2>/dev/null | grep -q "library/{{.AGENT_IMAGE}}:"; then
+          echo "minikube: '{{.AGENT_IMAGE}}' present"
+        else
+          echo "minikube: '{{.AGENT_IMAGE}}' missing — task mirrord:agent:load"
+        fi
+
+  cli:build:
+    desc: "Fast mirrord CLI build for THIS Mac only (aarch64 layer + shim + CLI, no x86_64/universal). RELEASE=true for release mode."
+    vars:
+      MODE: '{{if eq .RELEASE "true"}}release{{else}}debug{{end}}'
+      RELEASE_FLAG: '{{if eq .RELEASE "true"}}--release{{end}}'
+    cmds:
+      - |
+        set -e
+        cd {{.MIRRORD_DIR}}
+
+        # 1. Fresh aarch64 layer + arm64e shim. `build-layer` always builds (it ignores
+        #    MIRRORD_LAYER_FILE), unlike `build-cli`, which skips the layer when that var
+        #    is set.
+        cargo xtask build-layer --platform macos-aarch64 {{.RELEASE_FLAG}}
+
+        LAYER="$PWD/target/aarch64-apple-darwin/{{.MODE}}/libmirrord_layer.dylib"
+        # Re-sign ad-hoc like scripts/build_layer_mac.sh does (cheap, avoids any
+        # invalid-signature injection surprises after incremental rebuilds).
+        codesign -f -s - "$LAYER"
+
+        # 2. Build the CLI with the fresh layer embedded. MIRRORD_LAYER_FILE must be set
+        #    EXPLICITLY here: the MetalBear/.cargo/config.toml [env] section otherwise
+        #    injects the (stale) universal dylib path into every cargo run, and build-cli
+        #    would embed that instead of what we just built. Skip the UI rebuild when the
+        #    dist assets already exist.
+        UI_FLAG=""
+        [ -d packages/ui/dist ] && UI_FLAG="--no-ui"
+        MIRRORD_LAYER_FILE="$LAYER" \
+          cargo xtask build-cli --platform macos-aarch64 {{.RELEASE_FLAG}} $UI_FLAG
+
+        echo ""
+        echo "Built: {{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"
+        echo "Use it with sandbox tasks:"
+        echo "  task generic:run:local MIRRORD_BIN={{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"

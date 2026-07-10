@@ -1,0 +1,32 @@
+{
+  "target": {
+    "path": "deploy/echo-app",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300,
+      "config_mounts": [
+        {
+          "mount_at": "/app/logging.json",
+          "from_file": "./apps/echo-app/mounts/logging.json"
+        }
+      ],
+      "secret_mounts": [
+        {
+          "mount_at": "/app/appsettings.ci.json",
+          "from_file": "./apps/echo-app/mounts/appsettings.ci.json"
+        }
+      ]
+    },
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "http_filter": {
+          "header_filter": "X-Preview: {{ key }}"
+        }
+      }
+    }
+  }
+}
