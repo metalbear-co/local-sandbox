@@ -1,0 +1,29 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "couchbase-generic-branch",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 300,
+                "image": "couchbase:community-7.6.2",
+                "port": 8091,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "COUCHBASE_HOST", "value_pattern": "^(?P<host>.+)$" },
+                        "password": "COUCHBASE_PASSWORD"
+                    }
+                },
+                "command": [
+                    "/bin/bash", "-c",
+                    "/entrypoint.sh couchbase-server & until curl -s http://localhost:8091/pools > /dev/null; do sleep 2; done; couchbase-cli cluster-init -c localhost --cluster-username Administrator --cluster-password \"$MIRRORD_PARAM_PASSWORD\" --services data,index,query --cluster-ramsize 512 --cluster-index-ramsize 256; couchbase-cli bucket-create -c localhost -u Administrator -p \"$MIRRORD_PARAM_PASSWORD\" --bucket sandbox --bucket-type couchbase --bucket-ramsize 256; wait"
+                ],
+                "readiness": {
+                    "type": "exec",
+                    "command": ["sh", "-c", "curl -s -u \"Administrator:$MIRRORD_PARAM_PASSWORD\" http://localhost:8091/pools/default/buckets/sandbox > /dev/null"]
+                }
+            }
+        ]
+    }
+}

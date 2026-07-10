@@ -72,6 +72,10 @@ includes:
     taskfile: ./taskfiles/redis.yml
   generic:
     taskfile: ./taskfiles/generic.yml
+  multicluster:
+    taskfile: ./taskfiles/multicluster.yml
+  preview:
+    taskfile: ./taskfiles/preview.yml
 
 tasks:
   default:
@@ -106,6 +110,12 @@ tasks:
           task postgres:query:branch QUERY="SELECT count(*) FROM users;"
           task postgres:shell:branch        interactive shell into the branch
           task postgres:branches / logs / status / clean
+
+        multicluster (2 local clusters + real Azure Service Bus topics):
+
+          task multicluster:up              clusters + released operators
+          task multicluster:operator:primary     your operator vs primary (or :remote-1)
+          task multicluster:servicebus:deploy / run:local / send:match / send:nomatch
 
         mirrord agent:
 

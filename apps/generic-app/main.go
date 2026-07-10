@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -21,17 +22,21 @@ import (
 
 var rdb *redis.Client
 var ctx = context.Background()
-var addr, cacheName string
+var addr, sourceAddr, password, cacheName string
 
 func main() {
 	addr = os.Getenv("VALKEY_ADDR")
 	if addr == "" {
 		addr = "valkey-main:6379"
 	}
-	password := os.Getenv("VALKEY_PASSWORD")
+	// Same value in the pod spec, but NOT declared in the mirrord config, so mirrord never
+	// rewrites it: under mirrord this stays the ORIGINAL (source) address while VALKEY_ADDR
+	// gets rewritten to the branch.
+	sourceAddr = os.Getenv("VALKEY_SOURCE_ADDR")
+	password = os.Getenv("VALKEY_PASSWORD")
 	cacheName = os.Getenv("CACHE_NAME")
 
-	log.Printf("Connecting to Valkey at %s (cache name: %s)", addr, cacheName)
+	log.Printf("Connecting to Valkey at %s (source addr: %s, cache name: %s)", addr, sourceAddr, cacheName)
 
 	rdb = redis.NewClient(&redis.Options{
 		Addr:     addr,
@@ -70,18 +75,62 @@ func handleRoot(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "  GET /health              - Health check\n")
 }
 
-// Shows the resolved connection env, so you can see the value_pattern rewrite in action:
-// under mirrord the host/port fragments of VALKEY_ADDR point at the branch pod.
+// Extracts a field like "run_id" from valkey `INFO server` output.
+func infoField(info, field string) string {
+	for _, line := range strings.Split(info, "\n") {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(line), field+":"); ok {
+			return v
+		}
+	}
+	return "?"
+}
+
+// Shows the real (source) address next to the connected one, so you can see the
+// value_pattern rewrite in action: under mirrord the host/port fragments of VALKEY_ADDR
+// point at the branch pod while VALKEY_SOURCE_ADDR stays untouched. It then dials BOTH
+// servers and compares their run_ids (unique per server process) for definitive proof.
 func handleInfo(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "VALKEY_ADDR = %s\n", addr)
+	fmt.Fprintf(w, "VALKEY_SOURCE_ADDR (real, untouched)   = %s\n", sourceAddr)
+	fmt.Fprintf(w, "VALKEY_ADDR        (connected)         = %s\n", addr)
 	fmt.Fprintf(w, "CACHE_NAME  = %s\n", cacheName)
-	fmt.Fprintf(w, "password set: %v (never rewritten by mirrord)\n", os.Getenv("VALKEY_PASSWORD") != "")
-	server, err := rdb.Info(ctx, "server").Result()
+	fmt.Fprintf(w, "password set: %v (never rewritten by mirrord)\n", password != "")
+	fmt.Fprintf(w, "\n")
+
+	connectedInfo, err := rdb.Info(ctx, "server").Result()
 	if err != nil {
-		fmt.Fprintf(w, "INFO server failed: %v\n", err)
+		fmt.Fprintf(w, "INFO server on connected (%s) failed: %v\n", addr, err)
 		return
 	}
-	fmt.Fprintf(w, "\n--- INFO server ---\n%s", server)
+	connectedRunID := infoField(connectedInfo, "run_id")
+	fmt.Fprintf(w, "connected server run_id = %s\n", connectedRunID)
+
+	if sourceAddr == "" {
+		fmt.Fprintf(w, "source server run_id    = ? (VALKEY_SOURCE_ADDR not set)\n")
+		return
+	}
+
+	// Dial the source directly (through mirrord's outgoing proxy when running under mirrord).
+	srcCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	src := redis.NewClient(&redis.Options{Addr: sourceAddr, Password: password})
+	defer src.Close()
+	sourceInfo, err := src.Info(srcCtx, "server").Result()
+	if err != nil {
+		fmt.Fprintf(w, "source server run_id    = ? (INFO on %s failed: %v)\n", sourceAddr, err)
+		return
+	}
+	sourceRunID := infoField(sourceInfo, "run_id")
+	fmt.Fprintf(w, "source server run_id    = %s\n", sourceRunID)
+	fmt.Fprintf(w, "\n")
+
+	switch {
+	case addr == sourceAddr:
+		fmt.Fprintf(w, "REDIRECTED: no - VALKEY_ADDR was not rewritten (not running under mirrord with a branch?)\n")
+	case connectedRunID != "?" && connectedRunID == sourceRunID:
+		fmt.Fprintf(w, "REDIRECTED: NO! - address differs but it is the SAME server process as the source\n")
+	default:
+		fmt.Fprintf(w, "REDIRECTED: yes - connected to a DIFFERENT server (the branch) than the source\n")
+	}
 }
 
 func handleGet(w http.ResponseWriter, r *http.Request) {

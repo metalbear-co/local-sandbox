@@ -11,8 +11,8 @@
                 "port": 6379,
                 "connection": {
                     "params": {
-                        "host": { "env_var_name": "VALKEY_ADDR", "value_pattern": "^([^:]+):" },
-                        "port": { "env_var_name": "VALKEY_ADDR", "value_pattern": ":([0-9]+)$" },
+                        "host": { "env_var_name": "VALKEY_ADDR", "value_pattern": "^(?P<host>[^:]+):" },
+                        "port": { "env_var_name": "VALKEY_ADDR", "value_pattern": ":(?P<port>[0-9]+)$" },
                         "password": "VALKEY_PASSWORD",
                         "cache_name": "CACHE_NAME"
                     }

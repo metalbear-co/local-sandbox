@@ -24,6 +24,10 @@ spec:
             # value_pattern; the scheme and URL shape stay intact.
             - name: INFLUXDB_URL
               value: "http://influxdb-main:8086"
+            # Same value, but NOT declared in the mirrord config, so it arrives untouched.
+            # Lets the app display the real (source) URL next to the rewritten one.
+            - name: INFLUXDB_SOURCE_URL
+              value: "http://influxdb-main:8086"
             # The token is deliberately NOT read from this pod's env in the mirrord config -
             # it comes straight from the influx-creds Secret (direct Secret param source).
             - name: INFLUXDB_TOKEN

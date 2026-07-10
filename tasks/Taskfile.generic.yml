@@ -129,13 +129,18 @@ tasks:
         kubectl get -n {{.GENERIC_NAMESPACE}} $POD -o jsonpath='{.spec.containers[0].env}' | python3 -m json.tool
 
   query:source:
-    desc: "Query the source (cluster) Valkey keys"
+    desc: "Query the source (cluster) Valkey keys and values"
     cmds:
       - |
         POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l app=valkey-main -o jsonpath='{.items[0].metadata.name}')
         echo ""
         echo "=== SOURCE VALKEY (cluster) ==="
-        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- valkey-cli -a '{{.VALKEY_PASSWORD}}' KEYS '*'
+        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- sh -c '
+          KEYS=$(valkey-cli -a "{{.VALKEY_PASSWORD}}" --no-auth-warning KEYS "*")
+          [ -z "$KEYS" ] && echo "(no keys)" && exit 0
+          for k in $KEYS; do
+            echo "  $k = $(valkey-cli -a "{{.VALKEY_PASSWORD}}" --no-auth-warning GET "$k")"
+          done'
 
   query:branch:
     desc: "Query the branch Valkey with the app's password (proves the branch accepts the app's real creds)"
@@ -147,9 +152,12 @@ tasks:
         echo ""
         echo "=== BRANCH VALKEY ($POD) ==="
         echo '(authenticating with the SAME password the app uses - the MIRRORD_PARAM_PASSWORD bootstrap)'
-        kubectl exec -n {{.GENERIC_NAMESPACE}} ${POD#pod/} -- valkey-cli -a '{{.VALKEY_PASSWORD}}' KEYS '*'
-        echo ""
-        echo "A fresh branch starts EMPTY - keys appear here once the mirrord-run app writes."
+        kubectl exec -n {{.GENERIC_NAMESPACE}} ${POD#pod/} -- sh -c '
+          KEYS=$(valkey-cli -a "{{.VALKEY_PASSWORD}}" --no-auth-warning KEYS "*")
+          [ -z "$KEYS" ] && echo "(empty - a fresh branch starts with no keys)" && exit 0
+          for k in $KEYS; do
+            echo "  $k = $(valkey-cli -a "{{.VALKEY_PASSWORD}}" --no-auth-warning GET "$k")"
+          done'
 
   branches:
     desc: "Show BranchDatabase CRDs + branch status via the CLI"

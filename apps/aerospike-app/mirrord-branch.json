@@ -1,0 +1,21 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "aerospike-generic-branch",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 180,
+                "image": "aerospike/aerospike-server:latest",
+                "port": 3000,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "AEROSPIKE_ADDR", "value_pattern": "^(?P<host>[^:]+):" },
+                        "port": { "env_var_name": "AEROSPIKE_ADDR", "value_pattern": ":(?P<port>[0-9]+)$" }
+                    }
+                }
+            }
+        ]
+    }
+}

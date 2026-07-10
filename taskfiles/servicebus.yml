@@ -131,6 +131,118 @@ tasks:
       - kubectl delete -f {{.OVERLAY}}/servicebus-emulator.yaml --ignore-not-found=true
       - kubectl delete namespace {{.EMULATOR_NAMESPACE}} --ignore-not-found=true
 
+  # ── Real Azure Service Bus (cloud) ──────────────────────────────────────
+  # Same flow, but against a real Azure namespace instead of the emulator.
+  # The app AND the operator read the connection string from the
+  # `servicebus-azure-conn` secret, so the SAS key never lands in a file.
+  #
+  #   task servicebus:azure:secret CONN='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=...'
+  #   task servicebus:azure:deploy
+  #   task servicebus:azure:run:local
+  #   task servicebus:azure:send:match / azure:send:nomatch [MESSAGE=...]
+  #
+  # The topic/subscription variant is still available under
+  # `task legacy:servicebus:azure:deploy:topic` etc.
+
+  azure:secret:
+    desc: "Store the real Azure connection string secret (CONN='Endpoint=sb://...')"
+    silent: true
+    cmds:
+      - |
+        if [ -z "{{.CONN}}" ]; then
+          echo "Pass the connection string:"
+          echo "  task servicebus:azure:secret CONN='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=...'"
+          exit 1
+        fi
+        kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        kubectl create secret generic servicebus-azure-conn -n {{.NAMESPACE}} \
+          --from-literal=connection_string='{{.CONN}}' \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "Secret servicebus-azure-conn updated in {{.NAMESPACE}}"
+
+  azure:deploy:
+    desc: Deploy the consumer wired to REAL Azure Service Bus (run azure:secret first)
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret servicebus-azure-conn not found. Create it first: task servicebus:azure:secret CONN='Endpoint=sb://...'"
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t servicebus-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load servicebus-consumer:local
+      - kubectl apply -f {{.OVERLAY}}/property-list-azure.yaml
+      - kubectl apply -f {{.OVERLAY}}/consumer-azure.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config-azure.yaml
+      # Force a new pod so a rebuilt image is picked up (imagePullPolicy: Never).
+      - kubectl rollout restart deploy/servicebus-consumer -n {{.NAMESPACE}}
+      - kubectl rollout status deploy/servicebus-consumer -n {{.NAMESPACE}} --timeout=120s
+
+  azure:run:local:
+    desc: Run the consumer locally under mirrord against real Azure (Ctrl-C to stop)
+    interactive: true
+    dir: apps/servicebus-consumer
+    cmds:
+      - go build -o /tmp/servicebus-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.SB_MIRRORD_CONFIG}} -- /tmp/servicebus-consumer"
+
+  azure:send:match:
+    desc: 'Azure: send a message matching the filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: azure:send
+        vars:
+          TENANT: "test-user"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session (azure)"}}'
+
+  azure:send:nomatch:
+    desc: 'Azure: send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: azure:send
+        vars:
+          TENANT: "other"
+          TYPE: "basic"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer (azure)"}}'
+
+  azure:send:
+    desc: 'Azure: send with explicit routing (TENANT=... TYPE=... MESSAGE=...)'
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret servicebus-azure-conn not found. Create it first: task servicebus:azure:secret CONN='Endpoint=sb://...'"
+    vars:
+      AZURE_CONN:
+        sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} -o jsonpath='{.data.connection_string}' 2>/dev/null | base64 -d
+    cmds:
+      # Reuses the emulator `send` helper: the one-shot sender pod just runs in
+      # the app namespace with the real connection string instead.
+      - task: send
+        vars:
+          TENANT: '{{.TENANT | default "test-user"}}'
+          TYPE: '{{.TYPE | default "standard"}}'
+          MESSAGE: '{{.MESSAGE | default "Test message"}}'
+          CONN_STR: "{{.AZURE_CONN}}"
+          EMULATOR_NAMESPACE: "{{.NAMESPACE}}"
+
+  azure:status:
+    desc: Show real-Azure consumer + split state
+    silent: true
+    cmds:
+      - echo "=== secret ==="
+      - kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} 2>/dev/null || echo "missing — task servicebus:azure:secret"
+      - echo ""
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=servicebus-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split config ==="
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+
+  azure:clean:
+    desc: Remove the real-Azure consumer + CRDs (keeps the secret)
+    cmds:
+      - kubectl delete -f {{.OVERLAY}}/split-config-azure.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/property-list-azure.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/consumer-azure.yaml --ignore-not-found=true
+
   _deploy:emulator:
     internal: true
     # On Apple Silicon the cluster node is arm64, so by default it pulls the

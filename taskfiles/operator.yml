@@ -86,35 +86,53 @@ tasks:
       - echo "Released operator deployed. Apply your local CRDs with 'task operator:crds', then 'task operator:dev'."
 
   crds:
-    desc: Apply CRDs rendered from the local ../operator chart (server-side apply)
+    desc: "Apply CRDs rendered from the local ../operator chart (server-side apply). CLUSTER=<kube-context> targets another cluster."
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+      KCTX: '{{if .CLUSTER}}--context {{.CLUSTER}}{{end}}'
     preconditions:
       - sh: test -d "{{.CHARTS_DIR}}"
         msg: "Local operator chart not found at {{.CHARTS_DIR}} (clone ../operator or set CHARTS_DIR in .env)"
     cmds:
-      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} -s templates/crd.yaml | kubectl apply --server-side --force-conflicts -f -
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} -s templates/crd.yaml | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
       # Multi-cluster CRDs only render when the feature is enabled in values,
       # and `helm -s` errors on an empty render, so apply them best-effort.
       - |
-        MC=$(helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} -s templates/multi-cluster-crd.yaml 2>/dev/null || true)
+        MC=$(helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} --set operator.multiCluster.enabled=true -s templates/multi-cluster-crd.yaml 2>/dev/null || true)
         if [ -n "$MC" ]; then
-          echo "$MC" | kubectl apply --server-side --force-conflicts -f -
+          echo "$MC" | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
         fi
-      - echo "CRDs from the local chart applied."
+      - echo "CRDs from the local chart applied{{if .CLUSTER}} to {{.CLUSTER}}{{end}}."
 
   dev:
-    desc: "Run the local operator under mirrord (steals from the deployed operator). Applies local CRDs first. SANDBOX_LICENSE=1 to trust the sandbox license issuer."
+    desc: "Run the local operator under mirrord (steals from the deployed operator). Applies local CRDs first. CLUSTER=<kube-context> picks the cluster and its .mirrord/operator-dev.<cluster>.yaml config if present; CONFIG=<path> overrides; SANDBOX_LICENSE=1 to trust the sandbox license issuer."
     interactive: true
     vars:
       ISOLATION_MARKER: '{{.ISOLATION_MARKER | default "local-dev"}}'
+      CLUSTER: '{{.CLUSTER | default ""}}'
+      KCTX: '{{if .CLUSTER}}--context {{.CLUSTER}}{{end}}'
+      CONFIG: '{{.CONFIG | default ""}}'
     env:
       OPERATOR_ISOLATION_MARKER: "{{.ISOLATION_MARKER}}"
     cmds:
       - task: crds
+        vars: { CLUSTER: "{{.CLUSTER}}" }
       # Clear stale agent pods and give the deployed operator a clean start so
-      # the steal session attaches to a fresh pod.
-      - kubectl delete pods -n mirrord -l app=mirrord --force --grace-period=0 2>/dev/null || true
-      - kubectl rollout restart deployment/mirrord-operator -n mirrord
-      - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
+      # the steal session attaches to a fresh pod. Force-delete instead of a
+      # rolling restart: the multicluster operators run with hostNetwork, so a
+      # surge pod can never bind the node ports while the old pod is alive —
+      # `rollout restart` wedges on "1 old replicas are pending termination".
+      - kubectl {{.KCTX}} delete pods -n mirrord -l app=mirrord --force --grace-period=0 2>/dev/null || true
+      - kubectl {{.KCTX}} delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl {{.KCTX}} delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
+      - kubectl {{.KCTX}} delete lease mirrord-operator-leader -n mirrord 2>/dev/null || true
+      - |
+        if ! kubectl {{.KCTX}} wait --for=condition=available deployment/mirrord-operator -n mirrord --timeout=180s; then
+          echo ""
+          echo "Operator did not become available. State:"
+          kubectl {{.KCTX}} get pods -n mirrord || true
+          exit 1
+        fi
       # cd in the shell rather than task-level `dir:` — dir templates resolve
       # before dynamic vars like ROOT_DIR, which mangles the path.
       #
@@ -127,10 +145,31 @@ tasks:
         cargo build -p operator-service
         codesign -f -s - ./target/debug/operator-service
         rm -rf /tmp/mirrord
+
+        # Config resolution: CONFIG=<path> wins; else a per-cluster file
+        # (.mirrord/operator-dev.<cluster>.yaml) if it exists; else the base
+        # .mirrord/operator-dev.yaml. Relative CONFIG paths are taken from the
+        # sandbox root.
+        CONFIG="{{.CONFIG}}"
+        if [ -n "$CONFIG" ] && [ ! -f "$CONFIG" ] && [ -f "{{.ROOT_DIR}}/$CONFIG" ]; then
+          CONFIG="{{.ROOT_DIR}}/$CONFIG"
+        fi
+        if [ -z "$CONFIG" ] && [ -n "{{.CLUSTER}}" ] && [ -f "{{.ROOT_DIR}}/.mirrord/operator-dev.{{.CLUSTER}}.yaml" ]; then
+          CONFIG="{{.ROOT_DIR}}/.mirrord/operator-dev.{{.CLUSTER}}.yaml"
+        fi
+        if [ -z "$CONFIG" ]; then
+          CONFIG="{{.ROOT_DIR}}/.mirrord/operator-dev.yaml"
+        fi
+        echo "mirrord config: ${CONFIG#{{.ROOT_DIR}}/}"
+
         if [ "{{.SANDBOX_LICENSE}}" = "1" ]; then
           export OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)"
         fi
-        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.ROOT_DIR}}/.mirrord/operator-dev.yaml -- \
+        if [ -n "{{.CLUSTER}}" ]; then
+          export MIRRORD_KUBE_CONTEXT="{{.CLUSTER}}"
+          echo "kube context:   {{.CLUSTER}}"
+        fi
+        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f "$CONFIG" -- \
           ./target/debug/operator-service
 
   restart:

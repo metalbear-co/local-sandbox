@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: couchbase-app
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: couchbase-app
+  template:
+    metadata:
+      labels:
+        app: couchbase-app
+    spec:
+      containers:
+        - name: couchbase-app
+          image: couchbase-app:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8080
+          env:
+            # Bare HOSTNAME (no port!) - the mirrord config declares only a host param on
+            # it, so the rewrite redirects every Couchbase port (8091 mgmt, 8093 query) the
+            # app derives from this host to the branch pod.
+            - name: COUCHBASE_HOST
+              value: "couchbase-main"
+            # Same value, NOT declared in the mirrord config, so it arrives untouched.
+            - name: COUCHBASE_SOURCE_HOST
+              value: "couchbase-main"
+            - name: COUCHBASE_USER
+              value: "Administrator"
+            - name: COUCHBASE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: couchbase-creds
+                  key: password
+          resources:
+            requests:
+              memory: "32Mi"
+              cpu: "25m"
+            limits:
+              memory: "64Mi"
+              cpu: "50m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: couchbase-app
+  namespace: generic-test
+spec:
+  selector:
+    app: couchbase-app
+  ports:
+    - port: 8080
+      targetPort: 8080

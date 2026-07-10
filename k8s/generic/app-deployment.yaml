@@ -24,6 +24,11 @@ spec:
             # (value_pattern), so the app keeps seeing the host:port shape it expects.
             - name: VALKEY_ADDR
               value: "valkey-main:6379"
+            # Same value, but NOT declared in the mirrord config, so it arrives untouched.
+            # Lets the app display "real (source) URL" next to the rewritten one and prove
+            # the redirect by comparing the two servers' run_ids.
+            - name: VALKEY_SOURCE_ADDR
+              value: "valkey-main:6379"
             # Secret-backed - resolved off this pod spec by the operator and injected into
             # the branch container as MIRRORD_PARAM_PASSWORD (as a secretKeyRef, never read).
             - name: VALKEY_PASSWORD

@@ -1,0 +1,23 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "cockroach-generic-branch",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 240,
+                "image": "cockroachdb/cockroach:v24.1.5",
+                "port": 26257,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "COCKROACH_URL", "value_pattern": "@(?P<host>[^:/]+)" },
+                        "port": { "env_var_name": "COCKROACH_URL", "value_pattern": ":(?P<port>[0-9]+)/" }
+                    }
+                },
+                "args": ["start-single-node", "--insecure"],
+                "readiness": { "type": "http_get", "path": "/health?ready=1", "port": 8080 }
+            }
+        ]
+    }
+}

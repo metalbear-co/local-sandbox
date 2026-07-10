@@ -1,0 +1,219 @@
+version: "3"
+
+# PREVIEW environments (single-cluster).
+#
+#   task preview:deploy               build + deploy the echo-app target into the cluster
+#   task preview:start                start a basic preview (no mounts)
+#   task preview:mounts:start         start a preview with a config_mount + a secret_mount
+#   task preview:mounts:verify        show where each mount landed (CR ref, ConfigMap, Secret, pod)
+#   task preview:test:mounts          end-to-end: mounts:start then mounts:verify
+#   task preview:traffic              send requests with the preview header to the target
+#   task preview:status / stop / clean
+#
+# secret_mounts store sensitive files in a Kubernetes Secret that the OPERATOR creates
+# (the CLI never creates it, and the contents never land on the PreviewSession CR). The
+# Secret is named <session>-secrets, owned by the PreviewSession, so it is garbage-collected
+# with the session. `preview:mounts:verify` proves all of that.
+#
+# Override the key/image/timeout on any task, e.g.:
+#   task preview:mounts:start PREVIEW_KEY=my-key PREVIEW_TIMEOUT=120
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/echo-app'
+
+tasks:
+  deploy:
+    desc: Build and deploy the echo-app target for preview testing
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t echo-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi echo-app:latest --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load echo-app:latest
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app
+          labels:
+            app: echo-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: echo-app
+          template:
+            metadata:
+              labels:
+                app: echo-app
+            spec:
+              containers:
+              - name: echo
+                image: echo-app:latest
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 8080
+                env:
+                - name: CLUSTER_ID
+                  value: "bearkube"
+                - name: PORT
+                  value: "8080"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: echo-app
+        spec:
+          selector:
+            app: echo-app
+          ports:
+          - port: 8080
+            targetPort: 8080
+        EOF
+      - kubectl wait --for=condition=available deploy/echo-app -n {{.NAMESPACE}} --timeout=120s
+
+  start:
+    desc: Start a basic preview environment (single-cluster, no mounts)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        # If operator:dev is running on this machine, label the session with its isolation
+        # marker so the LOCAL operator reconciles it - unlabeled sessions go to the deployed
+        # operator, which may not have your changes. An explicit marker always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-single.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  mounts:start:
+    desc: Start a preview with both a config_mount (ConfigMap) and a secret_mount (Secret)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      # `from_file` paths in the config are resolved relative to the config file's directory.
+      - |
+        # If operator:dev is running on this machine, label the session with its isolation
+        # marker so the LOCAL operator reconciles it - unlabeled sessions go to the deployed
+        # operator, which may not have your changes. An explicit marker always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-mounts.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  mounts:verify:
+    desc: Verify the config_mount landed in a ConfigMap and the secret_mount in a Secret, both mounted in the pod
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}' - run 'task preview:mounts:start' first"
+          exit 1
+        fi
+        echo "preview session: $SESSION"
+        echo
+
+        echo "==> the PreviewSession carries only the Secret name and per-file keys, not the contents:"
+        kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} \
+          -o jsonpath='  secretName: {.spec.secretMounts.secretName}{"\n"}  files:      {.spec.secretMounts.files}{"\n"}'
+        echo
+
+        echo "==> config_mounts are stored in a ConfigMap (plaintext):"
+        kubectl get configmap "${SESSION}-config-mounts" -n {{.NAMESPACE}} \
+          -o jsonpath='{.metadata.name} owned-by {.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+        kubectl get configmap "${SESSION}-config-mounts" -n {{.NAMESPACE}} \
+          -o jsonpath='  data: {.data}{"\n"}'
+        echo
+
+        echo "==> secret_mounts are stored in a Secret (base64, RBAC-controllable):"
+        kubectl get secret "${SESSION}-secrets" -n {{.NAMESPACE}} \
+          -o jsonpath='{.metadata.name} owned-by {.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+        kubectl get secret "${SESSION}-secrets" -n {{.NAMESPACE}} \
+          -o jsonpath='  data: {.data}{"\n"}'
+        echo
+
+        echo "==> both files are projected into the preview pod at their mount_at paths:"
+        echo "--- /app/logging.json (from ConfigMap) ---"
+        kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- cat /app/logging.json
+        echo
+        echo "--- /app/appsettings.ci.json (from Secret) ---"
+        kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- cat /app/appsettings.ci.json
+
+  test:mounts:
+    desc: End-to-end - start a preview with config + secret mounts and verify them (needs the target deployed)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+    cmds:
+      - task: mounts:start
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - task: mounts:verify
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        echo
+        echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  traffic:
+    desc: Send requests with the preview header to the target (Ctrl-C to stop)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-preview"}}'
+    interactive: true
+    cmds:
+      - |
+        echo "Sending traffic WITH preview header (X-Preview: {{.PREVIEW_KEY}}); Ctrl-C to stop"
+        echo ""
+        i=1
+        while true; do
+          echo -n "Request $i: "
+          kubectl exec -n {{.NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- --header="X-Preview: {{.PREVIEW_KEY}}" \
+            http://echo-app:8080/echo?from=preview 2>/dev/null | head -1 || echo "failed"
+          i=$((i + 1))
+          sleep 2
+        done
+
+  status:
+    desc: Show preview session status
+    silent: true
+    cmds:
+      - echo "=== PreviewSessions ==="
+      - kubectl get previewsessions -n {{.NAMESPACE}} 2>/dev/null || echo "No preview sessions"
+      - echo ""
+      - echo "=== Preview pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l operator.metalbear.co/managed-by=preview 2>/dev/null || echo "No preview pods"
+
+  stop:
+    desc: Stop a preview environment (also GCs its <session>-secrets Secret)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mounts"}}'
+    cmds:
+      - "{{.MIRRORD_BIN}} preview stop -k \"{{.PREVIEW_KEY}}\" || true"
+
+  clean:
+    desc: Remove the echo-app target from the cluster
+    cmds:
+      - kubectl delete deploy/echo-app svc/echo-app -n {{.NAMESPACE}} --ignore-not-found=true

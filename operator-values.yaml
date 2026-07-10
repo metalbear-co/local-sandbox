@@ -14,6 +14,17 @@ operator:
   mssqlBranching: true
   spannerBranching: true
   genericBranching: true
+  # Generic branch pods default to a 512Mi limit - too small for JVM services like
+  # OpenSearch. This admin config applies to ALL generic branch pods in this sandbox.
+  genericBranchConfig:
+    dbPod:
+      resources:
+        requests:
+          cpu: 250m
+          memory: 512Mi
+        limits:
+          cpu: "1"
+          memory: 1536Mi
   previewEnv: true
   preview:
     image_pull_policy: "IfNotPresent"

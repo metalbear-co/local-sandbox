@@ -1,0 +1,74 @@
+# The "source" Elasticsearch (8.x) the app normally talks to. Security stays enabled with
+# basic auth (TLS off for sandbox simplicity): the `elastic` user's bootstrap password comes
+# from the elasticsearch-creds Secret - the same Secret the generic branch is bootstrapped
+# with via ELASTIC_PASSWORD=$(MIRRORD_PARAM_PASSWORD).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: elasticsearch-creds
+  namespace: generic-test
+type: Opaque
+stringData:
+  password: "Elastic-Branch-2024!"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: elasticsearch-main
+  namespace: generic-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch-main
+  template:
+    metadata:
+      labels:
+        app: elasticsearch-main
+    spec:
+      containers:
+        - name: elasticsearch
+          image: docker.elastic.co/elasticsearch/elasticsearch:8.17.4
+          env:
+            # Dotted env names become elasticsearch.yml settings.
+            - name: discovery.type
+              value: "single-node"
+            - name: xpack.security.http.ssl.enabled
+              value: "false"
+            - name: ES_JAVA_OPTS
+              value: "-Xms512m -Xmx512m"
+            - name: ELASTIC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: elasticsearch-creds
+                  key: password
+          ports:
+            - containerPort: 9200
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - curl -s -u "elastic:$ELASTIC_PASSWORD" http://localhost:9200 > /dev/null
+            initialDelaySeconds: 20
+            periodSeconds: 5
+            failureThreshold: 40
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "250m"
+            limits:
+              memory: "1536Mi"
+              cpu: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch-main
+  namespace: generic-test
+spec:
+  selector:
+    app: elasticsearch-main
+  ports:
+    - port: 9200
+      targetPort: 9200

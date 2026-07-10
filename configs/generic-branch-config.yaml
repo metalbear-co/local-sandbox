@@ -1,0 +1,18 @@
+# Branch pod config for GENERIC db branches, read by the LOCAL operator:dev process
+# (see .mirrord/operator-dev.yaml: OPERATOR_GENERIC_BRANCH_CONFIG points here, and the
+# fs `local` pattern makes mirrord read this path from the local disk).
+#
+# The 512Mi default limit OOMs JVM services like OpenSearch; these limits fit all the
+# generic sandbox scenarios (valkey, influxdb, opensearch).
+#
+# Other supported knobs (same shape as the per-engine <engine>BranchConfig helm values):
+#   dbPod.labels / annotations / imagePullSecrets / imagePullPolicy / volume
+#   dbPod.allowedImages: ["valkey/*", "influxdb:*"]   # glob allowlist; absent = allow all
+dbPod:
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi

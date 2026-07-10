@@ -30,8 +30,8 @@ operator:
   multiCluster:
     enabled: true
     clusterName: "mirrord-primary"
-    defaultCluster: "mirrord-remote-1" # Default cluster for stateful ops
-    managementOnly: true # Primary only runs Envoy
+    defaultCluster: "mirrord-primary" # Default cluster for stateful ops
+    managementOnly: false # Primary only runs Envoy — target resolution proxies to defaultCluster. Setting false makes the primary resolve targets on ITSELF (sessions targeting remote workloads will 404).
     remoteSessionTimeoutSecs: 300
     tokenRefreshIntervalSecs: 2700 # 45 minutes
     sessionTtlSecs: 60

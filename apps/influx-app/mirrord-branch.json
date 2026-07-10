@@ -11,8 +11,8 @@
                 "port": 8086,
                 "connection": {
                     "params": {
-                        "host": { "env_var_name": "INFLUXDB_URL", "value_pattern": "https?://([^:/]+)" },
-                        "port": { "env_var_name": "INFLUXDB_URL", "value_pattern": ":([0-9]+)$" },
+                        "host": { "env_var_name": "INFLUXDB_URL", "value_pattern": "https?://(?P<host>[^:/]+)" },
+                        "port": { "env_var_name": "INFLUXDB_URL", "value_pattern": ":(?P<port>[0-9]+)$" },
                         "token": { "secret": "influx-creds", "key": "token" },
                         "org": "INFLUXDB_ORG",
                         "bucket": "INFLUXDB_BUCKET"

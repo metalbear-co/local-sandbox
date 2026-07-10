@@ -52,3 +52,38 @@ tasks:
         else
           echo "minikube: '{{.AGENT_IMAGE}}' missing — task mirrord:agent:load"
         fi
+
+  cli:build:
+    desc: "Fast mirrord CLI build for THIS Mac only (aarch64 layer + shim + CLI, no x86_64/universal). RELEASE=true for release mode."
+    vars:
+      MODE: '{{if eq .RELEASE "true"}}release{{else}}debug{{end}}'
+      RELEASE_FLAG: '{{if eq .RELEASE "true"}}--release{{end}}'
+    cmds:
+      - |
+        set -e
+        cd {{.MIRRORD_DIR}}
+
+        # 1. Fresh aarch64 layer + arm64e shim. `build-layer` always builds (it ignores
+        #    MIRRORD_LAYER_FILE), unlike `build-cli`, which skips the layer when that var
+        #    is set.
+        cargo xtask build-layer --platform macos-aarch64 {{.RELEASE_FLAG}}
+
+        LAYER="$PWD/target/aarch64-apple-darwin/{{.MODE}}/libmirrord_layer.dylib"
+        # Re-sign ad-hoc like scripts/build_layer_mac.sh does (cheap, avoids any
+        # invalid-signature injection surprises after incremental rebuilds).
+        codesign -f -s - "$LAYER"
+
+        # 2. Build the CLI with the fresh layer embedded. MIRRORD_LAYER_FILE must be set
+        #    EXPLICITLY here: the MetalBear/.cargo/config.toml [env] section otherwise
+        #    injects the (stale) universal dylib path into every cargo run, and build-cli
+        #    would embed that instead of what we just built. Skip the UI rebuild when the
+        #    dist assets already exist.
+        UI_FLAG=""
+        [ -d packages/ui/dist ] && UI_FLAG="--no-ui"
+        MIRRORD_LAYER_FILE="$LAYER" \
+          cargo xtask build-cli --platform macos-aarch64 {{.RELEASE_FLAG}} $UI_FLAG
+
+        echo ""
+        echo "Built: {{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"
+        echo "Use it with sandbox tasks:"
+        echo "  task generic:run:local MIRRORD_BIN={{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"
