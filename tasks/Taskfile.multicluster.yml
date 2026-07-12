@@ -114,10 +114,7 @@ tasks:
         vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}" }
       - task: cluster:create
         vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
-      - |
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          task multicluster:cluster:create CLUSTER={{.REMOTE_CLUSTER_2}}
-        fi
+      - task: cluster:create:remote-2
       - 'echo "All clusters created (NUM_CLUSTERS={{.NUM_CLUSTERS}})"'
       - 'echo " - Primary: {{.PRIMARY_CLUSTER}}"'
       - 'echo " - Remote-1: {{.REMOTE_CLUSTER_1}}"'
@@ -158,6 +155,18 @@ tasks:
         minikube ssh -p {{.CLUSTER}} -- "echo 'fs.inotify.max_user_watches=655360' | sudo tee -a /etc/sysctl.conf" || true
       - echo "Cluster {{.CLUSTER}} created and context updated"
 
+  # Only in 3-cluster mode. The `status` command exits 0 (up-to-date, skipped)
+  # for any other NUM_CLUSTERS, so it is a no-op in 2-cluster mode. Used instead
+  # of a shell `task ...` call, which would spawn a fresh Task process that
+  # resolves the wrong Taskfile and cannot find this namespaced task.
+  cluster:create:remote-2:
+    desc: Create the second remote cluster (3-cluster mode only)
+    status:
+      - test "{{.NUM_CLUSTERS}}" != "3"
+    cmds:
+      - task: cluster:create
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
   clusters:delete:
     desc: Delete all minikube cluster profiles
     cmds:
@@ -186,10 +195,7 @@ tasks:
         vars: { CLUSTER: "{{.PRIMARY_CLUSTER}}" }
       - task: cluster:fix:inotify
         vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
-      - |
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          task multicluster:cluster:fix:inotify CLUSTER={{.REMOTE_CLUSTER_2}}
-        fi
+      - task: cluster:fix:inotify:remote-2
       - echo "Inotify limits updated on all clusters"
 
   cluster:fix:inotify:
@@ -204,6 +210,15 @@ tasks:
         echo "  fs.inotify.max_user_instances=1280"
         echo "  fs.inotify.max_user_watches=655360"
 
+  # 3-cluster mode only; no-op otherwise (see cluster:create:remote-2).
+  cluster:fix:inotify:remote-2:
+    desc: Fix inotify limits on the second remote cluster (3-cluster mode only)
+    status:
+      - test "{{.NUM_CLUSTERS}}" != "3"
+    cmds:
+      - task: cluster:fix:inotify
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
+
   # =============================================================================
   # Secret-Based Cluster Discovery Setup
   # =============================================================================
@@ -217,10 +232,7 @@ tasks:
         echo ""
       - task: remote:setup:cluster
         vars: { CLUSTER: "{{.REMOTE_CLUSTER_1}}" }
-      - |
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          task multicluster:remote:setup:cluster CLUSTER={{.REMOTE_CLUSTER_2}}
-        fi
+      - task: remote:setup:cluster:remote-2
       - echo "Remote cluster access setup complete"
 
   remote:setup:cluster:
@@ -231,6 +243,15 @@ tasks:
       - |
         echo "Setting up {{.CLUSTER}}..."
         kubectl --context {{.CLUSTER}} create namespace mirrord --dry-run=client -o yaml | kubectl --context {{.CLUSTER}} apply -f -
+
+  # 3-cluster mode only; no-op otherwise (see cluster:create:remote-2).
+  remote:setup:cluster:remote-2:
+    desc: Setup the second remote cluster for primary access (3-cluster mode only)
+    status:
+      - test "{{.NUM_CLUSTERS}}" != "3"
+    cmds:
+      - task: remote:setup:cluster
+        vars: { CLUSTER: "{{.REMOTE_CLUSTER_2}}" }
 
   network:connect:
     desc: Cross-connect all cluster containers to the shared Docker network so they can reach each other
@@ -275,10 +296,7 @@ tasks:
           CLUSTER: "{{.REMOTE_CLUSTER_1}}"
           CLUSTER_NAME: "mirrord-remote-1"
           IS_DEFAULT: "true"
-      - |
-        if [ "{{.NUM_CLUSTERS}}" = "3" ]; then
-          task multicluster:secrets:create:cluster CLUSTER={{.REMOTE_CLUSTER_2}} CLUSTER_NAME=mirrord-remote-2 IS_DEFAULT=false
-        fi
+      - task: secrets:create:cluster:remote-2
       - echo ""
       - echo "Cluster credential Secrets created. Verify with:"
       - echo "  kubectl --context {{.PRIMARY_CLUSTER}} get secrets -n mirrord -l operator.metalbear.co/remote-cluster-credentials=true"
@@ -321,6 +339,18 @@ tasks:
         EOF
 
         echo "  ✓ Secret mirrord-cluster-{{.CLUSTER_NAME}} created (auth credentials only)"
+
+  # 3-cluster mode only; no-op otherwise (see cluster:create:remote-2).
+  secrets:create:cluster:remote-2:
+    desc: Create the credential Secret for the second remote cluster (3-cluster mode only)
+    status:
+      - test "{{.NUM_CLUSTERS}}" != "3"
+    cmds:
+      - task: secrets:create:cluster
+        vars:
+          CLUSTER: "{{.REMOTE_CLUSTER_2}}"
+          CLUSTER_NAME: "mirrord-remote-2"
+          IS_DEFAULT: "false"
 
   secrets:delete:
     desc: Delete all cluster credential Secrets from primary cluster

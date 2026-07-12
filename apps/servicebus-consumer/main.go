@@ -220,13 +220,50 @@ func collectQueues() map[string]string {
 	return result
 }
 
+// collectTopicSubscriptions gathers topic/subscription pairs the app listens on.
+// Three input shapes, all merged:
+//   - Indexed pairs SERVICEBUS_TOPIC_N + SERVICEBUS_SUBSCRIPTION_N (N = 1..9).
+//     Each subscription lives in its own env var so queue splitting can rewrite
+//     just that var to point the pod at its per-session subscription. This is
+//     what the multi-topic repro uses.
+//   - SERVICEBUS_TOPIC_SUBSCRIPTIONS, a CSV of `topic/subscription` pairs.
+//   - The single SERVICEBUS_TOPIC_NAME/SERVICEBUS_SUBSCRIPTION_NAME pair.
 func collectTopicSubscriptions() map[string]string {
 	result := make(map[string]string)
+
+	// Scan a fixed small range instead of stopping at the first gap so a missing
+	// index does not silently drop later topics.
+	for i := 1; i <= 9; i++ {
+		topic := os.Getenv(fmt.Sprintf("SERVICEBUS_TOPIC_%d", i))
+		sub := os.Getenv(fmt.Sprintf("SERVICEBUS_SUBSCRIPTION_%d", i))
+		if topic == "" && sub == "" {
+			continue
+		}
+		if topic == "" || sub == "" {
+			log.Printf("Ignoring incomplete indexed pair %d (topic=%q sub=%q)", i, topic, sub)
+			continue
+		}
+		result[topic+"/"+sub] = topic + "/" + sub
+	}
+
+	if csv := os.Getenv("SERVICEBUS_TOPIC_SUBSCRIPTIONS"); csv != "" {
+		for _, pair := range strings.Split(csv, ",") {
+			pair = strings.TrimSpace(pair)
+			if pair == "" {
+				continue
+			}
+			if !strings.Contains(pair, "/") {
+				log.Printf("Ignoring malformed topic/subscription pair (want topic/sub): %s", pair)
+				continue
+			}
+			result[pair] = pair
+		}
+	}
 
 	topic := os.Getenv("SERVICEBUS_TOPIC_NAME")
 	sub := os.Getenv("SERVICEBUS_SUBSCRIPTION_NAME")
 	if topic != "" && sub != "" {
-		result["SERVICEBUS_TOPIC/SUBSCRIPTION"] = topic + "/" + sub
+		result[topic+"/"+sub] = topic + "/" + sub
 	}
 
 	return result

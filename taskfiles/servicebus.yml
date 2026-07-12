@@ -243,6 +243,209 @@ tasks:
       - kubectl delete -f {{.OVERLAY}}/property-list-azure.yaml --ignore-not-found=true
       - kubectl delete -f {{.OVERLAY}}/consumer-azure.yaml --ignore-not-found=true
 
+  # ── Multi-topic mixed-case reproduction (real Azure SB, single cluster) ────
+  # Same repro as the multicluster `multicluster:servicebus:multi:*` tasks, on
+  # one cluster so you can drive it through the preview flow here:
+  #   - two topics (test-topic, test-topic-2), one mixed-case subscription
+  #     (Test-sub-2) while the config stays lowercase,
+  #   - the app subscription resolves from env `Service.ServiceName` with
+  #     fallback `dummy`; the consumer never sets that env, so every queue
+  #     resolves its app subscription to `dummy` (a sub that does not exist),
+  #   - a wildcard `split_queues: "*"` with a `cot-context-intercept-id` filter.
+  # Needs a real Azure namespace (emulator has no management API for this).
+  #
+  #   task servicebus:multi:secret CONN='Endpoint=sb://...'   (or set AZURE_SB_RG/NS)
+  #   task servicebus:multi:deploy
+  #   task servicebus:multi:preview:start NAME=prev-1
+  #   task servicebus:multi:send TOPIC=test-topic KEY=prev-1
+  #   task servicebus:multi:azure:subs
+  #   task servicebus:multi:status / logs / preview:stop / clean
+
+  multi:secret:
+    desc: "Ensure both Azure topics/subs (test-topic/test-sub + test-topic-2/Test-sub-2, mixed case) exist and store the connection secret. CONN='Endpoint=sb://...' or set AZURE_SB_RG + AZURE_SB_NAMESPACE."
+    silent: true
+    vars:
+      AZ_RG: '{{.AZURE_SB_RG | default ""}}'
+      AZ_NS: '{{.AZURE_SB_NAMESPACE | default ""}}'
+    cmds:
+      - |
+        CONN='{{.CONN}}'
+        if [ -z "$CONN" ]; then
+          if [ -z "{{.AZ_RG}}" ] || [ -z "{{.AZ_NS}}" ] || ! az account show >/dev/null 2>&1; then
+            echo "Pass CONN='Endpoint=sb://<ns>.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=...'"
+            echo "or set AZURE_SB_RG + AZURE_SB_NAMESPACE in .env and run 'az login'."
+            exit 1
+          fi
+          CONN=$(az servicebus namespace authorization-rule keys list \
+            --resource-group {{.AZ_RG}} --namespace-name {{.AZ_NS}} \
+            --name RootManageSharedAccessKey --query primaryConnectionString -o tsv)
+        fi
+        # Create both topics/subs when az is available. Test-sub-2 is mixed case
+        # on purpose - the client's Azure has mixed case, the config does not.
+        if [ -n "{{.AZ_RG}}" ] && [ -n "{{.AZ_NS}}" ] && az account show >/dev/null 2>&1; then
+          echo "Ensuring topics/subs exist (test-topic/test-sub, test-topic-2/Test-sub-2)..."
+          az servicebus topic create -g {{.AZ_RG}} --namespace-name {{.AZ_NS}} --name test-topic -o none 2>/dev/null || true
+          az servicebus topic subscription create -g {{.AZ_RG}} --namespace-name {{.AZ_NS}} --topic-name test-topic --name test-sub -o none 2>/dev/null || true
+          az servicebus topic create -g {{.AZ_RG}} --namespace-name {{.AZ_NS}} --name test-topic-2 -o none 2>/dev/null || true
+          az servicebus topic subscription create -g {{.AZ_RG}} --namespace-name {{.AZ_NS}} --topic-name test-topic-2 --name Test-sub-2 -o none 2>/dev/null || true
+        else
+          echo "NOTE: ensure test-topic/test-sub and test-topic-2/Test-sub-2 (mixed case) exist in Azure."
+        fi
+        kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+        kubectl create secret generic servicebus-azure-conn -n {{.NAMESPACE}} \
+          --from-literal=connection_string="$CONN" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        echo "Secret servicebus-azure-conn updated in {{.NAMESPACE}}"
+
+  multi:deploy:
+    desc: "Deploy the 2-topic mixed-case consumer + split config (real Azure SB, single cluster). Run servicebus:multi:secret first."
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret servicebus-azure-conn not found. Run: task servicebus:multi:secret CONN='Endpoint=sb://...'"
+    cmds:
+      # Build straight on the node: `minikube image load` silently skips a tag
+      # that already exists and is in use, which leaves the pod running stale
+      # code (the whole app crash-loops on "No queues ... configured").
+      - minikube -p {{.CLUSTER_NAME}} image build -t servicebus-consumer:local {{.APP_DIR}}
+      - kubectl apply -f {{.OVERLAY}}/property-list-azure.yaml
+      - kubectl apply -f {{.OVERLAY}}/consumer-topic-multi.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config-multi.yaml
+      - kubectl rollout restart deploy/servicebus-multi-consumer -n {{.NAMESPACE}}
+      - kubectl rollout status deploy/servicebus-multi-consumer -n {{.NAMESPACE}} --timeout=120s
+
+  multi:preview:start:
+    desc: "Start a multi-topic preview env (single cluster). NAME=prev-1 pins the cot-context-intercept-id filter to s*prev-1$ and the session key to prev-1."
+    interactive: true
+    vars:
+      NAME: '{{.NAME | default ""}}'
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "sc-multi-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "servicebus-consumer:local"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+      MULTI_PREVIEW_CONFIG: '{{.OVERLAY}}/mirrord-preview-multi.json'
+    preconditions:
+      - sh: kubectl get deploy servicebus-multi-consumer -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Multi-topic consumer missing - run 'task servicebus:multi:deploy' first"
+    cmds:
+      - |
+        CFG="{{.MULTI_PREVIEW_CONFIG}}"
+        KEY="{{.PREVIEW_KEY}}"
+        if [ -n "{{.NAME}}" ]; then
+          KEY="{{.NAME}}"
+          CFG="/tmp/mirrord-preview-multi-sc-{{.NAME}}.json"
+          python3 - <<'PY'
+        import json
+        c = json.load(open("{{.MULTI_PREVIEW_CONFIG}}"))
+        # Keep the client's property name; only pin it to this preview's key.
+        for split in c["feature"]["split_queues"].values():
+            split["message_filter"] = {"cot-context-intercept-id": "s*{{.NAME}}$"}
+        json.dump(c, open("/tmp/mirrord-preview-multi-sc-{{.NAME}}.json", "w"), indent=2)
+        PY
+          echo "preview '{{.NAME}}': filter cot-context-intercept-id=s*{{.NAME}}$ (config $CFG)"
+        fi
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} preview start \
+            -f "$CFG" \
+            -i "{{.PREVIEW_IMAGE}}" \
+            -k "$KEY" \
+            --timeout {{.PREVIEW_TIMEOUT}}
+
+  multi:preview:stop:
+    desc: "Stop a multi-topic preview env (single cluster). NAME=prev-1, or PREVIEW_KEY for the default one."
+    vars:
+      NAME: '{{.NAME | default ""}}'
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "sc-multi-preview"}}'
+    cmds:
+      - |
+        KEY="{{.NAME}}"
+        [ -z "$KEY" ] && KEY="{{.PREVIEW_KEY}}"
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+        fi
+        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} preview stop -k "$KEY" || true
+
+  multi:send:
+    desc: "Publish to one topic (TOPIC=test-topic|test-topic-2 KEY=prev-1 [MESSAGE=...]). KEY sets cot-context-intercept-id so it matches that preview; omit KEY to hit the deployed consumer."
+    silent: true
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret missing. Run: task servicebus:multi:secret"
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      KEY: '{{.KEY | default ""}}'
+      MESSAGE: '{{.MESSAGE | default "multi-topic repro message"}}'
+    cmds:
+      - |
+        CONN=$(kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} -o jsonpath='{.data.connection_string}' | base64 -d)
+        INTERCEPT="{{.KEY}}"
+        BODY='{"order_id":"ORD-001","message":"{{.MESSAGE}}"}'
+        PROPS=""
+        [ -n "$INTERCEPT" ] && PROPS="cot-context-intercept-id=$INTERCEPT"
+        kubectl run sb-multi-sender-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING=$CONN" \
+          --env="SEND_TOPIC={{.TOPIC}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=$PROPS" \
+          -- /app/consumer >/dev/null 2>&1
+        if [ -n "$INTERCEPT" ]; then
+          echo "published to {{.TOPIC}} (cot-context-intercept-id=$INTERCEPT -> preview '$INTERCEPT')"
+        else
+          echo "published to {{.TOPIC}} (no intercept id -> deployed consumer)"
+        fi
+
+  multi:azure:subs:
+    desc: "List Azure subscriptions + their rules for both repro topics (needs az + AZURE_SB_RG/AZURE_SB_NAMESPACE). This is where the $Default vs mirrord-session state shows up."
+    silent: true
+    vars:
+      AZ_RG: '{{.AZURE_SB_RG | default ""}}'
+      AZ_NS: '{{.AZURE_SB_NAMESPACE | default ""}}'
+    cmds:
+      - |
+        if [ -z "{{.AZ_RG}}" ] || [ -z "{{.AZ_NS}}" ] || ! az account show >/dev/null 2>&1; then
+          echo "Set AZURE_SB_RG + AZURE_SB_NAMESPACE in .env and run 'az login' first."; exit 1
+        fi
+        for T in test-topic test-topic-2; do
+          echo "=== topic $T ==="
+          for S in $(az servicebus topic subscription list -g {{.AZ_RG}} --namespace-name {{.AZ_NS}} --topic-name "$T" --query "[].name" -o tsv); do
+            RULES=$(az servicebus topic subscription rule list -g {{.AZ_RG}} --namespace-name {{.AZ_NS}} \
+              --topic-name "$T" --subscription-name "$S" --query "[].name" -o tsv | tr '\n' ',' | sed 's/,$//')
+            echo "  $S  [rules: $RULES]"
+          done
+          echo ""
+        done
+
+  multi:status:
+    desc: Show the multi-topic consumer, preview sessions and split state (single cluster)
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=servicebus-multi-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== preview sessions ==="
+      - kubectl get previewsessions -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+
+  multi:logs:
+    desc: Tail the deployed multi-topic consumer logs (single cluster)
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-multi-consumer --tail=100 -f
+
+  multi:clean:
+    desc: Remove the multi-topic consumer + split config (keeps the secret + Azure topics)
+    cmds:
+      - kubectl delete previewsessions --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/split-config-multi.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/consumer-topic-multi.yaml --ignore-not-found=true
+
   _deploy:emulator:
     internal: true
     # On Apple Silicon the cluster node is arm64, so by default it pulls the

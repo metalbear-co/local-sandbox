@@ -1,7 +1,7 @@
 {
   "target": {
-    "path": "deployment/servicebus-topic-consumer",
-    "namespace": "test-mirrord"
+    "path": "deployment/sqs-consumer",
+    "namespace": "test-multicluster"
   },
   "operator": true,
   "feature": {
@@ -10,10 +10,10 @@
       "creation_timeout_secs": 300
     },
     "split_queues": {
-      "*": {
-        "queue_type": "AzureServiceBus",
+      "test-queue": {
+        "queue_type": "SQS",
         "message_filter": {
-          "tenant": "^test"
+          "type": "^premium$"
         }
       }
     }

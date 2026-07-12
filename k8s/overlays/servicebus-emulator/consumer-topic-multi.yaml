@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: servicebus-multi-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: servicebus-multi-consumer
+  template:
+    metadata:
+      labels:
+        app: servicebus-multi-consumer
+    spec:
+      # Reproduction of a client Azure Service Bus setup: one consumer reads two
+      # topics, and one subscription (Test-sub-2) exists in Azure with mixed
+      # case while the split config only ever names things in lowercase.
+      containers:
+      - name: consumer
+        image: servicebus-consumer:local
+        imagePullPolicy: Never
+        env:
+        # Each topic's subscription is a separate env var so queue splitting can
+        # rewrite just that var to the per-session `mirrord-s-*` sub, and the
+        # consumer re-reads it on restart. The split config binds to these same
+        # var names.
+        - name: SERVICEBUS_TOPIC_1
+          value: "test-topic"
+        - name: SERVICEBUS_SUBSCRIPTION_1
+          value: "test-sub"
+        - name: SERVICEBUS_TOPIC_2
+          value: "test-topic-2"
+        # Lowercase on purpose while the real Azure sub is `Test-sub-2`: this is
+        # the client's config-vs-Azure case drift. Azure entity lookups are
+        # case-insensitive, so the app and the operator both resolve it to the
+        # mixed-case sub.
+        - name: SERVICEBUS_SUBSCRIPTION_2
+          value: "test-sub-2"
+        - name: APP_NAME
+          value: "servicebus-multi-consumer"
+        - name: SERVICEBUS_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: servicebus-azure-conn
+              key: connection_string

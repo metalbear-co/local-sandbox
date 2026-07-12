@@ -1,0 +1,27 @@
+{
+  "target": {
+    "path": {
+      "container": "consumer",
+      "deployment": "servicebus-multi-consumer"
+    },
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "*": {
+        "queue_type": "AzureServiceBus",
+        "message_filter": {
+          "cot-context-intercept-id": "s*{{ key }}$"
+        }
+      }
+    },
+    "preview": {
+      "ttl_mins": 120,
+      "creation_timeout_secs": 300
+    }
+  },
+  "experimental": {
+    "non_blocking_tcp_connect": true
+  }
+}
