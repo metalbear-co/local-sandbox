@@ -1,0 +1,19 @@
+# Tells the operator how to split test-queue for the combo-app workload:
+# the queue id "test-queue" resolves to the app's QUEUE_NAME env var. The preview's
+# split_queues (in the mirrord config) references the same "test-queue" id + its filter.
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: combo-split-config
+  namespace: test-multicluster
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: combo-app
+  queues:
+    - id: test-queue
+      kind: sqs
+      appConfig:
+        queue:
+          - env: QUEUE_NAME

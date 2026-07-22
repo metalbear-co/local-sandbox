@@ -125,6 +125,141 @@ tasks:
         if [ -z "$POD" ]; then echo "No running branch pod found."; exit 1; fi
         kubectl exec -it -n {{.REDIS_NAMESPACE}} "$POD" -- redis-cli
 
+  # ---------------------------------------------------------------------------
+  # TLS branch pods (custom TLS-enabled image + dbServerArgs/tls branch config).
+  #
+  # One-time setup:
+  #   task redis:tls:build:redis-image   custom redis image with a baked-in cert
+  #   task redis:tls:build:init-image    init-binaries image with --target-tls
+  #                                      support (SLOW first run: release-builds
+  #                                      the operator branching crate in docker)
+  #   + the OPERATOR_REDIS_* / OPERATOR_IMAGE env in .mirrord/operator-dev.yaml
+  #     (already set), then (re)start `task operator:dev`.
+  #
+  # The with/without demo:
+  #   task redis:tls:disable + task redis:tls:run:local  -> plaintext branch (today's behavior)
+  #   task redis:tls:enable  + task redis:tls:run:local  -> TLS-only branch, app connects over TLS
+  #   task redis:tls:verify                              -> plain PING fails, TLS PING works
+  # ---------------------------------------------------------------------------
+
+  tls:build:redis-image:
+    desc: Build the TLS-enabled custom Redis image (self-signed cert baked in) and load it into minikube
+    cmds:
+      - |
+        STAGE={{.ROOT_DIR}}/.build/redis-tls-image
+        mkdir -p "$STAGE"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 30 \
+          -keyout "$STAGE/server.key" -out "$STAGE/server.crt" -subj "/CN=redis-branch-tls" 2>/dev/null
+        printf 'FROM redis:7-alpine\nCOPY server.crt server.key /certs/\nRUN chmod 644 /certs/server.key /certs/server.crt\n' > "$STAGE/Dockerfile"
+        {{.CONTAINER_RUNTIME}} build -t redis-tls-local:7-alpine "$STAGE"
+      - minikube -p {{.CLUSTER_NAME}} image load redis-tls-local:7-alpine
+      - echo "redis-tls-local:7-alpine loaded into minikube"
+
+  tls:build:init-image:
+    desc: "Build the branch init-binaries image from local operator source and load it into minikube (SLOW first run: ~20-40 min release build)"
+    cmds:
+      - |
+        {{.CONTAINER_RUNTIME}} volume create mirrord-branch-cargo >/dev/null
+        {{.CONTAINER_RUNTIME}} run --rm \
+          -v {{.ROOT_DIR}}/..:/w \
+          -v mirrord-branch-cargo:/usr/local/cargo/registry \
+          -w /w/operator rust:1-bookworm \
+          bash -c "apt-get update -qq && apt-get install -y -qq cmake perl >/dev/null && \
+                   cargo build -p operator-db-branching --bins --release --target-dir /w/local-sandbox/.build/operator-target"
+      - |
+        STAGE={{.ROOT_DIR}}/.build/branch-init-image
+        mkdir -p "$STAGE"
+        cp {{.ROOT_DIR}}/.build/operator-target/release/*-branch-init "$STAGE/"
+        printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*\nCOPY ./*-branch-init /usr/local/bin/\n' > "$STAGE/Dockerfile"
+        {{.CONTAINER_RUNTIME}} build -t mirrord-branch-init:local "$STAGE"
+      - minikube -p {{.CLUSTER_NAME}} image load mirrord-branch-init:local
+      - echo "mirrord-branch-init:local loaded into minikube (branch sidecars now have --target-tls support)"
+
+  tls:enable:
+    desc: Point new Redis branches at the TLS image (operator hot-reloads the config within ~60s)
+    cmds:
+      - cp {{.ROOT_DIR}}/configs/redis-branch-config.tls.yaml {{.ROOT_DIR}}/configs/redis-branch-config.yaml
+      - echo "TLS branch config active. Branches created from now on are TLS-only (allow ~60s for the operator to re-read the file)."
+
+  tls:disable:
+    desc: Point new Redis branches back at the stock plaintext image
+    cmds:
+      - cp {{.ROOT_DIR}}/configs/redis-branch-config.plain.yaml {{.ROOT_DIR}}/configs/redis-branch-config.yaml
+      - echo "Plaintext branch config active (allow ~60s for the operator to re-read the file)."
+
+  tls:run:local:
+    desc: Run the app locally with a CLUSTER branch Redis, connecting over TLS (pair with tls:enable)
+    interactive: true
+    dir: apps/redis-app
+    cmds:
+      - go build -o /tmp/redis-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8080 REDIS_TLS=1 {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-app \
+          -n {{.REDIS_NAMESPACE}} \
+          -f {{.ROOT_DIR}}/apps/redis-app/mirrord-cluster.json \
+          -- /tmp/redis-app
+
+  run:local:cluster:
+    desc: Run the app locally with a CLUSTER branch Redis over plaintext (the "without" side of the TLS demo)
+    interactive: true
+    dir: apps/redis-app
+    cmds:
+      - go build -o /tmp/redis-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8080 {{.MIRRORD_BIN}} exec \
+          -t deploy/redis-app \
+          -n {{.REDIS_NAMESPACE}} \
+          -f {{.ROOT_DIR}}/apps/redis-app/mirrord-cluster.json \
+          -- /tmp/redis-app
+
+  tls:verify:
+    desc: Prove the newest branch pod is TLS-only (plain PING fails, TLS PING works)
+    silent: true
+    vars:
+      BRANCH_PASS: "mirrord-redis-branch-pod-pass"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod. Start one with 'task redis:tls:run:local'."; exit 1; fi
+        echo "=== branch pod: $POD ==="
+        if kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- \
+             redis-cli --no-auth-warning -a {{.BRANCH_PASS}} PING 2>/dev/null | grep -q PONG; then
+          echo "FAIL: plaintext PING succeeded - the branch is NOT TLS-only"; exit 1
+        else
+          echo "OK: plaintext PING is rejected"
+        fi
+        if kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- \
+             redis-cli --no-auth-warning --tls --insecure -a {{.BRANCH_PASS}} PING 2>/dev/null | grep -q PONG; then
+          echo "OK: TLS PING answers PONG"
+        else
+          echo "FAIL: TLS PING did not answer"; exit 1
+        fi
+
+  tls:query:branch:
+    desc: 'Run a redis-cli command against a TLS branch Redis (QUERY="KEYS *")'
+    silent: true
+    vars:
+      QUERY: '{{.QUERY | default "KEYS *"}}'
+      BRANCH_PASS: "mirrord-redis-branch-pod-pass"
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.REDIS_NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then echo "No running branch pod."; exit 1; fi
+        echo "=== branch pod: $POD (TLS) ==="
+        kubectl exec -n {{.REDIS_NAMESPACE}} "$POD" -- \
+          redis-cli --no-auth-warning --tls --insecure -a {{.BRANCH_PASS}} {{.QUERY}}
+
   branches:
     desc: List BranchDatabase CRDs and branch pods
     cmds:

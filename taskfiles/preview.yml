@@ -7,6 +7,21 @@ version: "3"
 #   task preview:mounts:start         start a preview with a config_mount + a secret_mount
 #   task preview:mounts:verify        show where each mount landed (CR ref, ConfigMap, Secret, pod)
 #   task preview:test:mounts          end-to-end: mounts:start then mounts:verify
+#   task preview:pattern:deploy       deploy a target that reads one combined DATABASE_URL (Teladoc shape)
+#   task preview:pattern:start        start a preview with a value_pattern DB branch on that target
+#   task preview:pattern:verify       show the whole chain: runtime value -> env-overrides Secret -> secretKeyRef -> preview pod env
+#   task preview:test:pattern         end-to-end: pattern:start then pattern:verify
+#   task preview:pattern:mixed:deploy deploy a target with TWO pattern vars (URL + libpq keywords) + plain user/password vars
+#   task preview:pattern:mixed:start  start a preview mixing pattern params (2 vars, 2 formats) with plain-variable params
+#   task preview:pattern:mixed:verify trace both pattern vars (Secret) and the plain-var overrides (literal env) side by side
+#   task preview:test:pattern:mixed   end-to-end: mixed:start then mixed:verify
+#   task preview:idle:start           start a preview that auto-idles after 30s without traffic
+#   task preview:idle:start-idle      start a preview with ZERO pods from creation (start_idle)
+#   task preview:idle:watch           live phase + replicas view of an idle-capable preview
+#   task preview:idle:wake            send one preview-header request, timing the wake (send:match)
+#   task preview:idle:send:nomatch    send a request WITHOUT the header - must NOT wake the preview
+#   task preview:test:idle            end-to-end: start -> auto-idle -> wake -> ready
+#   task preview:test:start-idle      end-to-end: start with zero pods -> wake -> ready
 #   task preview:traffic              send requests with the preview header to the target
 #   task preview:status / stop / clean
 #
@@ -177,6 +192,523 @@ tasks:
         echo
         echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
 
+  pattern:deploy:
+    desc: Deploy a target that reads one combined DATABASE_URL (pattern overrides are its only branch option)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t echo-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi echo-app:latest --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load echo-app:latest
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # the postgres base provides the postgres-test source DATABASE_URL points at
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/postgres
+      # DATABASE_URL is one combined URL (the Teladoc shape): the app has no separate
+      # host/port/database vars, so pattern-based overrides are the only way a preview
+      # can point it at the branch. NOTE it must be a literal env value (not envFrom):
+      # the BRANCH controller extracts the SOURCE coordinates from the spec value at
+      # operator time, and its init container has no pattern support for envFrom values.
+      # The PREVIEW side has no such limitation - it reads the runtime value through the
+      # agent either way.
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app-pattern
+          labels:
+            app: echo-app-pattern
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: echo-app-pattern
+          template:
+            metadata:
+              labels:
+                app: echo-app-pattern
+            spec:
+              containers:
+              - name: echo
+                image: echo-app:latest
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 8080
+                env:
+                - name: CLUSTER_ID
+                  value: "bearkube"
+                - name: PORT
+                  value: "8080"
+                - name: DB_USER
+                  value: "postgres"
+                - name: DB_PASSWORD
+                  value: "postgres"
+                - name: DATABASE_URL
+                  value: "jdbc:postgresql://postgres-test:5432/source_db?application_name=preview-pattern-demo"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: echo-app-pattern
+        spec:
+          selector:
+            app: echo-app-pattern
+          ports:
+          - port: 8080
+            targetPort: 8080
+        EOF
+      - kubectl wait --for=condition=available deploy/echo-app-pattern -n {{.NAMESPACE}} --timeout=120s
+      - |
+        echo
+        echo "Target is up. The app reads ONE combined URL:"
+        echo -n "  "
+        kubectl exec -n {{.NAMESPACE}} deploy/echo-app-pattern -- sh -c 'echo $DATABASE_URL'
+        echo "A preview can only point it at the branch by rewriting spans inside that value."
+
+  pattern:start:
+    desc: Start a preview whose pg branch uses value_pattern on DATABASE_URL (host/port/database spans)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-pattern"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        # If operator:dev is running on this machine, label the session with its isolation
+        # marker so the LOCAL operator reconciles it - unlabeled sessions go to the deployed
+        # operator, which may not have your changes. An explicit marker always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-pattern.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  pattern:verify:
+    desc: Trace the value_pattern override end to end - runtime value, Secret, secretKeyRef, preview pod env
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-pattern"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}' - run 'task preview:pattern:start' first"
+          exit 1
+        fi
+        echo "preview session: $SESSION ($(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}'))"
+        echo
+
+        echo "==> 1. the TARGET's runtime value (what the operator reads through the agent):"
+        echo -n "  "
+        kubectl exec -n {{.NAMESPACE}} deploy/echo-app-pattern -- sh -c 'echo $DATABASE_URL'
+        echo
+
+        echo "==> 2. the substituted value lives in the session's env-overrides Secret (never plain pod-spec env):"
+        kubectl get secret "${SESSION}-env-overrides" -n {{.NAMESPACE}} \
+          -o jsonpath='  {.metadata.name} owned-by {.metadata.ownerReferences[0].kind}/{.metadata.ownerReferences[0].name}{"\n"}'
+        echo -n "  DATABASE_URL: "
+        kubectl get secret "${SESSION}-env-overrides" -n {{.NAMESPACE}} \
+          -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+        echo
+        echo
+
+        echo "==> 3. the preview Deployment references it via secretKeyRef (no value in the spec):"
+        kubectl get deploy "$SESSION" -n {{.NAMESPACE}} \
+          -o jsonpath='  {.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")]}{"\n"}'
+        echo
+
+        echo "==> 4. the PREVIEW pod's runtime value (kubelet injected it from the Secret at container start):"
+        echo -n "  "
+        kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- sh -c 'echo $DATABASE_URL'
+        echo
+
+        echo "Compare 1 vs 4: only the host, port, and database spans changed to the branch's;"
+        echo "the jdbc: prefix and ?application_name=... suffix survive byte-for-byte."
+        echo "Branch status: kubectl get branchdatabases -n {{.NAMESPACE}}"
+
+  test:pattern:
+    desc: End-to-end - start a value_pattern preview and trace the override (needs pattern:deploy first)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-pattern"}}'
+    cmds:
+      - task: pattern:start
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - task: pattern:verify
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        echo
+        echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+        echo "(stopping deletes the PreviewSession; its env-overrides Secret is owner-GC'd with it)"
+
+  pattern:clean:
+    desc: Remove the pattern-demo target (deployment, service)
+    cmds:
+      - kubectl delete deploy/echo-app-pattern svc/echo-app-pattern -n {{.NAMESPACE}} --ignore-not-found=true
+
+  pattern:mixed:deploy:
+    desc: Deploy a target with two pattern-shaped vars (combined URL + libpq keyword string) and plain user/password vars
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t echo-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi echo-app:latest --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load echo-app:latest
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/postgres
+      # Two different value shapes carry connection params:
+      #   DATABASE_URL  - one combined URL; host AND port are separate captured spans, so the
+      #                   preview chains two substitutions on the same variable.
+      #   DB_CONN_INFO  - libpq keyword format; only its dbname= span is captured.
+      # DB_USER / DB_PASSWORD are plain variables - those become LITERAL overrides (branch
+      # credentials as plain env), while the two pattern vars go through the session Secret.
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app-pattern-mixed
+          labels:
+            app: echo-app-pattern-mixed
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: echo-app-pattern-mixed
+          template:
+            metadata:
+              labels:
+                app: echo-app-pattern-mixed
+            spec:
+              containers:
+              - name: echo
+                image: echo-app:latest
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 8080
+                env:
+                - name: CLUSTER_ID
+                  value: "bearkube"
+                - name: PORT
+                  value: "8080"
+                - name: DB_USER
+                  value: "postgres"
+                - name: DB_PASSWORD
+                  value: "postgres"
+                - name: DATABASE_URL
+                  value: "jdbc:postgresql://postgres-test:5432/source_db?application_name=preview-mixed-demo"
+                - name: DB_CONN_INFO
+                  value: "host=postgres-test port=5432 dbname=source_db sslmode=disable"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: echo-app-pattern-mixed
+        spec:
+          selector:
+            app: echo-app-pattern-mixed
+          ports:
+          - port: 8080
+            targetPort: 8080
+        EOF
+      - kubectl wait --for=condition=available deploy/echo-app-pattern-mixed -n {{.NAMESPACE}} --timeout=120s
+
+  pattern:mixed:start:
+    desc: Start a preview mixing pattern params (two vars, two formats) with plain-variable params
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mixed"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        # If operator:dev is running on this machine, label the session with its isolation
+        # marker so the LOCAL operator reconciles it - unlabeled sessions go to the deployed
+        # operator, which may not have your changes. An explicit marker always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-pattern-mixed.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  pattern:mixed:verify:
+    desc: Trace both pattern vars (via the Secret) and the plain-variable overrides (literal env) side by side
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mixed"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}' - run 'task preview:pattern:mixed:start' first"
+          exit 1
+        fi
+        echo "preview session: $SESSION ($(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}'))"
+        echo
+
+        echo "==> TARGET runtime values (read through the agent):"
+        kubectl exec -n {{.NAMESPACE}} deploy/echo-app-pattern-mixed -- \
+          sh -c 'echo "  DATABASE_URL: $DATABASE_URL"; echo "  DB_CONN_INFO: $DB_CONN_INFO"; echo "  DB_USER:      $DB_USER"'
+        echo
+
+        echo "==> PATTERN vars land in the env-overrides Secret (host+port spans chained on DATABASE_URL, dbname span on DB_CONN_INFO):"
+        echo -n "  DATABASE_URL: "
+        kubectl get secret "${SESSION}-env-overrides" -n {{.NAMESPACE}} -o jsonpath='{.data.DATABASE_URL}' | base64 -d
+        echo
+        echo -n "  DB_CONN_INFO: "
+        kubectl get secret "${SESSION}-env-overrides" -n {{.NAMESPACE}} -o jsonpath='{.data.DB_CONN_INFO}' | base64 -d
+        echo
+        echo
+
+        echo "==> PLAIN-variable params become literal env overrides on the preview Deployment (branch credentials):"
+        kubectl get deploy "$SESSION" -n {{.NAMESPACE}} \
+          -o jsonpath='  DB_USER:      {.spec.template.spec.containers[0].env[?(@.name=="DB_USER")].value}{"\n"}  DB_PASSWORD:  {.spec.template.spec.containers[0].env[?(@.name=="DB_PASSWORD")].value}{"\n"}'
+        echo
+
+        echo "==> and the pattern vars reference the Secret (no values in the spec):"
+        kubectl get deploy "$SESSION" -n {{.NAMESPACE}} \
+          -o jsonpath='  DATABASE_URL secretKeyRef: {.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].valueFrom.secretKeyRef.key}@{.spec.template.spec.containers[0].env[?(@.name=="DATABASE_URL")].valueFrom.secretKeyRef.name}{"\n"}  DB_CONN_INFO secretKeyRef: {.spec.template.spec.containers[0].env[?(@.name=="DB_CONN_INFO")].valueFrom.secretKeyRef.key}@{.spec.template.spec.containers[0].env[?(@.name=="DB_CONN_INFO")].valueFrom.secretKeyRef.name}{"\n"}'
+        echo
+
+        echo "==> PREVIEW pod runtime values (all four should point at the branch):"
+        kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- \
+          sh -c 'echo "  DATABASE_URL: $DATABASE_URL"; echo "  DB_CONN_INFO: $DB_CONN_INFO"; echo "  DB_USER:      $DB_USER"'
+        echo
+        echo "Expected: same host+port in both vars = the branch pod; dbname/database span = preview_mixed_db;"
+        echo "jdbc: prefix, ?application_name=... and sslmode=disable suffixes preserved byte-for-byte."
+
+  test:pattern:mixed:
+    desc: End-to-end - start the mixed pattern preview and trace all overrides (needs pattern:mixed:deploy first)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-mixed"}}'
+    cmds:
+      - task: pattern:mixed:start
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - task: pattern:mixed:verify
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        echo
+        echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  pattern:mixed:clean:
+    desc: Remove the mixed pattern-demo target (deployment, service)
+    cmds:
+      - kubectl delete deploy/echo-app-pattern-mixed svc/echo-app-pattern-mixed -n {{.NAMESPACE}} --ignore-not-found=true
+
+  idle:start:
+    desc: Start a preview that scales to zero after 30s without traffic (wake it with preview:idle:wake)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-idle"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        # If operator:dev is running on this machine, label the session with its isolation
+        # marker so the LOCAL operator reconciles it - unlabeled sessions go to the deployed
+        # operator, which may not have your changes. An explicit marker always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-idle.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+        echo
+        echo "Leave it alone for ~30s and it scales to zero (watch with: task preview:idle:watch)."
+        echo "Wake it with: task preview:idle:wake PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  idle:start-idle:
+    desc: Start a preview with ZERO pods from creation - the first request boots them
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-idle"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      # start_idle is flipped on via its env var on top of the same idle config file, so the
+      # CLI returns as soon as the session reaches the Idle phase - no pods ever boot.
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        MIRRORD_PREVIEW_START_IDLE=true {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-idle.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+        echo
+        echo "No pods were booted. Wake it with: task preview:idle:wake PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  idle:watch:
+    desc: Live view of an idle-capable preview - phase, idleSince, and Deployment replicas (Ctrl-C to stop)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-idle"}}'
+    interactive: true
+    cmds:
+      - |
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}'"
+          exit 1
+        fi
+        echo "watching preview session '$SESSION' (Ctrl-C to stop)"
+        while true; do
+          PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}' 2>/dev/null || echo "gone")
+          IDLE_SINCE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.idleSince}' 2>/dev/null)
+          REPLICAS=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "-")
+          READY=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+          printf '%s  phase=%-13s replicas=%s ready=%s idleSince=%s\n' \
+            "$(date +%H:%M:%S)" "$PHASE" "$REPLICAS" "${READY:-0}" "${IDLE_SINCE:--}"
+          sleep 2
+        done
+
+  idle:wake:
+    desc: Send ONE preview-header request through the target, timing how long the wake takes
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-idle"}}'
+    cmds:
+      # The request goes through the ORIGINAL echo-app (which never scales down); the operator
+      # steals it, boots the preview pods, and holds the request until one can answer - so the
+      # elapsed time below is the real cold-start a user would feel.
+      - |
+        echo "Sending 'X-Preview: {{.PREVIEW_KEY}}' request (held until the preview pod boots)..."
+        START=$(date +%s)
+        RESPONSE=$(kubectl exec -n {{.NAMESPACE}} deploy/echo-app -- \
+          wget -q -O- -T 120 --header="X-Preview: {{.PREVIEW_KEY}}" \
+          http://echo-app:8080/echo?from=wake 2>/dev/null | head -1) || RESPONSE="FAILED (wake timeout hit? check idle:watch)"
+        echo "Response after $(( $(date +%s) - START ))s: $RESPONSE"
+
+  idle:send:nomatch:
+    desc: Send a request WITHOUT the preview header - the original app answers and the preview must stay Idle
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-idle"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}'"
+          exit 1
+        fi
+        BEFORE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+
+        echo "Sending request WITHOUT the preview header..."
+        RESPONSE=$(kubectl exec -n {{.NAMESPACE}} deploy/echo-app -- \
+          wget -q -O- -T 30 http://echo-app:8080/echo?from=nomatch 2>/dev/null | head -1)
+        echo "Response (from the ORIGINAL app): $RESPONSE"
+
+        sleep 3
+        AFTER=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+        REPLICAS=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}')
+        echo "preview phase before=$BEFORE after=$AFTER, replicas=$REPLICAS"
+        if [ "$BEFORE" = "Idle" ] && [ "$AFTER" != "Idle" ]; then
+          echo "BUG: non-matching traffic woke the preview!"
+          exit 1
+        fi
+
+  test:start-idle:
+    desc: End-to-end - start a preview with ZERO pods, verify nothing boots, wake it, verify Ready (needs the target deployed)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-start-idle"}}'
+    cmds:
+      - task: idle:start-idle
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        echo "preview session: $SESSION"
+
+        PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+        REPLICAS=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}')
+        PODS=$(kubectl get pods -n {{.NAMESPACE}} -l "preview.metalbear.co/session-uid" \
+          --field-selector=status.phase!=Succeeded -o name 2>/dev/null | wc -l | tr -d ' ')
+        echo "phase=$PHASE, deployment replicas=$REPLICAS, preview pods=$PODS"
+        [ "$PHASE" = "Idle" ] || { echo "expected phase Idle right after creation"; exit 1; }
+        [ "$REPLICAS" = "0" ] || { echo "expected 0 replicas - start-idle must not boot pods"; exit 1; }
+      - task: idle:wake
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+
+        echo
+        echo "==> waiting for the session to become Ready..."
+        for _ in $(seq 1 30); do
+          PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+          [ "$PHASE" = "Ready" ] && break
+          sleep 3
+        done
+        [ "$PHASE" = "Ready" ] || { echo "session never woke up (phase: $PHASE)"; exit 1; }
+
+        REPLICAS=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}')
+        echo "phase=Ready, deployment replicas=$REPLICAS"
+        echo
+        echo "Done. This session has no auto-idle timeout, so it stays up now."
+        echo "Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  test:idle:
+    desc: End-to-end - start an auto-idle preview, watch it idle, wake it, verify Ready (needs the target deployed)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-idle"}}'
+    cmds:
+      - task: idle:start
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        echo "preview session: $SESSION"
+
+        echo
+        echo "==> waiting for the session to go Idle (30s idle timeout + margin)..."
+        for _ in $(seq 1 40); do
+          PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+          [ "$PHASE" = "Idle" ] && break
+          sleep 3
+        done
+        [ "$PHASE" = "Idle" ] || { echo "session never went Idle (phase: $PHASE)"; exit 1; }
+
+        REPLICAS=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}')
+        echo "phase=Idle, deployment replicas=$REPLICAS"
+        [ "$REPLICAS" = "0" ] || { echo "expected 0 replicas while idle"; exit 1; }
+      - task: idle:wake
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+
+        echo
+        echo "==> waiting for the session to be Ready again..."
+        for _ in $(seq 1 30); do
+          PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+          [ "$PHASE" = "Ready" ] && break
+          sleep 3
+        done
+        [ "$PHASE" = "Ready" ] || { echo "session never woke up (phase: $PHASE)"; exit 1; }
+
+        REPLICAS=$(kubectl get deploy "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}')
+        echo "phase=Ready, deployment replicas=$REPLICAS"
+        echo
+        echo "Done. It will idle again after 30s without traffic."
+        echo "Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
   traffic:
     desc: Send requests with the preview header to the target (Ctrl-C to stop)
     vars:
@@ -217,3 +749,39 @@ tasks:
     desc: Remove the echo-app target from the cluster
     cmds:
       - kubectl delete deploy/echo-app svc/echo-app -n {{.NAMESPACE}} --ignore-not-found=true
+
+  test:all:
+    desc: "One-shot verification of preview idle mode: unit tests, prerequisites (echo-app + LocalStack), both sandbox flows, and the cargo e2e suite. Needs operator:dev running the CURRENT branch build."
+    vars:
+      OPERATOR_DIR: '{{.OPERATOR_DIR | default (print .ROOT_DIR "/../operator")}}'
+    preconditions:
+      - sh: pgrep -qf 'target/debug/operator-service'
+        msg: "operator:dev is not running - start it first ('task operator:dev') so YOUR branch build reconciles the test sessions. If you rebuilt since starting it, restart it."
+      - sh: kubectl get ns >/dev/null 2>&1
+        msg: "cluster unreachable - run 'task check' / 'task cluster:create'"
+    cmds:
+      - echo "==> [1/6] operator unit tests (idle gate, hold buffer, share-ingress store)"
+      - |
+        cd {{.OPERATOR_DIR}}
+        cargo test -p operator-preview-env --lib -p operator-share-ingress --quiet
+      - echo "==> [2/6] deploying the echo-app target"
+      - task: deploy
+      - echo "==> [3/6] deploying LocalStack + SQS consumer (needed by the SQS idle e2e)"
+      - task -d {{.ROOT_DIR}} sqs:deploy
+      - echo "==> [4/6] sandbox flow - auto-idle then wake"
+      - task: test:idle
+      - echo "==> [5/6] sandbox flow - start-idle then wake"
+      - task: test:start-idle
+      - echo "==> [6/6] cargo e2e - HTTP auto-idle, start-idle+wake, SQS wake/no-wake (the operator-restart HA test is excluded; it restarts the IN-CLUSTER operator and belongs to CI)"
+      - |
+        cd {{.OPERATOR_DIR}}
+        OPERATOR_ISOLATION_MARKER=local-dev cargo test --package tests --lib -- \
+          operator::preview_idle --include-ignored --test-threads=1
+      - |
+        echo
+        echo "All preview idle checks passed:"
+        echo "  - unit tests (gate, hold buffer, share-ingress routing)"
+        echo "  - sandbox: auto-idle -> wake, start-idle -> wake"
+        echo "  - e2e: preview_idles_after_inactivity, preview_starts_idle_and_wakes_on_first_request,"
+        echo "         preview_idle_sqs_wakes_on_matching_message_only"
+        echo "Cleanup leftovers with: task preview:stop PREVIEW_KEY=test-idle && task preview:clean"

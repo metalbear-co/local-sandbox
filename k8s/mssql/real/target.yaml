@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mssql-real-target
+  labels:
+    test-scenario: real
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'MSSQL real-data scenario target' && sleep infinity"]
+      env:
+        - name: DATABASE_URL
+          value: "mssql://sa:TestP%40ssw0rd!@mssql-real:1433/AdventureWorks"

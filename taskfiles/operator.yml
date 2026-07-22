@@ -259,3 +259,31 @@ tasks:
           exit 1
         fi
         echo "Operator is deployed and ready."
+
+  image:push:
+    desc: "Build the operator image from local source and push it (IMAGE=vrrashkov/operator TAG=local PLATFORM=linux/arm64; use linux/amd64 for cloud clusters). Point branch pods at it via OPERATOR_IMAGE in .mirrord/operator-dev.yaml."
+    vars:
+      IMAGE: '{{.IMAGE | default "vrrashkov/operator"}}'
+      TAG: '{{.TAG | default "local"}}'
+      PLATFORM: '{{.PLATFORM | default "linux/arm64"}}'
+    preconditions:
+      - sh: grep -A 2 '^name = "mirrord-operator"$' {{.OPERATOR_DIR}}/Cargo.lock | grep -q 'source = "git+'
+        msg: |
+          Cargo.lock resolves the mirrord crates from local paths (the dev [patch] in
+          MetalBear/.cargo/config.toml), which the Docker build context cannot see.
+          To build an image:
+            1. push your mirrord branch and set its rev in operator/Cargo.toml
+            2. comment out the [patch...] block in MetalBear/.cargo/config.toml
+            3. cd operator && cargo update
+          (re-enable the patch afterwards for local dev)
+    cmds:
+      - cd {{.OPERATOR_DIR}}/.. && {{.CONTAINER_RUNTIME}} build --platform {{.PLATFORM}} --provenance=false -f operator/public/operator/Dockerfile -t {{.IMAGE}}:{{.TAG}} --build-arg OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)" operator
+      - '{{.CONTAINER_RUNTIME}} push {{.IMAGE}}:{{.TAG}}'
+      - |
+        echo ""
+        echo "Pushed {{.IMAGE}}:{{.TAG}} ({{.PLATFORM}})."
+        echo ""
+        echo "Point branch pods at it: in .mirrord/operator-dev.yaml under feature.env.override set"
+        echo "  OPERATOR_IMAGE: \"{{.IMAGE}}:{{.TAG}}\""
+        echo "  OPERATOR_IMAGE_PULL_POLICY: \"Always\""
+        echo "then restart 'task operator:dev'."

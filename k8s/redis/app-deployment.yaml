@@ -22,6 +22,10 @@ spec:
           env:
             - name: REDIS_ADDR
               value: "redis-main:6379"
+            # URL form of the same connection, used by the remote (cluster) branch flow:
+            # the operator reads the source from it and patches it to the branch URL.
+            - name: REDIS_URL
+              value: "redis://redis-main:6379"
           resources:
             requests:
               memory: "32Mi"

@@ -1,0 +1,11 @@
+{
+  "target": { "path": "deployment/echo-app", "namespace": "test-mirrord" },
+  "operator": true,
+  "feature": {
+    "copy_target": { "enabled": true, "scale_down": true },
+    "network": { "incoming": { "mode": "steal" }, "outgoing": false, "dns": false },
+    "env": false,
+    "fs": "local",
+    "hostname": false
+  }
+}

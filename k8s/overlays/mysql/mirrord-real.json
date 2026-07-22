@@ -1,0 +1,51 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "mysql-real-target"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "mysql-real-subset",
+        "name": "sakila",
+        "type": "mysql",
+        "version": "8.0",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 300,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "MYSQL_CONNECTION_URL"
+          }
+        },
+        "copy": {
+          "mode": "subset",
+          "tables": {
+            "customer": {
+              "conditions": [
+                {
+                  "column": "customer_id",
+                  "op": "eq",
+                  "value": 1
+                }
+              ]
+            }
+          },
+          "limits": {
+            "max_total_rows": 100000,
+            "max_rows_per_table": 50000
+          }
+        }
+      }
+    ]
+  }
+}

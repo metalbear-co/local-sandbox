@@ -10,6 +10,20 @@ version: "3"
 # The split filter lives in k8s/overlays/temporal/mirrord.json
 # (workflow_id matching ^test-alice-). Workflows are started via tctl inside
 # the temporal server pod; MESSAGE becomes the CheckoutWorkflow input.
+#
+# mTLS (operator -> Temporal with client certificates):
+#
+#   task temporal:mtls:deploy    put a client-cert-requiring nginx front in
+#                                front of the Temporal frontend and point the
+#                                operator's connection config at it
+#   task temporal:mtls:verify    handshake checks: rejected without a client
+#                                cert, verified with one
+#   task temporal:mtls:disable   point the operator back at the plain frontend
+#
+# After mtls:deploy, run the normal flow (run:local + send:match/nomatch);
+# every operator poll and forward then goes through the mTLS front. Splits
+# resolve the connection config when they start, so restart run:local after
+# switching modes.
 
 vars:
   ROOT_DIR:
@@ -28,6 +42,7 @@ vars:
   TEMPORAL_ADDRESS: "temporal-frontend.temporal.svc.cluster.local:7233"
   TEMPORAL_NS: '{{.TEMPORAL_NS | default "temporal"}}'
   TASK_QUEUE: '{{.TEMPORAL_TASK_QUEUE | default "order-checkout"}}'
+  MTLS_CERTS_DIR: "{{.ROOT_DIR}}/.certs/temporal-mtls"
 
 tasks:
   deploy:
@@ -95,6 +110,91 @@ tasks:
           *)            echo "started CheckoutWorkflow $WF_ID input='{{.MESSAGE}}' (-> stays in cluster)";;
         esac
 
+  mtls:deploy:
+    desc: Front Temporal with an mTLS nginx proxy and point the operator at it
+    preconditions:
+      - sh: kubectl get deploy/temporal -n {{.TEMPORAL_NAMESPACE}} >/dev/null 2>&1
+        msg: "Temporal test env not deployed. Run `task temporal:deploy` first."
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/temporal-mtls-certs.sh {{.MTLS_CERTS_DIR}}"
+      - |
+        kubectl create secret generic temporal-mtls-server -n {{.TEMPORAL_NAMESPACE}} \
+          --from-file=tls.crt={{.MTLS_CERTS_DIR}}/server.crt \
+          --from-file=tls.key={{.MTLS_CERTS_DIR}}/server.key \
+          --from-file=ca.crt={{.MTLS_CERTS_DIR}}/ca.crt \
+          --dry-run=client -o yaml | kubectl apply -f -
+      - |
+        kubectl create secret generic temporal-mtls-client -n {{.NAMESPACE}} \
+          --from-file=ca.crt={{.MTLS_CERTS_DIR}}/ca.crt \
+          --from-file=tls.crt={{.MTLS_CERTS_DIR}}/client.crt \
+          --from-file=tls.key={{.MTLS_CERTS_DIR}}/client.key \
+          --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.OVERLAY}}/temporal-mtls-front.yaml
+      # Restart so a re-run with regenerated certs picks up the new secret.
+      - kubectl rollout restart deploy/temporal-mtls -n {{.TEMPORAL_NAMESPACE}}
+      - kubectl rollout status deploy/temporal-mtls -n {{.TEMPORAL_NAMESPACE}} --timeout=120s
+      - kubectl apply -f {{.OVERLAY}}/property-list-mtls.yaml
+      - echo "Operator now reaches Temporal through the mTLS front. Restart temporal:run:local if a split is active."
+
+  mtls:disable:
+    desc: Point the operator back at the plain Temporal frontend
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+      - echo "Operator back on the plaintext frontend. Restart temporal:run:local if a split is active."
+
+  mtls:verify:
+    desc: Check the front rejects requests without the client cert and accepts them with it
+    silent: true
+    cmds:
+      - |
+        set -e
+        PORT=17233
+
+        # A stale port-forward from an earlier run (or a crashed one whose
+        # trap never fired) keeps the port bound and silently swallows the new
+        # forward, so every probe returns 000. Clear the port first.
+        lsof -ti tcp:${PORT} 2>/dev/null | xargs kill 2>/dev/null || true
+        sleep 1
+        kubectl port-forward -n {{.TEMPORAL_NAMESPACE}} svc/temporal-mtls ${PORT}:7233 >/dev/null 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null" EXIT
+
+        # The with-cert probe doubles as the readiness gate for the forward:
+        # retry until nginx answers instead of trusting a fixed sleep.
+        WITH_CERT="000"
+        for _ in $(seq 1 20); do
+          WITH_CERT=$(curl -s --max-time 3 --http2-prior-knowledge "https://localhost:${PORT}/" \
+            --cacert {{.MTLS_CERTS_DIR}}/ca.crt \
+            --cert {{.MTLS_CERTS_DIR}}/client.crt \
+            --key {{.MTLS_CERTS_DIR}}/client.key -o /dev/null -w "%{http_code}" || true)
+          [ -n "$WITH_CERT" ] && [ "$WITH_CERT" != "000" ] && break
+          sleep 0.5
+        done
+        case "$WITH_CERT" in
+          400|000|"")
+            echo "FAIL: connection with the client cert was rejected (HTTP ${WITH_CERT:-handshake failure})"
+            echo "      (is the mTLS front healthy? kubectl get pods -n {{.TEMPORAL_NAMESPACE}} -l app=temporal-mtls)"
+            exit 1;;
+          *)
+            echo "OK: connection WITH the client cert reaches the gRPC front (HTTP ${WITH_CERT})";;
+        esac
+
+        # Under TLS 1.3 nginx cannot abort the handshake for a missing client
+        # cert; it rejects the request instead with HTTP 400 ("No required SSL
+        # certificate was sent"). curl reports 000 when the handshake itself
+        # fails (TLS 1.2 path), so both count as rejected. The forward is known
+        # to be up at this point, so 000 here cannot mean "not reachable".
+        NO_CERT=$(curl -s --max-time 3 --http2-prior-knowledge "https://localhost:${PORT}/" \
+          --cacert {{.MTLS_CERTS_DIR}}/ca.crt -o /dev/null -w "%{http_code}" || true)
+        case "$NO_CERT" in
+          400|000|"")
+            echo "OK: connection WITHOUT a client cert is rejected (HTTP ${NO_CERT:-handshake failure})";;
+          *)
+            echo "FAIL: expected rejection without a client cert, got HTTP ${NO_CERT}"; exit 1;;
+        esac
+        echo ""
+        echo "Full end-to-end: task temporal:run:local + task temporal:send:match"
+
   logs:
     desc: Tail the cluster worker logs
     cmds:
@@ -128,6 +228,9 @@ tasks:
       - kubectl delete mirrordclusterworkloadpatchrequests --all -A 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/temporal-mtls-front.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete secret temporal-mtls-server -n {{.TEMPORAL_NAMESPACE}} --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete secret temporal-mtls-client -n {{.NAMESPACE}} --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/worker.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/temporal-ui.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/temporal-server.yaml --ignore-not-found=true 2>/dev/null || true

@@ -298,11 +298,12 @@ tasks:
         echo "Secret servicebus-azure-conn updated in {{.NAMESPACE}}"
 
   multi:deploy:
-    desc: "Deploy the 2-topic mixed-case consumer + split config (real Azure SB, single cluster). Run servicebus:multi:secret first."
-    preconditions:
-      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
-        msg: "Secret servicebus-azure-conn not found. Run: task servicebus:multi:secret CONN='Endpoint=sb://...'"
+    desc: "Deploy the 2-topic mixed-case consumer + split config (real Azure SB, single cluster). Creates the connection secret from az + AZURE_SB_RG/AZURE_SB_NAMESPACE (in .env), or pass CONN='Endpoint=sb://...'."
     cmds:
+      # Ensure the connection secret exists first. `multi:secret` derives it from
+      # `az` when AZURE_SB_RG/AZURE_SB_NAMESPACE are set (see .env), so a plain
+      # `az login` is enough; passing CONN=... still works as a fallback.
+      - task: multi:secret
       # Build straight on the node: `minikube image load` silently skips a tag
       # that already exists and is in use, which leaves the pod running stale
       # code (the whole app crash-loops on "No queues ... configured").
@@ -445,6 +446,117 @@ tasks:
       - kubectl delete previewsessions --all -A 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/split-config-multi.yaml --ignore-not-found=true
       - kubectl delete -f {{.OVERLAY}}/consumer-topic-multi.yaml --ignore-not-found=true
+
+  # ── Shared-subscription-env reproduction (REAL Azure SB, single cluster) ──
+  # Reproduces the client bug where one env var (their Service.ServiceName)
+  # names the app's subscription on EVERY topic. The operator creates a
+  # different per-session mirrord-s-* subscription per topic but can only
+  # write ONE name into the env var, and the app's auto-provisioning then
+  # creates that name on the other topics itself - unfiltered, unowned,
+  # leaked. Uses the same secret + test-topic/test-topic-2 as the multi:*
+  # repro (the deployed consumer auto-creates its `test-service` sub).
+  #
+  #   task servicebus:multi:secret CONN='Endpoint=sb://...'   (once)
+  #   task servicebus:sharedsub:deploy         consumer + split config on the real topics
+  #   task servicebus:sharedsub:run:local      consumer under mirrord, filters on BOTH topics
+  #   task servicebus:sharedsub:subs           list subscriptions + rules on both topics
+  #   task servicebus:sharedsub:send TOPIC=test-topic-2 TENANT=other
+  #   task servicebus:sharedsub:clean
+  #
+  # Or run the whole demonstration in one go: scripts/asb-shared-sub-repro.sh
+
+  sharedsub:deploy:
+    desc: "Deploy the shared-subscription-env repro on REAL Azure SB (run servicebus:multi:secret first)"
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret servicebus-azure-conn not found. Run: task servicebus:multi:secret CONN='Endpoint=sb://...'"
+    cmds:
+      - minikube -p {{.CLUSTER_NAME}} image build -t servicebus-consumer:local {{.APP_DIR}}
+      - kubectl apply -f {{.OVERLAY}}/property-list-azure.yaml
+      - kubectl apply -f {{.OVERLAY}}/consumer-topic-shared.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config-shared.yaml
+      - kubectl rollout restart deploy/servicebus-shared-consumer -n {{.NAMESPACE}}
+      - kubectl rollout status deploy/servicebus-shared-consumer -n {{.NAMESPACE}} --timeout=180s
+
+  sharedsub:run:local:
+    desc: "Run the consumer locally under mirrord with filters on BOTH topics (Ctrl-C to stop)"
+    interactive: true
+    dir: apps/servicebus-consumer
+    cmds:
+      - go build -o /tmp/servicebus-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.OVERLAY}}/mirrord-shared-sub.json -- /tmp/servicebus-consumer"
+
+  sharedsub:subs:
+    desc: "List subscriptions + rules on both repro topics (data-plane management API, works without az)"
+    silent: true
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret servicebus-azure-conn not found. Run: task servicebus:multi:secret"
+    vars:
+      AZURE_CONN:
+        sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} -o jsonpath='{.data.connection_string}' 2>/dev/null | base64 -d
+    cmds:
+      # Detached pod + `kubectl logs`: `kubectl run -i` attaches after the
+      # container starts and silently loses the first output lines.
+      - |
+        NAME=sb-subs-lister-$RANDOM
+        kubectl run $NAME --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.NAMESPACE}} \
+          --env="LIST_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING={{.AZURE_CONN}}" \
+          --env="SERVICEBUS_TOPICS=test-topic,test-topic-2" \
+          -- /app/consumer >/dev/null 2>&1
+        for i in $(seq 1 30); do
+          PHASE=$(kubectl get pod $NAME -n {{.NAMESPACE}} -o jsonpath='{.status.phase}' 2>/dev/null)
+          [ "$PHASE" = "Succeeded" ] || [ "$PHASE" = "Failed" ] && break
+          sleep 2
+        done
+        kubectl logs -n {{.NAMESPACE}} $NAME 2>/dev/null
+        kubectl delete pod $NAME -n {{.NAMESPACE}} --wait=false >/dev/null 2>&1
+
+  sharedsub:send:
+    desc: "Publish to one repro topic (TOPIC=test-topic|test-topic-2 TENANT=test-user|other MESSAGE=...)"
+    silent: true
+    preconditions:
+      - sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "Secret servicebus-azure-conn not found. Run: task servicebus:multi:secret"
+    vars:
+      TOPIC: '{{.TOPIC | default "test-topic"}}'
+      TENANT: '{{.TENANT | default "test-user"}}'
+      MESSAGE: '{{.MESSAGE | default "shared-sub repro message"}}'
+      AZURE_CONN:
+        sh: kubectl get secret servicebus-azure-conn -n {{.NAMESPACE}} -o jsonpath='{.data.connection_string}' 2>/dev/null | base64 -d
+    cmds:
+      - |
+        BODY='{"order_id":"ORD-001","tenant":"{{.TENANT}}","type":"repro","message":"{{.MESSAGE}}"}'
+        kubectl run sb-shared-sender-$RANDOM --rm -i --restart=Never \
+          --image=servicebus-consumer:local \
+          --image-pull-policy=Never \
+          --namespace={{.NAMESPACE}} \
+          --env="SEND_MODE=true" \
+          --env="SERVICEBUS_CONNECTION_STRING={{.AZURE_CONN}}" \
+          --env="SEND_TOPIC={{.TOPIC}}" \
+          --env="MESSAGE_BODY=$BODY" \
+          --env="MESSAGE_PROPERTIES=tenant={{.TENANT}}" \
+          -- /app/consumer >/dev/null 2>&1
+        case "{{.TENANT}}" in
+          test*) echo "published to {{.TOPIC}} (tenant={{.TENANT}} -> should reach ONLY the local session)";;
+          *)     echo "published to {{.TOPIC}} (tenant={{.TENANT}} -> should stay with the deployed consumer)";;
+        esac
+
+  sharedsub:logs:
+    desc: Tail the deployed shared-consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=servicebus-shared-consumer --tail=100 -f
+
+  sharedsub:clean:
+    desc: Remove the shared-subscription repro (consumer + split config; keeps the secret + Azure topics)
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/split-config-shared.yaml --ignore-not-found=true
+      - kubectl delete -f {{.OVERLAY}}/consumer-topic-shared.yaml --ignore-not-found=true
 
   _deploy:emulator:
     internal: true

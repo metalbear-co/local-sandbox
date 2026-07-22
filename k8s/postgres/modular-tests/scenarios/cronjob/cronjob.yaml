@@ -1,0 +1,25 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: pg-server-cronjob
+  namespace: test-mirrord
+  labels:
+    test-scenario: cronjob
+spec:
+  # Suspended on purpose: branching reads the connection env straight from the
+  # jobTemplate, and copy_target builds its pod from the same template, so we
+  # never need a real scheduled Job to run.
+  suspend: true
+  schedule: "*/5 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: app
+            image: busybox
+            command: ["sh", "-c", "echo 'Postgres cronjob scenario' && sleep 3600"]
+            env:
+            - name: DATABASE_URL
+              value: "postgresql://postgres:postgres@postgres-test:5432/source_db"

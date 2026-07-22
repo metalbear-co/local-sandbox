@@ -1,0 +1,91 @@
+version: "3"
+
+# Copy-target restart regression (customer report: Ctrl-C + quick restart of a
+# copy_target+scale_down session failed with "no response received from agent
+# connection during agent version check" or came up without traffic).
+#
+# Automated suite:
+#   task copytarget:test            cooldown-restart + orphan-recovery scenarios
+#   task copytarget:test:extended   adds the immediate-restart known-gap probe
+#
+# Manual repro (~2 min, two terminals):
+#   task copytarget:session    # A: start the session; leave it running
+#   task copytarget:orphan     # B: simulate the customer's GC lag on the copy pod
+#   <Ctrl-C terminal A>
+#   task copytarget:watch      # B: broken operator -> pod stays Running forever;
+#                              #    fixed operator -> pod reaps itself in ~40-60s
+#   task copytarget:session    # A: restart; broken -> "found an existing copy"
+#                              #    (same pod); fixed -> fresh mirrord-copy pod
+#   task copytarget:status     # copy pods + copytargets + replicas at a glance
+#   task copytarget:clean      # delete zombie copy pods, restore the deployment
+#
+# Prereqs: cluster up, operator deployed (operator:use, or operator:dev on the
+# fixed branch), echo-app deployed (task preview:deploy). Running against a
+# pre-fix operator makes orphan-recovery fail - that is the original bug.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  COPYTARGET_CONFIG: '{{.ROOT_DIR}}/apps/echo-app/mirrord-copy-target.json'
+
+tasks:
+  test:
+    desc: "Prove copy-target restart behavior: Ctrl-C + restart gets a fresh copy, orphaned copy pods are reaped"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-copy-target-restart.sh"
+
+  test:extended:
+    desc: "Copy-target restart test plus the immediate-restart known-gap probe"
+    interactive: true
+    cmds:
+      - EXTENDED=1 {{.ROOT_DIR}}/scripts/test-copy-target-restart.sh
+
+  session:
+    desc: "Start a copy_target+scale_down session against echo-app (Ctrl-C to stop it)"
+    interactive: true
+    preconditions:
+      - sh: kubectl get deploy echo-app -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "echo-app missing - run: task preview:deploy"
+    cmds:
+      - "{{.MIRRORD_BIN}} exec -f {{.COPYTARGET_CONFIG}} -- sleep 3600"
+
+  orphan:
+    desc: "Strip ownerReferences from the newest copy pod (simulates the customer's GC lag)"
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.NAMESPACE}} --sort-by=.metadata.creationTimestamp -o name \
+          | grep mirrord-copy | tail -1 | cut -d/ -f2)
+        [ -n "$POD" ] || { echo "no mirrord-copy pod found - start a session first"; exit 1; }
+        kubectl patch pod "$POD" -n {{.NAMESPACE}} --type=merge \
+          -p '{"metadata":{"ownerReferences":null}}'
+        echo "Orphaned $POD. Now Ctrl-C the session and run: task copytarget:watch"
+
+  watch:
+    desc: "Watch copy pods live (broken operator: zombie stays Running; fixed: reaped in ~40-60s)"
+    interactive: true
+    cmds:
+      - kubectl get pods -n {{.NAMESPACE}} -w
+
+  status:
+    desc: "Show copy pods (with owners), copytargets, and echo-app replicas"
+    silent: true
+    cmds:
+      - |
+        echo "── copy pods ──"
+        for p in $(kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep mirrord-copy | cut -d/ -f2); do
+          echo "$p  status=$(kubectl get pod $p -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')  owners=[$(kubectl get pod $p -n {{.NAMESPACE}} -o jsonpath='{.metadata.ownerReferences[*].name}')]"
+        done
+        echo "── copytargets ──"
+        kubectl get copytargets -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+        echo "── echo-app ──"
+        echo "replicas: $(kubectl get deploy echo-app -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}' 2>/dev/null)"
+
+  clean:
+    desc: "Delete leftover copy pods and restore the echo-app deployment to 1 replica"
+    cmds:
+      - kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep mirrord-copy | xargs -n1 kubectl delete -n {{.NAMESPACE}} --wait=false 2>/dev/null || true
+      - kubectl scale deploy echo-app -n {{.NAMESPACE}} --replicas=1
+      - echo "Cleaned. Copy pods deleted, echo-app back to 1 replica."

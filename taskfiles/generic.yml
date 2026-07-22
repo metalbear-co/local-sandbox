@@ -10,6 +10,15 @@ version: "3"
 #   task generic:verify               RFC 0008 checks: MIRRORD_PARAM_* env + secretKeyRef passthrough
 #   task generic:influx:run:local     run the InfluxDB app locally under mirrord (InfluxDB branch)
 #
+# Data-copy variants (branch populated by a copy Job before it turns Ready):
+#   task generic:copy:run:local              Valkey full copy      -> generic:copy:query:branch
+#   task generic:copy:filtered:run:local     Valkey greeting* only -> generic:copy:filtered:query:branch
+#   task generic:influx:copy:run:local       InfluxDB CSV copy     -> generic:influx:copy:query:branch
+#   task generic:es:copy:run:local           ES _reindex copy      -> generic:es:copy:query:branch
+#   task generic:es:copy:filtered:run:local  ES writer=cluster     -> generic:es:copy:filtered:query:branch
+#   task generic:cassandra:copy:run:local    Cassandra schema+data -> generic:cassandra:copy:query:branch
+#   task generic:copy:status                 copy Jobs + status.copy + logs
+#
 # The branched service is Valkey - Redis-compatible, but a different image than mirrord's
 # built-in Redis dialect assumes, which is exactly the generic feature's use case. The setup
 # exercises the full generic surface:
@@ -145,13 +154,14 @@ tasks:
         fi
 
   query:branch:
-    desc: 'Query the branch Valkey with the app''s password (default: key = value dump; QUERY= any valkey-cli command)'
+    desc: 'Query the branch Valkey with the app''s password (default: key = value dump; QUERY= any valkey-cli command; BRANCH_ID= selects a copy branch)'
     vars:
       QUERY: '{{.QUERY | default ""}}'
+      BRANCH_ID: '{{.BRANCH_ID | default "valkey-generic-branch"}}'
     cmds:
       - |
         set -f  # no globbing, so QUERY="KEYS *" passes the * through to valkey-cli
-        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="valkey-generic-branch")]}{.metadata.name}{end}')
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="{{.BRANCH_ID}}")]}{.metadata.name}{end}')
         POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
         if [ -z "$POD" ]; then echo "No Valkey branch pod found. Run 'task generic:run:local' first."; exit 1; fi
         echo ""
@@ -313,10 +323,12 @@ tasks:
           'from(bucket:"{{.INFLUX_BUCKET}}") |> range(start:-1h)'
 
   influx:query:branch:
-    desc: Query the BRANCH InfluxDB with the app's token (proves the setup-mode bootstrap)
+    desc: Query the BRANCH InfluxDB with the app's token (proves the setup-mode bootstrap; BRANCH_ID= selects a copy branch)
+    vars:
+      BRANCH_ID: '{{.BRANCH_ID | default "influx-generic-branch"}}'
     cmds:
       - |
-        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="influx-generic-branch")]}{.metadata.name}{end}')
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="{{.BRANCH_ID}}")]}{.metadata.name}{end}')
         POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
         if [ -z "$POD" ]; then echo "No InfluxDB branch pod found. Run 'task generic:influx:run:local' first."; exit 1; fi
         echo ""
@@ -436,10 +448,12 @@ tasks:
           'http://localhost:9200/sandbox/_search?q=*&size=50&pretty' || echo "(no sandbox index)"
 
   es:query:branch:
-    desc: List docs in the BRANCH Elasticsearch with the app's password (proves the ELASTIC_PASSWORD bootstrap)
+    desc: List docs in the BRANCH Elasticsearch with the app's password (proves the ELASTIC_PASSWORD bootstrap; BRANCH_ID= selects a copy branch)
+    vars:
+      BRANCH_ID: '{{.BRANCH_ID | default "elasticsearch-generic-branch"}}'
     cmds:
       - |
-        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="elasticsearch-generic-branch")]}{.metadata.name}{end}')
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="{{.BRANCH_ID}}")]}{.metadata.name}{end}')
         POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
         if [ -z "$POD" ]; then echo "No Elasticsearch branch pod found. Run 'task generic:es:run:local' first."; exit 1; fi
         echo ""
@@ -552,10 +566,12 @@ tasks:
         kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- cqlsh -e "SELECT writer, msg, ts FROM sandbox.msgs;" || echo "(no sandbox keyspace)"
 
   cassandra:query:branch:
-    desc: List rows in the BRANCH Cassandra
+    desc: List rows in the BRANCH Cassandra (BRANCH_ID= selects a copy branch)
+    vars:
+      BRANCH_ID: '{{.BRANCH_ID | default "cassandra-generic-branch"}}'
     cmds:
       - |
-        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="cassandra-generic-branch")]}{.metadata.name}{end}')
+        CRD=$(kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} -o jsonpath='{range .items[?(@.spec.id=="{{.BRANCH_ID}}")]}{.metadata.name}{end}')
         POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l db-owner-name=$CRD -o name 2>/dev/null | head -1)
         if [ -z "$POD" ]; then echo "No Cassandra branch pod found. Run 'task generic:cassandra:run:local' first."; exit 1; fi
         echo ""
@@ -704,3 +720,188 @@ tasks:
       - echo "Waiting for InfluxDB + app..."
       - kubectl wait --for=condition=ready pod -l app=influxdb-main -n {{.GENERIC_NAMESPACE}} --timeout=180s || true
       - kubectl wait --for=condition=ready pod -l app=influx-app -n {{.GENERIC_NAMESPACE}} --timeout=120s || true
+
+  # --- Data-copy variants ------------------------------------------------------------------
+  # Same engines, but the branch is POPULATED by a user-supplied copy Job before it turns
+  # Ready (mirrord-branch-copy*.json in each app dir; scripts loaded via script_path). The
+  # Job gets the source as MIRRORD_PARAM_* and the branch as MIRRORD_BRANCH_HOST/PORT; the
+  # branch only serves the session after the Job exits 0. Copy branches use distinct ids
+  # (…-copy / …-copyfiltered) so they never reuse an existing EMPTY branch.
+  #
+  # Typical flow (Valkey):
+  #   task generic:seed                     # put keys into the source
+  #   task generic:copy:run:local           # branch + copy Job; app waits for Ready
+  #   task generic:copy:query:branch        # seeded keys are THERE (an empty branch wouldn't have them)
+  #   task generic:copy:status              # Jobs + status.copy + latest copy logs
+  # Filtered (only greeting* keys):        task generic:copy:filtered:run:local
+  #                                        task generic:copy:filtered:query:branch
+  # Engines: influx (CSV export/import via /scratch), es (server-side _reindex from remote,
+  # filtered variant keeps writer=cluster only), cassandra (DESCRIBE schema + COPY csv).
+
+  copy:run:local:
+    desc: Run the Valkey app under mirrord with a FULL-COPY branch (source keys land in the branch)
+    interactive: true
+    dir: apps/generic-app
+    cmds:
+      - go mod tidy && go build -o generic-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8080 {{.MIRRORD_BIN}} exec \
+          -t deploy/generic-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch-copy.json \
+          -- ./generic-app
+
+  copy:filtered:run:local:
+    desc: Run the Valkey app under mirrord with a FILTERED-COPY branch (only greeting* keys are copied)
+    interactive: true
+    dir: apps/generic-app
+    cmds:
+      - go mod tidy && go build -o generic-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8080 {{.MIRRORD_BIN}} exec \
+          -t deploy/generic-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch-copy-filtered.json \
+          -- ./generic-app
+
+  copy:query:branch:
+    desc: Query the Valkey FULL-COPY branch (expect the seeded keys)
+    cmds:
+      - task: query:branch
+        vars: { BRANCH_ID: valkey-generic-branch-copy, QUERY: '{{.QUERY | default ""}}' }
+
+  copy:filtered:query:branch:
+    desc: Query the Valkey FILTERED-COPY branch (expect ONLY greeting*, not counter/source)
+    cmds:
+      - task: query:branch
+        vars: { BRANCH_ID: valkey-generic-branch-copyfiltered, QUERY: '{{.QUERY | default ""}}' }
+
+  copy:status:
+    desc: Show copy Jobs, each branch CRD's status.copy, and the latest copy Job's logs
+    silent: true
+    cmds:
+      - |
+        echo "=== copy Jobs ==="
+        kubectl get jobs -n {{.GENERIC_NAMESPACE}} 2>/dev/null | awk 'NR==1 || /mirrord-copy-/' || echo "(none)"
+        echo ""
+        echo "=== BranchDatabase status.copy ==="
+        kubectl get branchdatabases -n {{.GENERIC_NAMESPACE}} \
+          -o jsonpath='{range .items[*]}{.spec.id}{": "}{.status.copy}{"\n"}{end}' 2>/dev/null || echo "(none)"
+        echo ""
+        JOB=$(kubectl get jobs -n {{.GENERIC_NAMESPACE}} -o name 2>/dev/null | grep mirrord-copy- | tail -1)
+        if [ -n "$JOB" ]; then
+          echo "=== logs: $JOB ==="
+          kubectl logs -n {{.GENERIC_NAMESPACE}} $JOB --tail=50 2>/dev/null || echo "(job pod already gone - Jobs are GC'd 5 min after finishing)"
+        fi
+
+  influx:copy:run:local:
+    desc: Run the InfluxDB app under mirrord with a FULL-COPY branch (CSV export/import via /scratch)
+    interactive: true
+    dir: apps/influx-app
+    cmds:
+      - go build -o influx-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8090 {{.MIRRORD_BIN}} exec \
+          -t deploy/influx-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch-copy.json \
+          -- ./influx-app
+
+  influx:copy:query:branch:
+    desc: Query the InfluxDB COPY branch (expect the seeded points)
+    cmds:
+      - task: influx:query:branch
+        vars: { BRANCH_ID: influx-generic-branch-copy }
+
+  es:copy:run:local:
+    desc: Run the Elasticsearch app under mirrord with a FULL-COPY branch (server-side _reindex from the source)
+    interactive: true
+    dir: apps/elasticsearch-app
+    cmds:
+      - go build -o elasticsearch-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8085 {{.MIRRORD_BIN}} exec \
+          -t deploy/elasticsearch-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch-copy.json \
+          -- ./elasticsearch-app
+
+  es:copy:filtered:run:local:
+    desc: Run the Elasticsearch app under mirrord with a FILTERED-COPY branch (only writer=cluster docs)
+    interactive: true
+    dir: apps/elasticsearch-app
+    cmds:
+      - go build -o elasticsearch-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8085 {{.MIRRORD_BIN}} exec \
+          -t deploy/elasticsearch-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch-copy-filtered.json \
+          -- ./elasticsearch-app
+
+  es:seed:other:
+    desc: Index a doc with writer=other into the SOURCE Elasticsearch (filtered copy must NOT bring it over)
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.GENERIC_NAMESPACE}} -l app=elasticsearch-main -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.GENERIC_NAMESPACE}} $POD -- curl -s -u 'elastic:{{.ES_PASSWORD}}' \
+          -X POST 'http://localhost:9200/sandbox/_doc?refresh=true' \
+          -H 'Content-Type: application/json' \
+          -d '{"writer":"other","msg":"should NOT survive a writer=cluster filtered copy"}'
+        echo ""
+        echo "Seeded 1 writer=other doc into the source Elasticsearch"
+
+  es:copy:query:branch:
+    desc: List docs in the Elasticsearch FULL-COPY branch (expect all seeded docs)
+    cmds:
+      - task: es:query:branch
+        vars: { BRANCH_ID: elasticsearch-generic-branch-copy }
+
+  es:copy:filtered:query:branch:
+    desc: List docs in the Elasticsearch FILTERED-COPY branch (expect writer=cluster only)
+    cmds:
+      - task: es:query:branch
+        vars: { BRANCH_ID: elasticsearch-generic-branch-copyfiltered }
+
+  cassandra:copy:run:local:
+    desc: Run the Cassandra app under mirrord with a COPY branch (DESCRIBE schema + COPY csv via /scratch)
+    interactive: true
+    dir: apps/cassandra-app
+    cmds:
+      - go mod tidy && go build -o cassandra-app .
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        PORT=8065 {{.MIRRORD_BIN}} exec \
+          -t deploy/cassandra-app \
+          -n {{.GENERIC_NAMESPACE}} \
+          -f mirrord-branch-copy.json \
+          -- ./cassandra-app
+
+  cassandra:copy:query:branch:
+    desc: List rows in the Cassandra COPY branch (expect schema + seeded rows)
+    cmds:
+      - task: cassandra:query:branch
+        vars: { BRANCH_ID: cassandra-generic-branch-copy }

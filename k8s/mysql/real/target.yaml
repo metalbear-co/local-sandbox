@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql-real-target
+  labels:
+    test-scenario: real
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'MySQL real-data scenario target' && sleep infinity"]
+      env:
+        - name: MYSQL_CONNECTION_URL
+          value: "mysql://root:examplepassword@mysql-real:3306/sakila"

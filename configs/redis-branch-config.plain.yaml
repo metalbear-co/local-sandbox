@@ -1,0 +1,3 @@
+# Default Redis branch pod config: stock redis image, plaintext.
+# task redis:tls:disable copies this over redis-branch-config.yaml.
+dbPod: {}

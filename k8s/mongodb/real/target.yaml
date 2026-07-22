@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mongo-real-target
+  labels:
+    test-scenario: real
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'MongoDB real-data scenario target' && sleep infinity"]
+      env:
+        - name: DATABASE_URL
+          value: "mongodb://admin:password@mongodb-real:27017/sample_analytics?authSource=admin"

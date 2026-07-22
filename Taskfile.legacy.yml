@@ -113,6 +113,33 @@ tasks:
       - docker push {{.DOCKER_HUB_IMAGE}}
       - echo "Pushed {{.DOCKER_HUB_IMAGE}}"
 
+  deploy:operator:playground:
+    desc: 'Build the local operator, push it, and swap it into the playground GKE cluster with the live helm values (TAG=... overrides the image tag)'
+    vars:
+      PLAYGROUND_CTX: '{{.PLAYGROUND_CTX | default "gke_playground-383912_us-central1-c_playground-cluster-1"}}'
+      TAG: '{{.TAG | default "playground"}}'
+      IMAGE: vrrashkov/operator
+    cmds:
+      - task: build:operator:linux
+        vars: { DOCKER_HUB_IMAGE: '{{.IMAGE}}:{{.TAG}}' }
+      # The helm release lives in the "default" namespace; the workload deploys into
+      # "mirrord" via the chart's namespace value. Reusing the live values keeps the
+      # playground's license, previewEnv, splitting flags and share-ingress unchanged.
+      - helm --kube-context {{.PLAYGROUND_CTX}} get values mirrord-operator -n default > /tmp/playground-operator-values.yaml
+      - >-
+        helm --kube-context {{.PLAYGROUND_CTX}} upgrade mirrord-operator {{.CHARTS_DIR}}
+        -n default
+        -f /tmp/playground-operator-values.yaml
+        --set operator.image=docker.io/{{.IMAGE}}
+        --set operator.imageTag={{.TAG}}
+        --set image.pullPolicy=Always
+      # A re-push under the same tag changes nothing in the helm diff; the restart
+      # forces a fresh pull either way.
+      - kubectl --context {{.PLAYGROUND_CTX}} -n mirrord rollout restart deploy/mirrord-operator
+      - kubectl --context {{.PLAYGROUND_CTX}} -n mirrord rollout status deploy/mirrord-operator --timeout=180s
+      - kubectl --context {{.PLAYGROUND_CTX}} -n mirrord get deploy mirrord-operator -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+      - 'echo "Rollback: helm --kube-context {{.PLAYGROUND_CTX}} rollback mirrord-operator -n default"'
+
   build:operator:aks:
     desc: Build operator image for AKS (linux/amd64) and push to ACR
     vars:

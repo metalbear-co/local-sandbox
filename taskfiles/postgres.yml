@@ -26,6 +26,7 @@ vars:
   POSTGRES_DIR: '{{.ROOT_DIR}}/k8s/postgres'
   SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/postgres/modular-tests/scenarios'
   POSTGRES_MIRRORD_CONFIG: '{{.POSTGRES_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres/mirrord.json")}}'
+  POSTGRES_MIRRORD_REAL_CONFIG: '{{.POSTGRES_MIRRORD_REAL_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres/mirrord-real.json")}}'
 
 tasks:
   deploy:
@@ -58,6 +59,37 @@ tasks:
           echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
         fi
         {{.MIRRORD_BIN}} exec -f {{.POSTGRES_MIRRORD_CONFIG}} -- /tmp/postgres-app
+
+  deploy:cronjob:
+    desc: Deploy the Postgres source DB plus a CronJob branch target (for CronJob branching)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.POSTGRES_DIR}}
+      - task: _wait:source
+      - kubectl apply -k {{.SCENARIOS_DIR}}/cronjob
+      - echo "CronJob target 'pg-server-cronjob' deployed. Run 'task postgres:run:local:cronjob'."
+
+  run:local:cronjob:
+    desc: Run the app under mirrord against a CronJob target with a branch DB (Ctrl-C to stop)
+    interactive: true
+    dir: apps/postgres-app
+    vars:
+      CONFIG: '{{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-cronjob.json'
+    preconditions:
+      - sh: test -f {{.CONFIG}}
+        msg: "mirrord config not found at {{.CONFIG}}"
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - |
+        # Branching a CronJob needs the operator carrying the fix. When
+        # 'task operator:dev' is running locally, label our resources with its
+        # isolation marker so the LOCAL operator reconciles the branch; the
+        # released cluster operator would reject a CronJob branch target.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- /tmp/postgres-app
 
   query:source:
     desc: 'Query the source database (QUERY="SELECT * FROM users;")'
@@ -173,3 +205,78 @@ tasks:
         done
         echo "Branch pod did not come up; check 'task postgres:status'"
         exit 1
+
+  deploy:real:
+    desc: Deploy a realistic source DB — Pagila (DVD rental, ~20 FK-linked tables) — plus its mirrord target pod
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/postgres/real
+      - echo "Waiting for the real source database (downloads and loads the dataset on first start)..."
+      - kubectl wait --for=condition=ready pod postgres-real -n {{.NAMESPACE}} --timeout=600s
+      - kubectl wait --for=condition=ready pod pg-real-target -n {{.NAMESPACE}} --timeout=120s
+      - echo "Real source ready. Start a subset branch with 'task postgres:run:real:local'."
+
+  run:real:local:
+    desc: Run the app under mirrord with a `subset` branch of the real DB (seed customer_id = 1; Ctrl-C to stop)
+    interactive: true
+    dir: apps/postgres-app
+    preconditions:
+      - sh: test -f {{.POSTGRES_MIRRORD_REAL_CONFIG}}
+        msg: "mirrord config not found at {{.POSTGRES_MIRRORD_REAL_CONFIG}}"
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.POSTGRES_MIRRORD_REAL_CONFIG}} -- /tmp/postgres-app
+      # Inspect the closure afterwards, e.g.: task postgres:query:branch DB=pagila QUERY="SELECT count(*) FROM rental;"
+
+  clean:real:
+    desc: Remove the real-data source DB and its target pod
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/postgres/real --ignore-not-found=true 2>/dev/null || true
+
+  tables:source:
+    desc: 'List tables + exact row counts on the source (auto-detects postgres-test/postgres-real; override with POD=... DB=...)'
+    silent: true
+    vars:
+      POD: '{{.POD | default ""}}'
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD="{{.POD}}"; DB="{{.DB}}"
+        if [ -z "$POD" ]; then
+          if kubectl get pod postgres-test -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=postgres-test
+          elif kubectl get pod postgres-real -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=postgres-real; [ -z "$DB" ] && DB=pagila
+          else
+            echo "No source pod found (postgres-test or postgres-real). Deploy one first."; exit 1
+          fi
+        fi
+        [ -z "$DB" ] && DB=source_db
+        echo "=== source pod: $POD (db: $DB) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d "$DB" -c "SELECT table_schema AS schema, table_name AS table, (xpath('/row/cnt/text()', query_to_xml(format('SELECT count(*) AS cnt FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS rows FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema, table_name;"
+  tables:branch:
+    desc: 'List tables + exact row counts on the newest postgres branch (all user DBs; narrow with DB=...)'
+    silent: true
+    vars:
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | grep mirrord-postgres-branch | tail -1 | cut -d/ -f2)
+        if [ -z "$POD" ]; then echo "No running postgres branch pod found."; exit 1; fi
+        echo "=== branch pod: $POD ==="
+        ONLY="{{.DB}}"
+        for db in $(kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -At -c "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY datname"); do
+          if [ -n "$ONLY" ] && [ "$db" != "$ONLY" ]; then continue; fi
+          echo "--- db: $db ---"
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d "$db" -c "SELECT table_schema AS schema, table_name AS table, (xpath('/row/cnt/text()', query_to_xml(format('SELECT count(*) AS cnt FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS rows FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema, table_name;"
+        done

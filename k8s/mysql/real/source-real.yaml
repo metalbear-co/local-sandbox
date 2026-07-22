@@ -1,0 +1,68 @@
+# "Real" MySQL source: the official Sakila sample database (16 FK-linked tables)
+# downloaded at pod start. Used for exercising the `subset` branch copy mode.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mysql-real
+  labels:
+    app: mysql-real
+spec:
+  initContainers:
+    - name: fetch-sakila
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -e
+          wget -q -O /tmp/sakila.tar.gz https://downloads.mysql.com/docs/sakila-db.tar.gz
+          tar -xzf /tmp/sakila.tar.gz -C /tmp
+          # The official files carry their own CREATE DATABASE sakila / USE sakila.
+          cp /tmp/sakila-db/sakila-schema.sql /initdb/01-schema.sql
+          cp /tmp/sakila-db/sakila-data.sql   /initdb/02-data.sql
+          echo "sakila downloaded"
+      volumeMounts:
+        - name: initdb
+          mountPath: /initdb
+  containers:
+    - name: mysql
+      image: mysql:8.0
+      # Trim the footprint so the shared 6GB node doesn't OOM-kill mysqld
+      # (performance_schema alone costs a few hundred MB).
+      args:
+        - --performance-schema=OFF
+        - --innodb-buffer-pool-size=128M
+      env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: examplepassword
+      ports:
+        - containerPort: 3306
+      volumeMounts:
+        - name: initdb
+          mountPath: /docker-entrypoint-initdb.d
+        # Persist the datadir across container restarts: without it every
+        # restart re-runs the full Sakila import (the memory-heaviest phase).
+        - name: datadir
+          mountPath: /var/lib/mysql
+      readinessProbe:
+        exec:
+          command: ["sh", "-c", "mysqladmin ping -uroot -pexamplepassword --silent"]
+        initialDelaySeconds: 20
+        periodSeconds: 5
+        failureThreshold: 40
+  volumes:
+    - name: initdb
+      emptyDir: {}
+    - name: datadir
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-real
+spec:
+  selector:
+    app: mysql-real
+  ports:
+    - name: mysql
+      port: 3306
+      targetPort: 3306

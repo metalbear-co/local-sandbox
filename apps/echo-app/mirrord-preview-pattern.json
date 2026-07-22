@@ -1,0 +1,41 @@
+{
+  "target": {
+    "path": "deploy/echo-app-pattern",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "http_filter": {
+          "header_filter": "X-Preview: {{ key }}"
+        }
+      }
+    },
+    "db_branches": [
+      {
+        "id": "pg-preview-pattern-{{ key }}",
+        "name": "preview_branch_db",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 1800,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "type": "env",
+          "params": {
+            "host": { "env_var_name": "DATABASE_URL", "value_pattern": "://(?P<host>[^:/]+):" },
+            "port": { "env_var_name": "DATABASE_URL", "value_pattern": "://[^:/]+:(?P<port>[^/]+)/" },
+            "database": { "env_var_name": "DATABASE_URL", "value_pattern": "/(?P<database>[^/?]+)\\?" },
+            "user": "DB_USER",
+            "password": "DB_PASSWORD"
+          }
+        },
+        "copy": { "mode": "empty" }
+      }
+    ]
+  }
+}

@@ -61,12 +61,45 @@ tasks:
         msg: "RELEASE_LICENSE_KEY is required for released operators. Set it in .env"
     cmds:
       - task: _agent:ensure
+      # minikube's docker driver cannot (re)provision a container attached to more than its
+      # own network ("container addresses should have 2 values, got N") - drop the
+      # cross-cluster mesh around cluster creation and restore it right after.
+      - task: _mesh:detach
       - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:clusters:create MC_NUM_CLUSTERS={{.MC_CLUSTERS}}
+      - task: _mesh:attach
       - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:agent:load AGENT_IMAGE={{.MC_AGENT_IMAGE}} MC_NUM_CLUSTERS={{.MC_CLUSTERS}}
       - task: _operators:install
         vars: { VERSION: '{{.VERSION | default "latest"}}' }
       - kubectl config use-context {{.PRIMARY}}
       - task: _up:summary
+
+  _mesh:detach:
+    internal: true
+    # See the note in `up`: every cluster container must sit on ONLY its own docker network
+    # while minikube provisions it. Best-effort - containers or attachments may not exist.
+    cmds:
+      - |
+        docker network disconnect mirrord-remote-1 mirrord-primary >/dev/null 2>&1 || true
+        docker network disconnect mirrord-remote-2 mirrord-primary >/dev/null 2>&1 || true
+        docker network disconnect mirrord-primary mirrord-remote-1 >/dev/null 2>&1 || true
+        docker network disconnect mirrord-primary mirrord-remote-2 >/dev/null 2>&1 || true
+        echo "cross-cluster network mesh detached (minikube can provision now)"
+
+  _mesh:attach:
+    internal: true
+    # The mesh gives every cluster an address on its peers' docker networks - it is what
+    # makes cross-cluster reachability work (the shared localstack NodePort, the default
+    # cluster's apiserver as seen from members). Without it, splits/branches/replicas all
+    # fail with connection refused on 192.168.x.x addresses.
+    cmds:
+      - |
+        docker network connect mirrord-remote-1 mirrord-primary >/dev/null 2>&1 || true
+        docker network connect mirrord-primary mirrord-remote-1 >/dev/null 2>&1 || true
+        if [ "{{.MC_CLUSTERS}}" = "3" ]; then
+          docker network connect mirrord-remote-2 mirrord-primary >/dev/null 2>&1 || true
+          docker network connect mirrord-primary mirrord-remote-2 >/dev/null 2>&1 || true
+        fi
+        echo "cross-cluster network mesh attached"
 
   _agent:ensure:
     internal: true
@@ -241,6 +274,97 @@ tasks:
         sleep 5
         kubectl --context {{.PRIMARY}} get mirrordoperators operator -o jsonpath='{.status}' 2>/dev/null | head -c 400 || true
         echo ""
+
+  operator:deploy:
+    desc: "Deploy YOUR locally built mirrord-operator:custom into every cluster (unique tag, tar-based load, OPERATOR_IMAGE + default-apiserver env, verifies the pods run the fresh image)"
+    cmds:
+      - DEPLOY_OPERATOR=1 DEPLOY_ONLY=1 {{.ROOT_DIR}}/scripts/mc-preview-replica-e2e.sh
+
+  operator:use:
+    desc: "Multicluster twin of operator:use - deploy an operator to ALL clusters. VERSION=latest|x.y.z|pick (released, cached under .versions so no registry needed on reuse) or VERSION=custom (your local mirrord-operator:custom build)."
+    vars:
+      VERSION: '{{.VERSION | default "latest"}}'
+    preconditions:
+      - sh: test -n "$RELEASE_LICENSE_KEY"
+        msg: "RELEASE_LICENSE_KEY is required. Set it in .env"
+    cmds:
+      - |
+        set -euo pipefail
+        VERSION="{{.VERSION}}"
+        if [ "$VERSION" = "custom" ]; then
+          task multicluster:operator:install:custom MC_NUM_CLUSTERS={{.MC_CLUSTERS}}
+          exit 0
+        fi
+
+        CACHE="{{.ROOT_DIR}}/.versions/operator"
+        mkdir -p "$CACHE"
+        helm repo add metalbear https://metalbear-co.github.io/charts >/dev/null 2>&1 || true
+        helm repo update metalbear >/dev/null 2>&1 || true
+
+        if [ "$VERSION" = "latest" ]; then
+          VERSION=$(helm search repo metalbear/mirrord-operator | awk 'NR==2 {print $2}')
+          echo "Latest released operator: $VERSION"
+        elif [ "$VERSION" = "pick" ]; then
+          VERSION=$(helm search repo metalbear/mirrord-operator --versions | awk 'NR>1 {print $2}' \
+            | fzf --height=40% --reverse --border --border-label=" multicluster:operator:use " \
+                  --prompt="version> " --header="Pick an operator release. Esc to cancel.")
+          [ -n "$VERSION" ] || { echo "Cancelled."; exit 0; }
+        fi
+        IMG="ghcr.io/metalbear-co/operator:$VERSION"
+        echo "Using operator $VERSION on: {{.ALL_CTXS}}"
+
+        # Same cache as single-cluster operator:use - a version downloaded once installs
+        # forever after without registry access (ghcr timeouts have bitten before).
+        if [ -f "$CACHE/$VERSION.tar" ]; then
+          echo "Using cached image $CACHE/$VERSION.tar"
+          {{.CONTAINER_RUNTIME}} load -i "$CACHE/$VERSION.tar" 2>/dev/null || true
+        else
+          echo "Downloading $IMG (cached to .versions for offline reuse)..."
+          {{.CONTAINER_RUNTIME}} pull "$IMG"
+          {{.CONTAINER_RUNTIME}} save "$IMG" -o "$CACHE/$VERSION.tar"
+        fi
+
+        for P in {{.ALL_CTXS}}; do
+          echo "Loading image into $P..."
+          minikube -p "$P" ssh "docker rmi $IMG --force" 2>/dev/null || true
+          minikube -p "$P" image load "$IMG"
+        done
+
+        task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:operator:install:all \
+          AGENT_IMAGE={{.MC_AGENT_IMAGE}} \
+          MC_NUM_CLUSTERS={{.MC_CLUSTERS}} \
+          EXTRA_HELM_ARGS="--set operator.image=ghcr.io/metalbear-co/operator --set operator.imageTag=$VERSION {{.MC_RELEASE_COMMON_FLAGS}} --set-string license.key=$RELEASE_LICENSE_KEY"
+      # The legacy installer puts the operators on hostNetwork - undo it, same as `up` does.
+      - task: operator:podnetwork
+
+  operator:install:release:
+    desc: "Install the RELEASED operator (VERSION=latest|x.y.z) on all EXISTING clusters - e.g. to baseline released behavior after testing a custom build. Needs ghcr.io reachable."
+    preconditions:
+      - sh: test -n "$RELEASE_LICENSE_KEY"
+        msg: "RELEASE_LICENSE_KEY is required. Set it in .env"
+    cmds:
+      - task: _operators:install
+        vars: { VERSION: '{{.VERSION | default "latest"}}' }
+
+  operator:install:custom:
+    desc: "FIRST install of YOUR locally built operator (OPERATOR_IMAGE, default mirrord-operator:custom) on all clusters - no ghcr pull. Use when multicluster:up cannot reach ghcr or you want a custom build from the start; afterwards use operator:deploy for rebuilds."
+    preconditions:
+      - sh: test -n "$RELEASE_LICENSE_KEY"
+        msg: "RELEASE_LICENSE_KEY is required. Set it in .env"
+      - sh: '{{.CONTAINER_RUNTIME}} image inspect {{.OPERATOR_IMAGE | default "mirrord-operator:custom"}} >/dev/null 2>&1'
+        msg: "Local operator image not found - build or retag it first, e.g. docker tag <your-tag> mirrord-operator:custom"
+    vars:
+      OPERATOR_IMAGE: '{{.OPERATOR_IMAGE | default "mirrord-operator:custom"}}'
+    cmds:
+      - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:operator:load:images OPERATOR_IMAGE={{.OPERATOR_IMAGE}} MC_NUM_CLUSTERS={{.MC_CLUSTERS}}
+      - |
+        IMAGE="{{.OPERATOR_IMAGE}}"
+        task -t {{.ROOT_DIR}}/Taskfile.legacy.yml multicluster:operator:install:all \
+          AGENT_IMAGE={{.MC_AGENT_IMAGE}} \
+          MC_NUM_CLUSTERS={{.MC_CLUSTERS}} \
+          EXTRA_HELM_ARGS="--set operator.image=${IMAGE%:*} --set operator.imageTag=${IMAGE##*:} {{.MC_RELEASE_COMMON_FLAGS}} --set-string license.key=$RELEASE_LICENSE_KEY"
+      # The legacy installer puts the operators on hostNetwork - undo it, same as `up` does.
+      - task: operator:podnetwork
 
   operator:apply:
     desc: "Re-apply the multicluster values files (multicluster/*.yaml) to BOTH deployed operators after editing them. Keeps the currently deployed released version; also refreshes remote credentials."
@@ -1099,3 +1223,466 @@ tasks:
           kubectl --context "$CTX" delete previewsessions --all -A 2>/dev/null || true
           kubectl --context "$CTX" delete pods -n test-multicluster -l preview.metalbear.co/session-uid 2>/dev/null || true
         done
+
+  # ------------------------------------------------------------------------
+  # HTTP preview across clusters.
+  #
+  # Deploys the same echo-app on EVERY workload cluster (each answering
+  # "Hello from <cluster>"), then starts a preview targeting deploy/echo-app.
+  # The preview pod answers "Hello from preview-pod", so every response tells
+  # you exactly who served it:
+  #
+  #   task multicluster:http:deploy          echo-app on all workload clusters
+  #   task multicluster:http:preview:start   preview on the DEFAULT cluster
+  #   task multicluster:http:send:default    header request via the default
+  #                                          cluster -> "Hello from preview-pod"
+  #   task multicluster:http:send:remote     header request via a remote
+  #                                          cluster -> "Hello from <remote>"
+  #                                          (previews do NOT intercept HTTP on
+  #                                          non-default clusters - the current
+  #                                          multicluster gap this proves)
+  #   task multicluster:http:test            scripted end-to-end of the above
+  #   task multicluster:http:preview:stop / http:clean
+  http:deploy:
+    desc: Build the echo-app and deploy it on EVERY workload cluster (CLUSTER_ID = the cluster's name)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t echo-app:latest {{.ROOT_DIR}}/apps/echo-app"
+      - |
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          echo "=== $CTX ==="
+          minikube -p "$CTX" image load echo-app:latest
+          kubectl --context "$CTX" create namespace {{.NAMESPACE}} --dry-run=client -o yaml \
+            | kubectl --context "$CTX" apply -f -
+          kubectl --context "$CTX" apply -n {{.NAMESPACE}} -f - <<YAML
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app
+          labels:
+            app: echo-app
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: echo-app
+          template:
+            metadata:
+              labels:
+                app: echo-app
+            spec:
+              containers:
+              - name: echo
+                image: echo-app:latest
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 8080
+                env:
+                - name: CLUSTER_ID
+                  value: "$CTX"
+                - name: PORT
+                  value: "8080"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: echo-app
+        spec:
+          selector:
+            app: echo-app
+          ports:
+          - port: 8080
+            targetPort: 8080
+        YAML
+          kubectl --context "$CTX" wait --for=condition=available deploy/echo-app \
+            -n {{.NAMESPACE}} --timeout=120s
+        done
+
+  http:preview:start:
+    desc: Start a preview env targeting echo-app (pods land on the DEFAULT cluster; answers "Hello from preview-pod")
+    interactive: true
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-http-preview"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    preconditions:
+      - sh: kubectl --context {{.DEFAULT_CTX}} get deploy echo-app -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "echo-app missing on {{.DEFAULT_CTX}} - run 'task multicluster:http:deploy' first"
+    cmds:
+      - |
+        # Same marker rule as the other preview tasks - with operator:dev
+        # running, the session must be labeled so YOUR operator handles it.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} preview start \
+            -f {{.ROOT_DIR}}/apps/echo-app/mirrord-preview-mc.json \
+            -i "{{.PREVIEW_IMAGE}}" \
+            -k "{{.PREVIEW_KEY}}" \
+            --timeout {{.PREVIEW_TIMEOUT}}
+
+  http:send:
+    desc: "Send one X-Preview request through a chosen cluster's echo-app (CTX=<kube-context>)"
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-http-preview"}}'
+    preconditions:
+      - sh: test -n "{{.CTX}}"
+        msg: "CTX is required, e.g. task multicluster:http:send CTX=mirrord-remote-1"
+    cmds:
+      - |
+        echo "sending 'X-Preview: {{.PREVIEW_KEY}}' request via {{.CTX}}..."
+        RESPONSE=$(kubectl --context {{.CTX}} exec -n {{.NAMESPACE}} deploy/echo-app -- \
+          wget -q -O- -T 60 --header="X-Preview: {{.PREVIEW_KEY}}" \
+          http://echo-app:8080/echo?from=mc-test 2>/dev/null | head -1)
+        echo "response: $RESPONSE"
+
+  http:send:default:
+    desc: Header request via the DEFAULT cluster - should be answered by the preview ("Hello from preview-pod")
+    cmds:
+      - task: http:send
+        vars: { CTX: '{{.DEFAULT_CTX}}', PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-http-preview"}}' }
+
+  http:send:remote:
+    desc: Header request via a REMOTE workload cluster - answered by the ORIGINAL remote app (previews don't intercept HTTP there)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-http-preview"}}'
+    cmds:
+      - |
+        REMOTE_CTX=""
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          [ "$CTX" != "{{.DEFAULT_CTX}}" ] && REMOTE_CTX="$CTX" && break
+        done
+        if [ -z "$REMOTE_CTX" ]; then
+          echo "no non-default workload cluster in this topology (WORKLOAD_CTXS={{.WORKLOAD_CTXS}})"
+          exit 1
+        fi
+        echo "sending 'X-Preview: {{.PREVIEW_KEY}}' request via $REMOTE_CTX..."
+        RESPONSE=$(kubectl --context "$REMOTE_CTX" exec -n {{.NAMESPACE}} deploy/echo-app -- \
+          wget -q -O- -T 60 --header="X-Preview: {{.PREVIEW_KEY}}" \
+          http://echo-app:8080/echo?from=mc-test 2>/dev/null | head -1)
+        echo "response: $RESPONSE"
+
+  http:test:
+    desc: End-to-end - prove HTTP reaches the preview via the DEFAULT cluster but bypasses it via a REMOTE cluster (needs http:deploy + http:preview:start)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-http-preview"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl --context {{.PRIMARY}} get previewsessions -A \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session for key '{{.PREVIEW_KEY}}' - run 'task multicluster:http:preview:start' first"
+          exit 1
+        fi
+        echo "preview session: $SESSION (pods on {{.DEFAULT_CTX}})"
+
+        REMOTE_CTX=""
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          [ "$CTX" != "{{.DEFAULT_CTX}}" ] && REMOTE_CTX="$CTX" && break
+        done
+        [ -n "$REMOTE_CTX" ] || { echo "no non-default workload cluster in this topology"; exit 1; }
+
+        send() {
+          kubectl --context "$1" exec -n {{.NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- -T 60 --header="X-Preview: {{.PREVIEW_KEY}}" \
+            http://echo-app:8080/echo?from=mc-test 2>/dev/null | head -1
+        }
+
+        echo
+        echo "==> via the DEFAULT cluster ({{.DEFAULT_CTX}}) - the steal lives here:"
+        DEFAULT_RESPONSE=$(send {{.DEFAULT_CTX}})
+        echo "    $DEFAULT_RESPONSE"
+        case "$DEFAULT_RESPONSE" in
+          *preview-pod*) echo "    OK: answered by the preview" ;;
+          *) echo "    FAIL: expected the preview to answer on the default cluster"; exit 1 ;;
+        esac
+
+        echo
+        echo "==> via the REMOTE cluster ($REMOTE_CTX) - no steal exists here:"
+        REMOTE_RESPONSE=$(send "$REMOTE_CTX")
+        echo "    $REMOTE_RESPONSE"
+        case "$REMOTE_RESPONSE" in
+          *preview-pod*)
+            echo "    UNEXPECTED: the preview answered via the remote cluster -"
+            echo "    cross-cluster HTTP interception works now; update this test's expectation!"
+            exit 1 ;;
+          *"$REMOTE_CTX"*)
+            echo "    EXPECTED (current limitation): the ORIGINAL app on $REMOTE_CTX answered -"
+            echo "    previews only intercept HTTP on the default cluster." ;;
+          *) echo "    FAIL: unexpected response"; exit 1 ;;
+        esac
+
+        echo
+        echo "Done. Stop the preview with: task multicluster:http:preview:stop"
+
+  http:preview:stop:
+    desc: Stop the HTTP preview env
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "mc-http-preview"}}'
+    cmds:
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+        fi
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} preview stop -k "{{.PREVIEW_KEY}}" || true
+
+  http:clean:
+    desc: Remove the echo-app from every workload cluster
+    cmds:
+      - |
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          kubectl --context "$CTX" delete deploy/echo-app svc/echo-app \
+            -n {{.NAMESPACE}} --ignore-not-found=true
+        done
+
+
+  # ===========================================================================
+  # probe:* — interactive per-cluster replica preview demo. ONE app (preview-probe)
+  # doing HTTP steal + SQS split + PG branch, replicated to every workload cluster.
+  # Poke each cluster by hand to see replicas serve their OWN traffic.
+  #
+  #   task multicluster:probe:up               # build + deploy + start the preview
+  #   task multicluster:probe:http:primary     # baggage GET on the primary -> its replica
+  #   task multicluster:probe:http:remote      # baggage GET on the remote  -> its replica
+  #   task multicluster:probe:sqs:match        # matched msg -> a replica consumes it
+  #   task multicluster:probe:sqs:nomatch      # unmatched   -> the deployed consumer
+  #   task multicluster:probe:db:remote        # remote replica insert+select via the proxy
+  #   task multicluster:probe:db:primary       # primary replica insert+select (direct)
+  #   task multicluster:probe:status / :logs CTX=... / :down
+  # ===========================================================================
+  probe:build:
+    desc: "Build the preview-probe image (HTTP + SQS + PG in one app) and load it into all clusters"
+    vars:
+      IMG: '{{.PROBE_IMAGE | default "preview-probe:mc"}}'
+    cmds:
+      - docker build --platform linux/arm64 -t {{.IMG}} {{.ROOT_DIR}}/apps/preview-probe
+      - for: { var: ALL_CTXS, split: " " }
+        cmd: minikube -p "{{.ITEM}}" image load {{.IMG}}
+
+  probe:deploy:
+    desc: "Deploy the demo: LocalStack+queue (sqs:deploy), pg-source on the default cluster, combo-app on every cluster, queue registry"
+    vars:
+      IMG: '{{.PROBE_IMAGE | default "preview-probe:mc"}}'
+      PROBE_DIR: '{{.ROOT_DIR}}/k8s/overlays/multicluster-probe'
+    cmds:
+      - task: sqs:deploy
+      # The standalone sqs-consumer reads the same queue and would steal the split's matched
+      # messages - park it (probe:down restores it).
+      - for: { var: WORKLOAD_CTXS, split: " " }
+        cmd: kubectl --context "{{.ITEM}}" -n test-multicluster scale deploy/sqs-consumer --replicas=0 >/dev/null 2>&1 || true
+      - kubectl --context {{.DEFAULT_CTX}} -n test-multicluster apply -f {{.PROBE_DIR}}/pg-source.yaml
+      - kubectl --context {{.DEFAULT_CTX}} -n test-multicluster rollout status deploy/pg-source --timeout=120s
+      - |
+        AWS_EP=$(kubectl --context {{.DEFAULT_CTX}} -n test-multicluster get deploy sqs-consumer -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="AWS_ENDPOINT_URL")].value}')
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          sed -e "s|__IMG__|{{.IMG}}|g" -e "s|__CLUSTER__|$CTX|g" -e "s|__AWS_EP__|$AWS_EP|g" \
+            {{.PROBE_DIR}}/combo-app.yaml | kubectl --context "$CTX" -n test-multicluster apply -f -
+          kubectl --context "$CTX" -n test-multicluster rollout status deploy/combo-app --timeout=120s
+        done
+      - kubectl --context {{.DEFAULT_CTX}} -n test-multicluster apply -f {{.PROBE_DIR}}/split-config.yaml
+      - echo "deployed. next -> task multicluster:probe:preview:start"
+
+  probe:preview:start:
+    desc: "Start ONE combined preview: HTTP steal + SQS split (type=^premium$) + PG branch, replicated to every cluster"
+    interactive: true
+    vars:
+      KEY: '{{.KEY | default "prev-combo"}}'
+      IMG: '{{.PROBE_IMAGE | default "preview-probe:mc"}}'
+    cmds:
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        printf '%s\n' '{' \
+          '  "target": { "path": "deployment/combo-app", "namespace": "test-multicluster" },' \
+          '  "operator": true,' \
+          '  "feature": {' \
+          '    "preview": { "ttl_mins": 60, "creation_timeout_secs": 300 },' \
+          '    "network": { "incoming": { "mode": "steal" } },' \
+          '    "split_queues": { "test-queue": { "queue_type": "SQS", "message_filter": { "type": "^premium$" } } },' \
+          '    "db_branches": [ { "id": "combo-db", "type": "pg", "version": "16", "name": "source_db",' \
+          '      "ttl_secs": 3600, "creation_timeout_secs": 180,' \
+          '      "connection": { "url": { "type": "env", "variable": "DATABASE_URL" } },' \
+          '      "copy": { "mode": "all" } } ]' \
+          '  }' \
+          '}' > /tmp/mirrord-probe-combo.json
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false \
+          {{.MIRRORD_BIN}} preview start -f /tmp/mirrord-probe-combo.json -i {{.IMG}} -k {{.KEY}} --timeout 300
+      - echo "preview '{{.KEY}}' started -> try probe:http:remote / probe:db:remote / probe:sqs:match"
+
+  probe:http:
+    desc: "HTTP request to a cluster's combo-app (CTX=mirrord-remote-1 [MSG=hi] [BAGGAGE=1]); baggage=1 targets that cluster's REPLICA"
+    silent: true
+    vars:
+      CTX: '{{.CTX | default "mirrord-remote-1"}}'
+      MSG: '{{.MSG | default "hello"}}'
+      KEY: '{{.KEY | default "prev-combo"}}'
+      BAGGAGE: '{{.BAGGAGE | default "1"}}'
+    cmds:
+      - |
+        PORT=18800
+        kubectl --context {{.CTX}} -n test-multicluster port-forward deploy/combo-app $PORT:80 >/dev/null 2>&1 &
+        PF=$!; trap "kill $PF 2>/dev/null" EXIT
+        for _ in $(seq 1 20); do curl -sf -m 2 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 1; done
+        MARK="{{.MSG}}-$(date +%s)"
+        if [ "{{.BAGGAGE}}" = 1 ]; then
+          echo "-> baggage GET on {{.CTX}} (expect: served by {{.CTX}}'s REPLICA)"
+          echo "   response: $(curl -s -H "baggage: mirrord-session={{.KEY}}" http://127.0.0.1:$PORT/log/$MARK)"
+          sleep 2
+          echo "   {{.CTX}} replica log line:"
+          kubectl --context {{.CTX}} -n test-multicluster logs -l preview.metalbear.co/session-uid,app=combo-app --tail=300 2>/dev/null | grep "$MARK" | sed 's/^/     /' || echo "     (not yet - run again)"
+        else
+          echo "-> plain GET on {{.CTX}} (expect: served by the DEPLOYED app)"
+          echo "   response: $(curl -s http://127.0.0.1:$PORT/log/$MARK)"
+        fi
+
+  probe:http:primary:
+    desc: "Baggage HTTP on the PRIMARY cluster -> its own replica"
+    cmds: [{ task: probe:http, vars: { CTX: '{{.PRIMARY}}', BAGGAGE: "1" } }]
+
+  probe:http:remote:
+    desc: "Baggage HTTP on the REMOTE cluster -> its own replica"
+    cmds: [{ task: probe:http, vars: { CTX: '{{.REMOTE}}', BAGGAGE: "1" } }]
+
+  probe:db:
+    desc: "Insert+select on the branch via a cluster's REPLICA app (CTX=mirrord-remote-1); remote goes through the branch proxy"
+    silent: true
+    vars:
+      CTX: '{{.CTX | default "mirrord-remote-1"}}'
+      VAL: '{{.VAL | default "hello-branch"}}'
+    cmds:
+      - |
+        RPOD=$(kubectl --context {{.CTX}} -n test-multicluster get pods -l preview.metalbear.co/session-uid,app=combo-app -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        [ -n "$RPOD" ] || { echo "no replica pod on {{.CTX}} - is the preview started?"; exit 1; }
+        PORT=18801
+        kubectl --context {{.CTX}} -n test-multicluster port-forward "pod/$RPOD" $PORT:80 >/dev/null 2>&1 &
+        PF=$!; trap "kill $PF 2>/dev/null" EXIT
+        for _ in $(seq 1 30); do curl -sf -m 2 http://127.0.0.1:$PORT/health >/dev/null 2>&1 && break; sleep 1; done
+        echo "-> {{.CTX}} replica DB host: $(curl -s http://127.0.0.1:$PORT/db/host)"
+        VAL="{{.VAL}}-$(date +%s)"
+        printf -- '-> INSERT %s : ' "$VAL"
+        for _ in $(seq 1 15); do R=$(curl -sf -m 5 "http://127.0.0.1:$PORT/db/insert/$VAL" 2>/dev/null) && { echo "$R"; break; }; sleep 2; done
+        echo "-> SELECT (branch contents, newest first):"
+        curl -s http://127.0.0.1:$PORT/db/select | sed 's/^/   /'; echo
+
+  probe:db:primary:
+    desc: "Insert+select on the branch from the PRIMARY replica (direct pod IP)"
+    cmds: [{ task: probe:db, vars: { CTX: '{{.PRIMARY}}' } }]
+
+  probe:db:remote:
+    desc: "Insert+select on the branch from the REMOTE replica (through the branch proxy)"
+    cmds: [{ task: probe:db, vars: { CTX: '{{.REMOTE}}' } }]
+
+  probe:sqs:send:
+    desc: "Send an SQS message (TYPE=premium|basic MSG=...); premium is split to a replica, basic to the deployed consumer"
+    silent: true
+    vars:
+      TYPE: '{{.TYPE | default "premium"}}'
+      MSG: '{{.MSG | default "hello"}}'
+    cmds:
+      - |
+        kubectl --context {{.DEFAULT_CTX}} exec -n localstack deploy/localstack -- \
+          awslocal sqs send-message --queue-url http://localhost:4566/000000000000/test-queue \
+            --message-body '{"type":"{{.TYPE}}","message":"{{.MSG}}"}' \
+            --message-attributes '{"type":{"DataType":"String","StringValue":"{{.TYPE}}"}}' >/dev/null
+        echo "sent type={{.TYPE}} '{{.MSG}}'  ->  watch: task multicluster:probe:logs CTX={{.REMOTE}}"
+
+  probe:sqs:match:
+    desc: "Send a MATCHED SQS message (type=premium) -> a replica consumes it"
+    cmds: [{ task: probe:sqs:send, vars: { TYPE: "premium", MSG: '{{.MSG | default "match-to-a-replica"}}' } }]
+
+  probe:sqs:nomatch:
+    desc: "Send an UNMATCHED SQS message (type=basic) -> the deployed consumer"
+    cmds: [{ task: probe:sqs:send, vars: { TYPE: "basic", MSG: '{{.MSG | default "nomatch-to-deployed"}}' } }]
+
+  probe:sqs:burst:
+    desc: "Send N numbered matched + N numbered unmatched SQS messages (N=5) - each body has a unique number so you can see the distribution"
+    silent: true
+    vars:
+      N: '{{.N | default "5"}}'
+    cmds:
+      - |
+        for i in $(seq 1 {{.N}}); do
+          kubectl --context {{.DEFAULT_CTX}} exec -n localstack deploy/localstack --             awslocal sqs send-message --queue-url http://localhost:4566/000000000000/test-queue               --message-body "{\"type\":\"premium\",\"n\":$i}"               --message-attributes '{"type":{"DataType":"String","StringValue":"premium"}}' >/dev/null
+          kubectl --context {{.DEFAULT_CTX}} exec -n localstack deploy/localstack --             awslocal sqs send-message --queue-url http://localhost:4566/000000000000/test-queue               --message-body "{\"type\":\"basic\",\"n\":$i}"               --message-attributes '{"type":{"DataType":"String","StringValue":"basic"}}' >/dev/null
+        done
+        echo "sent {{.N}} premium (n=1..{{.N}}) + {{.N}} basic (n=1..{{.N}})"
+        echo "watch the split: task multicluster:probe:sqs:tally"
+
+  probe:sqs:tally:
+    desc: "Show which cluster's REPLICA consumed which premium n, and which DEPLOYED app got which basic n"
+    silent: true
+    cmds:
+      - |
+        echo "MATCHED (premium) -> replicas:"
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          NS=$(kubectl --context "$CTX" -n test-multicluster logs -l preview.metalbear.co/session-uid,app=combo-app --tail=1000 2>/dev/null | grep 'type=premium' | grep -oE '"n":[0-9]+' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          printf '  %-20s n = %s\n' "$CTX" "$NS"
+        done
+        echo "UNMATCHED (basic) -> deployed apps:"
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          NS=$(kubectl --context "$CTX" -n test-multicluster logs -l 'app=combo-app,!preview.metalbear.co/session-uid' --tail=1000 2>/dev/null | grep 'type=basic' | grep -oE '"n":[0-9]+' | grep -oE '[0-9]+' | sort -n | uniq | tr '\n' ' ')
+          printf '  %-20s n = %s\n' "$CTX" "$NS"
+        done
+
+  probe:status:
+    desc: "Show the preview copies, replica pods, split state and branch proxy on every cluster"
+    silent: true
+    cmds:
+      - |
+        for CTX in {{.ALL_CTXS}}; do
+          echo "=== $CTX ==="
+          echo "preview copies:"
+          kubectl --context "$CTX" -n test-multicluster get previewsessions -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,REPLICA:.metadata.labels.operator\.metalbear\.co/preview-replica' 2>/dev/null | sed 's/^/  /' || echo "  none"
+          echo "replica pods:"
+          kubectl --context "$CTX" -n test-multicluster get pods -l preview.metalbear.co/session-uid,app=combo-app --no-headers 2>/dev/null | sed 's/^/  /' || echo "  none"
+          echo "branch proxy (remote clusters only):"
+          kubectl --context "$CTX" -n test-multicluster get deploy 2>/dev/null | grep -- "-brdb-" | sed 's/^/  /' || echo "  (none - default cluster reaches the branch by pod IP)"
+          echo ""
+        done
+        echo "=== queue splits (primary aggregates all clusters) ==="
+        kubectl --context {{.PRIMARY}} get queuesplits -A 2>/dev/null | sed 's/^/  /' || echo "  none"
+
+  probe:logs:
+    desc: "Tail a cluster's REPLICA combo-app logs (CTX=mirrord-remote-1) - shows HTTP + DB + SQS lines, tagged by cluster"
+    vars:
+      CTX: '{{.CTX | default "mirrord-remote-1"}}'
+    cmds:
+      - kubectl --context {{.CTX}} -n test-multicluster logs -l preview.metalbear.co/session-uid,app=combo-app --tail=120 -f
+
+  probe:preview:stop:
+    desc: "Stop the combined preview (KEY=prev-combo)"
+    vars:
+      KEY: '{{.KEY | default "prev-combo"}}'
+    cmds:
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then export OPERATOR_ISOLATION_MARKER=local-dev; fi
+        MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} preview stop -k {{.KEY}} || true
+
+  probe:up:
+    desc: "One-shot: build image + deploy + start the combined preview"
+    cmds:
+      - task: probe:build
+      - task: probe:deploy
+      - task: probe:preview:start
+
+  probe:down:
+    desc: "Tear down: stop the preview, remove combo-app/pg-source/registry, restore sqs-consumer"
+    vars:
+      KEY: '{{.KEY | default "prev-combo"}}'
+    cmds:
+      - task: probe:preview:stop
+        vars: { KEY: '{{.KEY}}' }
+      - |
+        kubectl --context {{.DEFAULT_CTX}} -n test-multicluster delete mirrordsplitconfig combo-split-config --ignore-not-found >/dev/null 2>&1 || true
+        kubectl --context {{.DEFAULT_CTX}} -n test-multicluster delete deploy/pg-source svc/pg-source --ignore-not-found >/dev/null 2>&1 || true
+        for CTX in {{.WORKLOAD_CTXS}}; do
+          kubectl --context "$CTX" -n test-multicluster delete deploy/combo-app svc/combo-app --ignore-not-found >/dev/null 2>&1 || true
+          kubectl --context "$CTX" -n test-multicluster scale deploy/sqs-consumer --replicas=1 >/dev/null 2>&1 || true
+        done
+        echo "torn down."

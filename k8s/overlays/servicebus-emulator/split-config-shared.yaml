@@ -1,0 +1,54 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: shared-subscription-split
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: servicebus-shared-consumer
+  clientConfigs:
+    azureServiceBus: servicebus-azure-config
+  # BOTH queues resolve their subscription from the SAME env var - the app has
+  # one service name used as its subscription name on every topic (NServiceBus
+  # endpoint pattern; the client's config does exactly this with
+  # Service.ServiceName across three topics). The topic name comes from a
+  # fallback only, mirroring the client's `env: dummy` entries.
+  #
+  # This is the bug trigger: the operator creates a DIFFERENT per-session
+  # mirrord-s-* subscription per topic, but a single env var can only carry
+  # one of those names - the last queue processed wins, and the app's own
+  # auto-provisioning then creates that name on the other topics itself,
+  # unfiltered and unowned.
+  queues:
+  - id: shared-topic-1
+    kind: azureServiceBus
+    appConfig:
+      subscription:
+      - env: SERVICEBUS_SERVICE_NAME
+        fallback: test-service
+      topic:
+      - env: dummy
+        fallback: test-topic
+  - id: shared-topic-2
+    kind: azureServiceBus
+    appConfig:
+      subscription:
+      - env: SERVICEBUS_SERVICE_NAME
+        fallback: test-service
+      topic:
+      - env: dummy
+        fallback: test-topic-2
+  # The mixed part: this topic's subscription resolves from its OWN env var,
+  # so it must get its OWN per-session subscription name, independent of the
+  # shared group above.
+  - id: own-topic-3
+    kind: azureServiceBus
+    appConfig:
+      subscription:
+      - env: SERVICEBUS_SUBSCRIPTION_1
+        fallback: test-sub-3
+      topic:
+      - env: dummy
+        fallback: test-topic-3

@@ -1,0 +1,53 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "mongo-real-target"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "mongo-real-subset",
+        "name": "sample_analytics",
+        "type": "mongodb",
+        "version": "7.0",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 300,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "copy": {
+          "mode": "subset",
+          "collections": {
+            "customers": {
+              "conditions": [
+                { "column": "username", "op": "eq", "value": "fmiller" }
+              ]
+            }
+          },
+          "relations": [
+            { "from": { "collection": "accounts", "field": "account_id" },
+              "to": { "collection": "customers", "field": "accounts" } },
+            { "from": { "collection": "transactions", "field": "account_id" },
+              "to": { "collection": "accounts", "field": "account_id" } }
+          ],
+          "limits": {
+            "max_total_rows": 100000,
+            "max_rows_per_table": 50000
+          }
+        }
+      }
+    ]
+  }
+}

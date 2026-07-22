@@ -36,6 +36,8 @@ vars:
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 includes:
+  lint:
+    taskfile: ./taskfiles/lint.yml
   cluster:
     taskfile: ./taskfiles/cluster.yml
   operator:
@@ -76,6 +78,10 @@ includes:
     taskfile: ./taskfiles/multicluster.yml
   preview:
     taskfile: ./taskfiles/preview.yml
+  kafka-demo:
+    taskfile: ./taskfiles/kafka-demo.yml
+  copytarget:
+    taskfile: ./taskfiles/copytarget.yml
 
 tasks:
   default:

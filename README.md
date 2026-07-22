@@ -54,6 +54,13 @@ task sqs:run:local                    # local consumer under mirrord
 task sqs:send:match MESSAGE="hi"      # -> your local session
 task sqs:send:nomatch                 # -> cluster consumer
 
+# Azure Service Bus multi-topic preview (real Azure; needs `az login`,
+# AZURE_SB_RG + AZURE_SB_NAMESPACE in .env, or pass CONN='Endpoint=sb://...')
+task servicebus:multi:deploy                        # deploy consumer + create secret from az
+task servicebus:multi:preview:start NAME=prev-1     # start preview, session key prev-1
+task servicebus:multi:send TOPIC=test-topic KEY=prev-1   # -> preview 'prev-1' (omit KEY -> cluster)
+task servicebus:multi:preview:stop NAME=prev-1      # stop the preview
+
 # database branching (same verbs for every DB module)
 task postgres:deploy
 task postgres:run:local               # creates a branch DB

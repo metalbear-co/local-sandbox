@@ -1,0 +1,36 @@
+{
+  "operator": true,
+  "multi_cluster": false,
+  "target": {
+    "path": "cronjob/pg-server-cronjob/container/app",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "copy_target": {
+      "enabled": true,
+      "scale_down": false
+    },
+    "db_branches": [
+      {
+        "id": "pg-cronjob-branch",
+        "name": "branch_db",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 90,
+        "connection": {
+          "url": "DATABASE_URL"
+        },
+        "copy": {
+          "mode": "all"
+        }
+      }
+    ]
+  }
+}
