@@ -15,17 +15,22 @@
     },
     "db_branches": [
       {
-        "id": "pg-dev-random-id101133",
-        "name": "my_database_name_etc",
+        "id": "pg-migrations-flyway-image",
+        "name": "migrations_branch",
         "type": "pg",
         "version": "17",
         "ttl_secs": 600,
-        "creation_timeout_secs": 90,
+        "creation_timeout_secs": 120,
         "connection": {
           "url": "DATABASE_URL"
         },
         "copy": {
-          "mode": "all"
+          "mode": "empty"
+        },
+        "migrations": {
+          "flavor": "flyway",
+          "image": "mirrord-flyway-baked:local",
+          "locations": ["filesystem:/flyway/sql-baked"]
         }
       }
     ]

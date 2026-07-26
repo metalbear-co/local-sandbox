@@ -1,0 +1,49 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "pg-server-env-val"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "pg-migrations-container",
+        "name": "migrations_branch",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "url": "DATABASE_URL"
+        },
+        "copy": {
+          "mode": "empty"
+        },
+        "migrations": {
+          "flavor": "container",
+          "image": "postgres:17",
+          "command": [
+            "sh",
+            "-c",
+            "for i in 1 2 3 4 5 6 7 8 9 10; do psql -c 'CREATE TABLE IF NOT EXISTS container_migrated (id INT, note TEXT)' && psql -c \"INSERT INTO container_migrated VALUES (1, 'created by container flavor')\" && exit 0; sleep 2; done; exit 1"
+          ],
+          "env": {
+            "PGHOST": "$(MIRRORD_DB_HOST)",
+            "PGPORT": "$(MIRRORD_DB_PORT)",
+            "PGUSER": "$(MIRRORD_DB_USER)",
+            "PGPASSWORD": "$(MIRRORD_DB_PASSWORD)",
+            "PGDATABASE": "$(MIRRORD_DB_NAME)"
+          }
+        }
+      }
+    ]
+  }
+}

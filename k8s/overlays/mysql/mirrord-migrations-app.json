@@ -1,0 +1,43 @@
+{
+  "operator": true,
+  "target": {
+    "path": "pod/server-env-val",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "db_branches": [
+      {
+        "id": "mysql-migrations-app",
+        "type": "mysql",
+        "version": "8.0",
+        "name": "teladoc_eds",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 180,
+        "connection": {
+          "params": {
+            "host": "MYSQL_HOST",
+            "port": "MYSQL_PORT",
+            "user": "MYSQL_USERNAME",
+            "password": "MYSQL_PASSWORD",
+            "database": "MYSQL_DATABASE"
+          }
+        },
+        "copy": {
+          "mode": "empty"
+        },
+        "migrations": {
+          "flavor": "container",
+          "image": "mirrord-demo-app:local",
+          {% if get_env(name="SNAPSHOT_JOB", default="false") == "true" %}
+          "command": ["config/db_snapshot.sh"],
+          {% else %}
+          "command": ["/home/app/config/db_setup.sh"],
+          {% endif %}
+          "env": {
+            "DATABASE_URL": "mysql2://$(MIRRORD_DB_USER):$(MIRRORD_DB_PASSWORD)@$(MIRRORD_DB_HOST):$(MIRRORD_DB_PORT)/$(MIRRORD_DB_NAME)"
+          }
+        }
+      }
+    ]
+  }
+}

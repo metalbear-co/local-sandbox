@@ -714,6 +714,23 @@ if [ "$SQS" = 1 ]; then
   else
     kubectl --context "$PRIMARY_CTX" -n "$NS" apply -f "$PROBE_DIR/split-config.yaml" >/dev/null
   fi
+
+  # Gate on the broadcast sync delivering the config to EVERY workload cluster before the
+  # preview starts. A replica whose split initializes before its cluster received the config
+  # fails with "no MirrordSplitConfig found" and fail-anywhere kills the whole preview - a
+  # race the 2-cluster topology hits reliably right after the fleet-mode bounce, because the
+  # default cluster's tmp-resources gate (which implicitly covered member sync in 3-cluster
+  # mode, where the default is itself a member) passes as fast as the primary's own split.
+  for c in "${WORKLOAD_CTXS[@]}"; do
+    synced=0; deadline=$(( $(date +%s) + 60 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      if kubectl --context "$c" -n "$NS" get mirrordsplitconfig combo-split-config >/dev/null 2>&1; then
+        synced=1; break
+      fi
+      sleep 2
+    done
+    [ "$synced" = 1 ] || { err "split config never synced to $c - replicas would fail their splits"; exit 1; }
+  done
 fi
 
 # ---------------------------------------------------------------------------

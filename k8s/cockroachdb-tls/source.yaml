@@ -1,0 +1,90 @@
+# mTLS-secured CockroachDB source for testing branch copies against a verify-full +
+# client-certificate database. Certs come from Secrets created by `task cockroachdb-tls:certs`.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cockroachdb-source
+  namespace: crdb-tls-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cockroachdb-source
+  template:
+    metadata:
+      labels:
+        app: cockroachdb-source
+    spec:
+      containers:
+        - name: cockroach
+          image: cockroachdb/cockroach:latest-v26.2
+          command: ["cockroach"]
+          args:
+            - start-single-node
+            - --certs-dir=/certs
+            - --listen-addr=0.0.0.0:26257
+            - --cache=256MiB
+            - --max-sql-memory=256MiB
+          ports:
+            - containerPort: 26257
+          volumeMounts:
+            - name: certs
+              mountPath: /certs
+      volumes:
+        - name: certs
+          secret:
+            secretName: crdb-node-certs
+            defaultMode: 0o400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cockroachdb-source
+  namespace: crdb-tls-test
+spec:
+  selector:
+    app: cockroachdb-source
+  ports:
+    - name: sql
+      port: 26257
+---
+# The mirrord target; its DATABASE_URL is what the branch copies from.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: cockroachdb-server-tls
+  namespace: crdb-tls-test
+  labels:
+    app: cockroachdb-server-tls
+spec:
+  containers:
+    - name: app
+      image: busybox:latest
+      command: ["sleep", "86400"]
+      env:
+        - name: DATABASE_URL
+          value: "postgresql://root@cockroachdb-source.crdb-tls-test.svc.cluster.local:26257/source_db?sslmode=verify-full"
+---
+# Source TLS settings for the branch copy; presence of this object turns TLS on.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: cockroachdb-source-tls
+  namespace: crdb-tls-test
+spec:
+  properties:
+    - name: tlsCaCert
+      valueFrom:
+        secretKeyRef:
+          name: crdb-client-certs
+          key: ca.crt
+    - name: tlsClientCert
+      valueFrom:
+        secretKeyRef:
+          name: crdb-client-certs
+          key: client.root.crt
+    - name: tlsClientKey
+      valueFrom:
+        secretKeyRef:
+          name: crdb-client-certs
+          key: client.root.key

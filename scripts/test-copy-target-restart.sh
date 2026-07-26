@@ -1,69 +1,50 @@
 #!/usr/bin/env bash
-# Proves the copy-target restart fix (operator: CopyState::mark_as_orphaned on
-# creator-session 404 during recovery), reconstructing the customer report:
-# Ctrl-C a copy_target+scale_down session, restart quickly, and the new run
-# either died with "no response received from agent connection during agent
-# version check" or came up without traffic, until the operator advertised a
-# stale copy target as Ready long after its session was gone.
+# Verifies the reworked copy-target lifecycle (staleness-driven, controller-owned
+# deletion, no owner refs, restart adoption). Traces every state change with
+# timestamps so you can watch what the operator does at each step.
 #
 # Scenarios (verdict each, exit code = number of failures):
 #
-#   1. cooldown-restart  - the customer flow: session up (traffic proven local),
-#                          Ctrl-C, wait RESTART_DELAY (default 40s, inside the
-#                          old zombie window), restart. Must come up serving
-#                          local traffic on a FRESH copy pod, with no
-#                          version-check error, and the deployment must scale
-#                          back up after the final Ctrl-C.
-#   2. orphan-recovery   - THE deterministic regression proof. The customer hit
-#                          a window where k8s GC lagged ~60s behind session
-#                          deletion; local clusters GC too fast to reproduce it
-#                          naturally, so we manufacture the lag by stripping the
-#                          copy pod's ownerReferences before Ctrl-C. The
-#                          operator's in-memory state expires ~30s later, the
-#                          pod controller re-recovers the pod from its
-#                          annotation, and the creator session 404s:
-#                            fixed operator  -> copy marked Failed, pod reaped
-#                                               within ~60s, next session gets a
-#                                               fresh copy
-#                            broken operator -> pod survives forever, copytarget
-#                                               stays Ready, next session REUSES
-#                                               the zombie (same pod name)
-#   3. immediate-restart - EXTENDED=1 only, informational (not counted): restart
-#                          ~2s after Ctrl-C. The old session is still lingering,
-#                          so the CLI reuses its copy target and the pod dies
-#                          under the new session once GC catches up. This gap is
-#                          CLI-side (retry-with-fresh-copy follow-up), not
-#                          covered by the operator fix.
+#   A. cleanup-after-stop - session up, Ctrl-C: the entry must leave
+#                           `copytargets` and the pod must be deleted by the
+#                           CONTROLLER within ~2min, deployment scaled back.
+#                           (COR-1680: no more stuck entries, no operator
+#                           restart needed.)
+#   B. quick-restart      - restart ~45s after Ctrl-C (after the session close,
+#                           before staleness): the new session must serve
+#                           traffic. Reusing the previous pod here is CORRECT
+#                           in the new design (nothing dooms the pod anymore) -
+#                           the script logs whether it reused or built fresh.
+#   C. fresh-copy-after-cleanup - restart long after staleness: must get a FRESH pod.
+#   D. pod-deleted-mid-session - delete the copy pod mid-session (COR-1680's literal
+#                           repro): entry goes Failed, then disappears from
+#                           status and memory on its own within ~2.5min.
+#   E. operator-restart   - INTERACTIVE (skipped when not a tty or
+#                           SKIP_RESTART=1): kill the client, then YOU restart
+#                           operator:dev; the new operator must adopt the
+#                           leftover pod and reap it. This is the InstanceId
+#                           gate removal working.
 #
-# Prereqs:
-#   - sandbox cluster up, operator deployed (task operator:use) or operator:dev
-#     running the fixed branch; whichever operator serves the sessions must stay
-#     up for the whole run
-#   - echo-app deployed in test-mirrord (auto-deployed unless SKIP_DEPLOY=1)
-#   - no other mirrord sessions targeting echo-app while this runs
+# Prereqs: cluster up, operator:dev running the reworked branch, echo-app
+# deployed (auto-deployed unless SKIP_DEPLOY=1), no other mirrord sessions
+# against echo-app.
 #
 # Usage:
 #   ./scripts/test-copy-target-restart.sh
-#   EXTENDED=1 ./scripts/test-copy-target-restart.sh
-#   RESTART_DELAY=90 ./scripts/test-copy-target-restart.sh
-#
-# To see the pre-fix behavior, run against a released operator
-# (task operator:use VERSION=3.166.0): scenario 2 fails there.
+#   SKIP_RESTART=1 ./scripts/test-copy-target-restart.sh   # skip scenario E
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 NS="test-mirrord"
-RESTART_DELAY="${RESTART_DELAY:-40}"
+IDLE_TTL=30          # spec default; staleness clock starts when the session closes
+SESSION_CLOSE=35     # observed operator-side session linger after client death
 READY_TIMEOUT=120
-ORPHAN_TIMEOUT=120
-SCALE_RESTORE_TIMEOUT=180
-LOGDIR="$(mktemp -d /tmp/copy-target-restart.XXXXXX)" || { echo "mktemp failed"; exit 1; }
+LOGDIR="$(mktemp -d /tmp/copy-target-lifecycle.XXXXXX)" || { echo "mktemp failed"; exit 1; }
 CONFIG="$LOGDIR/copy-target.json"
+TRACE="$LOGDIR/state-trace.log"
 FAILURES=0
-CUSTOMER_ERROR="no response received from agent connection during agent version check"
 
-# Session logs (mirrord CLI + local echo-app output) stream to $LOGDIR/session-*.log.
-echo "Session logs: $LOGDIR"
+echo "Session logs and state trace: $LOGDIR"
 
 # The sandbox keeps MIRRORD_BIN in .env (task reads it; plain shells do not).
 if [ -z "${MIRRORD_BIN:-}" ] && [ -f "$ROOT/.env" ]; then
@@ -86,11 +67,15 @@ cleanup() {
 }
 trap cleanup EXIT
 
+log() { # timestamped narrator line, also into the trace file
+  echo "[$(date +%H:%M:%S)] $*" | tee -a "$TRACE"
+}
+
 verdict() { # verdict <name> <0|1> <detail>
   if [ "$2" -eq 0 ]; then
-    echo "✅ $1: $3"
+    log "✅ $1: $3"
   else
-    echo "❌ $1: $3"
+    log "❌ $1: $3"
     FAILURES=$((FAILURES + 1))
   fi
 }
@@ -100,13 +85,22 @@ copy_pods() {
     | grep '^mirrord-copy-' || true
 }
 
-copytarget_phases() {
+newest_copy_pod() { # leftovers from earlier sessions may coexist; take the newest
+  kubectl get pods -n "$NS" --sort-by=.metadata.creationTimestamp -o name 2>/dev/null \
+    | grep mirrord-copy | tail -1 | cut -d/ -f2
+}
+
+copytargets() {
   kubectl get copytargets -n "$NS" \
     -o jsonpath='{range .items[*]}{.metadata.name}{"="}{.status.phase}{" "}{end}' 2>/dev/null || true
 }
 
 deploy_replicas() {
   kubectl get deploy echo-app -n "$NS" -o jsonpath='{.spec.replicas}' 2>/dev/null || echo "?"
+}
+
+snapshot() { # one trace line with the full observable state
+  log "   state: pods=[$(copy_pods | tr '\n' ' ')] copytargets=[$(copytargets)] replicas=$(deploy_replicas)"
 }
 
 cluster_curl() {
@@ -116,6 +110,7 @@ cluster_curl() {
 
 start_session() { # start_session <id>; sets SESSION_PID
   local id="$1"
+  log "starting session $id (mirrord exec, copy_target+scale_down)"
   CLUSTER_ID="local-$id" PORT=8080 \
     "$MIRRORD_BIN" exec -f "$CONFIG" -- "$LOCAL_APP" \
     >"$LOGDIR/session-$id.log" 2>&1 &
@@ -123,18 +118,20 @@ start_session() { # start_session <id>; sets SESSION_PID
   SESSION_PIDS+=("$SESSION_PID")
 }
 
-stop_session() { # stop_session <pid> - the Ctrl-C
-  # SIGTERM, not SIGINT: children started with & in a non-interactive shell
-  # ignore SIGINT (POSIX), so a scripted "Ctrl-C" must use TERM. The observable
-  # teardown is identical - the process dies without notifying the operator.
+stop_session() { # scripted Ctrl-C (TERM: &-children ignore INT in non-interactive shells)
+  log "killing the client (Ctrl-C equivalent)"
   kill -TERM "$1" 2>/dev/null || true
   wait "$1" 2>/dev/null || true
 }
 
 wait_for_local() { # wait_for_local <id> -> 0 when cluster traffic reaches local-<id>
-  local id="$1" deadline=$((SECONDS + READY_TIMEOUT))
+  local id="$1" deadline=$((SECONDS + READY_TIMEOUT)) reply
   while [ "$SECONDS" -lt "$deadline" ]; do
-    if cluster_curl | grep -q "\"cluster_id\":\"local-$id\""; then
+    reply="$(cluster_curl)"
+    if echo "$reply" | grep -q "\"cluster_id\":\"local-$id\""; then
+      # show the actual response: a request sent to the in-cluster service,
+      # answered by the LOCAL process (cluster_id proves who replied)
+      log "   traffic proof: request to echo-app.$NS answered by the local app: $(echo "$reply" | head -1 | cut -c1-140)"
       return 0
     fi
     sleep 3
@@ -142,35 +139,83 @@ wait_for_local() { # wait_for_local <id> -> 0 when cluster traffic reaches local
   return 1
 }
 
-# After the client dies the operator keeps its session OPEN ~35s awaiting a
-# reconnect. A same-identity session started while the old one is still open is
-# treated as a reconnect and rejected with 410 ReconnectNotPossible (the new
-# run's session key differs). Scenarios must wait for the old session to close
-# before starting the next one, or they fail on this unrelated quick-restart gap.
+# watch_until <what> <timeout_s> <check-fn> -> 0 on success; snapshots every poll
+watch_until() {
+  local what="$1" timeout="$2" check="$3" t0=$SECONDS
+  log "waiting for: $what (up to ${timeout}s)"
+  while [ $((SECONDS - t0)) -lt "$timeout" ]; do
+    if "$check"; then
+      log "   -> $what after $((SECONDS - t0))s"
+      return 0
+    fi
+    snapshot
+    sleep 10
+  done
+  log "   -> TIMEOUT (${timeout}s) waiting for: $what"
+  return 1
+}
+
+no_copy_pods() { [ -z "$(copy_pods)" ]; }
+no_copytargets() { [ -z "$(copytargets)" ]; }
+replicas_restored() { [ "$(deploy_replicas)" = "1" ]; }
+fully_clean() { no_copy_pods && no_copytargets && replicas_restored; }
+
+# A dead client's session lingers awaiting reconnect, and even a CLOSED session
+# CR blocks a new same-identity session (the operator finds the closed CR under
+# the same deterministic session id and answers 410 ReconnectNotPossible instead
+# of starting fresh - tracked as the quick-restart gap). Only the CR's deletion
+# unblocks, so wait until no session CR remains at all.
+session_crs() {
+  kubectl get mirrordclustersessions --no-headers 2>/dev/null | grep -c . || true
+}
+
 wait_reconnect_grace() {
-  echo "waiting for the previous session to close (reconnect grace, 45s)..."
-  sleep 45
+  local deadline=$((SECONDS + 180))
+  log "waiting until no session CR remains (reconnect grace + closed-CR cleanup)..."
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$(session_crs)" = "0" ]; then
+      log "   -> no session CRs"
+      sleep 5
+      return 0
+    fi
+    sleep 5
+  done
+  log "   -> WARN: session CRs still present after 180s; continuing anyway"
+}
+
+# brief <title>  (body from stdin): explains the upcoming scenario in the
+# terminal - the steps it will take and what the runner should look for -
+# then waits for Enter on a tty (NO_PAUSE=1 skips the pause).
+brief() {
+  echo ""
+  echo "┌─────────────────────────────────────────────────────────────────────"
+  echo "│ NEXT: $1"
+  echo "├─────────────────────────────────────────────────────────────────────"
+  sed 's/^/│ /'
+  echo "└─────────────────────────────────────────────────────────────────────"
+  if [ -t 0 ] && [ -z "${NO_PAUSE:-}" ]; then
+    read -rp ">>> Press Enter to run this scenario... "
+  fi
 }
 
 # ── preflight ────────────────────────────────────────────────────────────────
 kubectl cluster-info >/dev/null 2>&1 || { echo "cluster unreachable"; exit 1; }
 kubectl get apiservice v1.operator.metalbear.co >/dev/null 2>&1 \
-  || { echo "mirrord operator APIService missing (task operator:use)"; exit 1; }
+  || { echo "mirrord operator APIService missing"; exit 1; }
+pgrep -qf "target/debug/operator-service" \
+  || log "note: no operator:dev process - assuming the DEPLOYED operator runs the build under test"
 
 if ! kubectl get deploy echo-app -n "$NS" >/dev/null 2>&1; then
   [ -n "${SKIP_DEPLOY:-}" ] && { echo "echo-app missing and SKIP_DEPLOY set"; exit 1; }
-  echo "Deploying echo-app..."
+  log "deploying echo-app..."
   (cd "$ROOT" && task preview:deploy) || { echo "echo-app deploy failed"; exit 1; }
 fi
 
-# In-cluster prober: with scale_down the deployment is at 0, so requests must
-# originate inside the cluster to hit the copy pod's stolen port.
 if ! kubectl get deploy curl-client -n "$NS" >/dev/null 2>&1; then
   kubectl create deployment curl-client -n "$NS" --image=curlimages/curl -- sleep infinity
 fi
 kubectl wait --for=condition=available deploy/curl-client -n "$NS" --timeout=120s >/dev/null
 
-# Local process for the sessions: the echo-app itself, so responses prove who answered.
 LOCAL_APP="$LOGDIR/echo-app"
 if command -v go >/dev/null 2>&1; then
   (cd "$ROOT/apps/echo-app" && go build -o "$LOCAL_APP" .) || { echo "echo-app build failed"; exit 1; }
@@ -178,13 +223,6 @@ elif [ -x "$ROOT/apps/echo-app/echo-app" ]; then
   LOCAL_APP="$ROOT/apps/echo-app/echo-app"
 else
   echo "need go or a prebuilt apps/echo-app/echo-app binary"; exit 1
-fi
-
-# A leftover session may have the deployment scaled to 0 right now; a baseline
-# of 0 would make the scale-restore verdict vacuous. echo-app deploys with 1.
-ORIGINAL_REPLICAS="$(deploy_replicas)"
-if [ "$ORIGINAL_REPLICAS" = "0" ] || [ "$ORIGINAL_REPLICAS" = "?" ]; then
-  ORIGINAL_REPLICAS=1
 fi
 
 cat >"$CONFIG" <<EOF
@@ -203,146 +241,201 @@ EOF
 
 leftovers="$(copy_pods)"
 if [ -n "$leftovers" ]; then
-  echo "Deleting leftover copy pods from previous runs: $leftovers"
+  log "deleting leftover copy pods: $leftovers"
   echo "$leftovers" | xargs -n1 kubectl delete pod -n "$NS" --wait=false 2>/dev/null || true
+  kubectl scale deploy echo-app -n "$NS" --replicas=1 >/dev/null 2>&1 || true
   sleep 5
 fi
 
-# ── scenario 1: cooldown-restart (the customer flow) ─────────────────────────
-echo ""
-echo "── scenario 1: cooldown-restart (Ctrl-C, wait ${RESTART_DELAY}s, restart) ──"
-
-start_session 1; pid1=$SESSION_PID
-if wait_for_local 1; then
-  copy1="$(copy_pods | head -1)"
-  echo "session 1 serving locally via copy pod: $copy1 (replicas now: $(deploy_replicas))"
-  stop_session "$pid1"
-  echo "Ctrl-C sent; waiting ${RESTART_DELAY}s before restart..."
-  sleep "$RESTART_DELAY"
-
-  start_session 2; pid2=$SESSION_PID
-  if wait_for_local 2; then
-    copy2_all="$(copy_pods | tr '\n' ' ')"
-    if grep -q "$CUSTOMER_ERROR" "$LOGDIR/session-2.log"; then
-      verdict "cooldown-restart" 1 "restart hit the customer error: $CUSTOMER_ERROR"
-    elif [ -n "$copy1" ] && copy_pods | grep -qvx "$copy1"; then
-      verdict "cooldown-restart" 0 "restart serves local traffic on a fresh copy pod ($copy2_all)"
-    else
-      verdict "cooldown-restart" 1 "restart reused the old copy pod $copy1"
-    fi
+# ── scenario A: lifecycle-gc (COR-1680: nothing sticks, no restart needed) ───
+brief "scenario A: cleanup after a normal stop (COR-1680 core)" <<'EOF'
+Steps: start a session (copy_target+scale_down), confirm traffic reaches the
+local process, then stop the client (like Ctrl-C).
+What should happen after the stop:
+  ~35-50s  the operator notices the client is gone and closes the session
+  ~65-90s  the copy target disappears from the list AND the operator itself
+           deletes the copy pod (nothing else deletes it - this is the operator's job now)
+  <150s    echo-app is scaled back to 1 replica; everything is clean,
+           WITHOUT restarting the operator
+FAIL looks like: the copy target is still listed after ~2min (the old
+stuck-forever bug).
+EOF
+log ""
+log "── scenario A: cleanup after a normal stop ──"
+start_session A; pidA=$SESSION_PID
+if wait_for_local A; then
+  podA="$(newest_copy_pod)"
+  log "session A serving locally via $podA"; snapshot
+  stop_session "$pidA"
+  # session closes ~35s after the kill, staleness idle_ttl later; controller
+  # deletes the pod and the status hides the entry; memory entry removed
+  # ~60s after that. End-to-end budget: generous 150s.
+  if watch_until "entry gone from copytargets AND pod deleted AND replicas restored" 150 fully_clean; then
+    verdict "cleanup-after-stop" 0 "copy fully cleaned up by the operator alone (no restart)"
   else
-    tail -5 "$LOGDIR/session-2.log"
-    verdict "cooldown-restart" 1 "restarted session never served local traffic (see session-2.log)"
+    snapshot
+    verdict "cleanup-after-stop" 1 "something is stuck: pods=[$(copy_pods | tr '\n' ' ')] copytargets=[$(copytargets)] replicas=$(deploy_replicas)"
   fi
-  stop_session "${pid2:-}"
-
-  deadline=$((SECONDS + SCALE_RESTORE_TIMEOUT))
-  restored=1
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    [ "$(deploy_replicas)" = "$ORIGINAL_REPLICAS" ] && { restored=0; break; }
-    sleep 5
-  done
-  verdict "scale-restore" "$restored" \
-    "deployment back to $ORIGINAL_REPLICAS replicas after the last Ctrl-C (now: $(deploy_replicas))"
 else
-  tail -5 "$LOGDIR/session-1.log"
-  verdict "cooldown-restart" 1 "baseline session never served local traffic (see session-1.log)"
-  stop_session "$pid1"
+  tail -5 "$LOGDIR/session-A.log" | tee -a "$TRACE"
+  verdict "cleanup-after-stop" 1 "baseline session never served local traffic (see session-A.log)"
+  stop_session "$pidA"
 fi
 
-# ── scenario 2: orphan-recovery (deterministic proof of the operator fix) ────
-echo ""
-echo "── scenario 2: orphan-recovery (manufactured GC lag) ──"
-
+# ── scenario B: reuse-window (restart between session close and staleness) ──
+brief "scenario B: quick restart (before the old copy times out)" <<'EOF'
+Steps: session up, stop the client, start again 45s later - after the session
+closed but before the old copy's unused-timeout runs out. In the new design it
+is OK for the new session to pick up the previous copy pod (it is healthy and
+nothing will delete it under us anymore).
+One of three outcomes is fine:
+  SAME pod picked up + traffic works    -> best case
+  NEW pod built + traffic works         -> timing ran past the timeout, also fine
+  410 "failed to reconnect"             -> the KNOWN quick-restart problem
+                                           (separate ticket, session handling,
+                                           not this PR) - logged as pass-with-note
+FAIL looks like: any other error, or traffic never works again.
+EOF
+log ""
+log "── scenario B: quick restart ──"
 wait_reconnect_grace
-start_session 3; pid3=$SESSION_PID
-if wait_for_local 3; then
-  copy3="$(copy_pods | head -1)"
-  echo "session 3 serving locally via copy pod: $copy3"
-
-  # Manufacture the customer's GC lag: without owner references, deleting the
-  # session CR no longer deletes the pod, exactly like slow GC left it alive.
-  kubectl patch pod "$copy3" -n "$NS" --type=json \
-    -p '[{"op":"remove","path":"/metadata/ownerReferences"}]' >/dev/null
-  stop_session "$pid3"
-  echo "Ctrl-C sent; waiting for the operator to expire, re-recover, and reap the orphan..."
-
-  deadline=$((SECONDS + ORPHAN_TIMEOUT))
-  reaped=1
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    if ! copy_pods | grep -qx "$copy3"; then reaped=0; break; fi
-    sleep 5
-  done
-
-  if [ "$reaped" -eq 0 ]; then
-    verdict "orphan-reaped" 0 "zombie copy pod $copy3 deleted within ${ORPHAN_TIMEOUT}s"
-  else
-    verdict "orphan-reaped" 1 \
-      "zombie copy pod $copy3 still alive after ${ORPHAN_TIMEOUT}s (copytargets: $(copytarget_phases)) - operator lacks the orphan fix"
-    kubectl delete pod "$copy3" -n "$NS" --wait=false 2>/dev/null || true
-  fi
-
-  # Best-effort log probe; absent when the operator runs via operator:dev
-  # (its logs stream to that terminal, not to kubectl).
-  if kubectl logs -n mirrord deploy/mirrord-operator --since=5m 2>/dev/null \
-    | grep -q "no longer exists"; then
-    echo "   operator log confirms: creator session gone -> copy target failed"
-  fi
-
-  start_session 4; pid4=$SESSION_PID
-  if wait_for_local 4; then
-    if copy_pods | grep -qx "$copy3"; then
-      verdict "fresh-after-orphan" 1 "new session reused the zombie pod $copy3"
+start_session B1; pidB1=$SESSION_PID
+if wait_for_local B1; then
+  podB1="$(newest_copy_pod)"
+  log "session B1 serving via $podB1"
+  stop_session "$pidB1"
+  log "starting again in 45s - after the session closed, before the old copy times out"
+  sleep 45
+  start_session B2; pidB2=$SESSION_PID
+  if wait_for_local B2; then
+    podB2="$(newest_copy_pod)"
+    if [ "$podB2" = "$podB1" ]; then
+      verdict "quick-restart" 0 "picked up the same pod $podB1 and traffic works (allowed in the new design)"
     else
-      verdict "fresh-after-orphan" 0 "new session got a fresh copy pod ($(copy_pods | tr '\n' ' '))"
+      verdict "quick-restart" 0 "built a new pod $podB2 and traffic works (also fine - timing)"
     fi
+  elif grep -qE "failed to reconnect|ReconnectNotPossible" "$LOGDIR/session-B2.log"; then
+    # The CLI used to send the old session's id when reusing a copy, and the
+    # operator refused to "reconnect" to a closed session. Fixed in mirrord OSS
+    # (reused copies connect as a NEW session) - a 410 here means MIRRORD_BIN is
+    # built without that fix.
+    verdict "quick-restart" 1 "410 on quick restart - rebuild the mirrord CLI with the reused-copy session fix (MIRRORD_BIN=$MIRRORD_BIN)"
   else
-    tail -5 "$LOGDIR/session-4.log"
-    verdict "fresh-after-orphan" 1 "session after orphan never served local traffic (see session-4.log)"
+    tail -5 "$LOGDIR/session-B2.log" | tee -a "$TRACE"
+    verdict "quick-restart" 1 "restart never got traffic working again"
   fi
-  stop_session "${pid4:-}"
+  stop_session "${pidB2:-}"
 else
-  tail -5 "$LOGDIR/session-3.log"
-  verdict "orphan-reaped" 1 "baseline session never served local traffic (see session-3.log)"
-  stop_session "$pid3"
+  tail -5 "$LOGDIR/session-B1.log" | tee -a "$TRACE"
+  verdict "quick-restart" 1 "baseline session never served local traffic"
+  stop_session "$pidB1"
 fi
 
-# ── scenario 3 (EXTENDED): immediate-restart, informational only ─────────────
-if [ -n "${EXTENDED:-}" ]; then
-  echo ""
-  echo "── scenario 3 (informational): immediate restart, known CLI-side gap ──"
-  start_session 5; pid5=$SESSION_PID
-  if wait_for_local 5; then
-    copy5="$(copy_pods | head -1)"
-    stop_session "$pid5"
-    sleep 2
-    start_session 6; pid6=$SESSION_PID
-    if wait_for_local 6; then
-      if copy_pods | grep -qx "$copy5"; then
-        echo "ℹ️  immediate restart REUSED $copy5 (doomed once the old session is GC'd)"
-        sleep 45
-        if copy_pods | grep -qx "$copy5"; then
-          echo "ℹ️  ...and the pod is still alive 45s in"
-        else
-          echo "ℹ️  ...and the pod died under the new session, as predicted (CLI follow-up needed)"
-        fi
-      else
-        echo "ℹ️  immediate restart got a fresh copy pod (GC beat the reuse window on this cluster)"
-      fi
-    else
-      if grep -q "$CUSTOMER_ERROR" "$LOGDIR/session-6.log"; then
-        echo "ℹ️  immediate restart hit the customer error (CLI follow-up needed)"
-      else
-        echo "ℹ️  immediate restart never served local traffic (see session-6.log)"
-      fi
-    fi
-    stop_session "${pid6:-}"
+# ── scenario C: fresh-after-stale ────────────────────────────────────────────
+brief "scenario C: restart after full cleanup" <<'EOF'
+Steps: wait until the previous copy is completely cleaned up (unlisted and
+pod deleted), then start a new session.
+What should happen: a copy pod with a NEW name is created and traffic works.
+FAIL looks like: the old pod name showing up again after it was cleaned up.
+EOF
+log ""
+log "── scenario C: restart after full cleanup ──"
+lastpod="$(newest_copy_pod)"
+log "waiting until the previous copy (${lastpod:-none}) is fully cleaned up..."
+watch_until "previous copy cleaned up" 150 fully_clean || true
+start_session C; pidC=$SESSION_PID
+if wait_for_local C; then
+  podC="$(newest_copy_pod)"
+  if [ -n "$lastpod" ] && [ "$podC" = "$lastpod" ]; then
+    verdict "fresh-copy-after-cleanup" 1 "restart after cleanup picked up the OLD pod $lastpod - should be impossible"
   else
-    echo "ℹ️  baseline for immediate-restart never came up; skipping"
-    stop_session "$pid5"
+    verdict "fresh-copy-after-cleanup" 0 "restart after cleanup built a new pod ($podC)"
   fi
+else
+  tail -5 "$LOGDIR/session-C.log" | tee -a "$TRACE"
+  verdict "fresh-copy-after-cleanup" 1 "session never served local traffic"
+fi
+stop_session "${pidC:-}"
+
+# ── scenario D: pod deleted mid-session (COR-1680 literal repro) ─────────────
+brief "scenario D: copy pod deleted while the session runs (COR-1680 repro)" <<'EOF'
+Steps: session up and serving, then the script DELETES the copy pod while the
+session is still using it (the exact steps from the customer ticket).
+What should happen:
+  - the copy target shows as Failed ("copied pod is being deleted")
+  - the client errors out (expected - its pod is gone)
+  - after the session closes, the Failed copy target disappears from the list
+    on its own; everything clean well under 3min, WITHOUT restarting the operator
+FAIL looks like: the Failed copy target still listed after ~3min (the customer
+had it stuck for 14h and only an operator restart cleared it).
+EOF
+log ""
+log "── scenario D: copy pod deleted mid-session ──"
+wait_reconnect_grace
+start_session D; pidD=$SESSION_PID
+if wait_for_local D; then
+  podD="$(newest_copy_pod)"
+  log "deleting the copy pod $podD out from under the live session"
+  kubectl delete pod "$podD" -n "$NS" --wait=false >/dev/null
+  # the client is expected to die; what we assert is the OPERATOR's cleanup
+  if watch_until "Failed entry aged out of copytargets, everything clean" 180 fully_clean; then
+    verdict "pod-deleted-mid-session" 0 "Failed copy target cleaned up on its own, no operator restart (COR-1680)"
+  else
+    snapshot
+    verdict "pod-deleted-mid-session" 1 "copy target still stuck after pod deletion: copytargets=[$(copytargets)]"
+  fi
+  log "client outcome (expected to error out): $(tail -2 "$LOGDIR/session-D.log" | head -1 | cut -c1-120)"
+else
+  tail -5 "$LOGDIR/session-D.log" | tee -a "$TRACE"
+  verdict "pod-deleted-mid-session" 1 "baseline session never served local traffic"
+fi
+stop_session "${pidD:-}" 2>/dev/null || true
+
+# ── scenario E: restart-adoption (interactive) ───────────────────────────────
+if [ -t 0 ] && [ -z "${SKIP_RESTART:-}" ]; then
+  brief "scenario E: operator restart with a leftover copy pod (interactive)" <<'EOF'
+Steps: session up, stop the client, then the script asks YOU to restart the
+operator (deployed image: kubectl rollout restart deploy/mirrord-operator
+-n mirrord; operator:dev: Ctrl-C it and rerun task operator:dev).
+What should happen after the restart:
+  - operator log shows "Recovering CopyTarget ..." - the new operator finds
+    the leftover pod and takes it over (the old code ignored such pods forever)
+  - since no session uses it, the new operator deletes it; clean within ~3min
+FAIL looks like: the pod still Running 3min after the restart - that is the
+old leak (we saw one live 11 hours on the previous code).
+EOF
+  log ""
+  log "── scenario E: operator restart with a leftover pod ──"
+  wait_reconnect_grace
+  start_session E; pidE=$SESSION_PID
+  if wait_for_local E; then
+    podE="$(newest_copy_pod)"
+    log "session E serving via $podE"
+    stop_session "$pidE"
+    echo ""
+    echo ">>> ACTION REQUIRED: restart the operator NOW."
+    echo ">>>   deployed image:  kubectl rollout restart deploy/mirrord-operator -n mirrord"
+    echo ">>>   operator:dev:    Ctrl-C it and rerun 'task operator:dev'"
+    echo ">>> Press Enter here once it is back up..."
+    read -r
+    log "operator restarted by user; the new process must ADOPT $podE and reap it"
+    if watch_until "leftover pod $podE deleted by the restarted operator" 180 fully_clean; then
+      verdict "operator-restart" 0 "restarted operator found the leftover pod and deleted it"
+    else
+      snapshot
+      verdict "operator-restart" 1 "pod survived the operator restart - the new operator never took it over"
+      kubectl delete pod "$podE" -n "$NS" --wait=false 2>/dev/null || true
+    fi
+  else
+    tail -5 "$LOGDIR/session-E.log" | tee -a "$TRACE"
+    verdict "operator-restart" 1 "baseline session never served local traffic"
+    stop_session "$pidE"
+  fi
+else
+  log ""
+  log "scenario E (operator restart) skipped: interactive tty required (or SKIP_RESTART=1 set)"
 fi
 
-echo ""
-echo "Failures: $FAILURES (logs in $LOGDIR)"
+log ""
+log "Failures: $FAILURES  (full trace: $TRACE)"
 exit "$FAILURES"

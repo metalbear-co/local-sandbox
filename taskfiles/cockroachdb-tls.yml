@@ -1,0 +1,68 @@
+version: "3"
+
+# CockroachDB branching against an mTLS-secured source (verify-full + client certs).
+#
+#   task cockroachdb-tls:certs        generate CA/node/client certs (cockroach cert, via docker)
+#   task cockroachdb-tls:deploy       secure source + seed + target + MirrordPropertyList
+#   task cockroachdb-tls:run:local    create a branch under mirrord; copy goes through mTLS
+#   task cockroachdb-tls:verify       query the branch for the copied rows
+#   task cockroachdb-tls:clean        tear everything down
+#
+# The dump init container gets the client certs through the `cockroachdb-source-tls`
+# MirrordPropertyList (k8s/cockroachdb-tls/source.yaml); without it the copy fails with
+# `x509: certificate signed by unknown authority` - which is itself a useful negative test:
+# delete the property list and rerun run:local to see the failure mode.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: crdb-tls-test
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  CRDB_IMAGE: cockroachdb/cockroach:latest-v26.2
+  TLS_DIR: '{{.ROOT_DIR}}/k8s/cockroachdb-tls'
+  CERTS_DIR: '{{.ROOT_DIR}}/k8s/cockroachdb-tls/.certs'
+
+tasks:
+  certs:
+    desc: Generate CA, node, and root client certs with cockroach's own tooling
+    cmds:
+      - mkdir -p {{.CERTS_DIR}}
+      - docker run --rm -v {{.CERTS_DIR}}:/certs --entrypoint cockroach {{.CRDB_IMAGE}} cert create-ca --certs-dir=/certs --ca-key=/certs/ca.key --overwrite
+      - docker run --rm -v {{.CERTS_DIR}}:/certs --entrypoint cockroach {{.CRDB_IMAGE}} cert create-node cockroachdb-source cockroachdb-source.{{.NAMESPACE}}.svc.cluster.local localhost 127.0.0.1 --certs-dir=/certs --ca-key=/certs/ca.key --overwrite
+      - docker run --rm -v {{.CERTS_DIR}}:/certs --entrypoint cockroach {{.CRDB_IMAGE}} cert create-client root --certs-dir=/certs --ca-key=/certs/ca.key --overwrite
+
+  deploy:
+    desc: Deploy the mTLS source, seed it, and install the property list
+    deps: [certs]
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl -n {{.NAMESPACE}} create secret generic crdb-node-certs --from-file=ca.crt={{.CERTS_DIR}}/ca.crt --from-file=node.crt={{.CERTS_DIR}}/node.crt --from-file=node.key={{.CERTS_DIR}}/node.key --from-file=client.root.crt={{.CERTS_DIR}}/client.root.crt --from-file=client.root.key={{.CERTS_DIR}}/client.root.key --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl -n {{.NAMESPACE}} create secret generic crdb-client-certs --from-file=ca.crt={{.CERTS_DIR}}/ca.crt --from-file=client.root.crt={{.CERTS_DIR}}/client.root.crt --from-file=client.root.key={{.CERTS_DIR}}/client.root.key --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -f {{.TLS_DIR}}/source.yaml
+      - kubectl -n {{.NAMESPACE}} rollout status deployment/cockroachdb-source --timeout=180s
+      - kubectl -n {{.NAMESPACE}} wait --for=condition=Ready pod/cockroachdb-server-tls --timeout=120s
+      - task: seed
+
+  seed:
+    desc: Create source_db with three rows (idempotent)
+    cmds:
+      - kubectl -n {{.NAMESPACE}} exec deploy/cockroachdb-source -- cockroach sql --certs-dir=/certs -e "CREATE DATABASE IF NOT EXISTS source_db; CREATE TABLE IF NOT EXISTS source_db.events (id INT8 PRIMARY KEY, name STRING); UPSERT INTO source_db.events VALUES (1,'alice'),(2,'bob'),(3,'carol'); SELECT count(*) FROM source_db.events"
+
+  run:local:
+    desc: Run a query loop under mirrord; branch creation copies through mTLS
+    cmds:
+      # any process works as the "app" here; psql-compatible check of the branch rows.
+      # DATABASE_URL is rewritten to the branch (sslmode=disable) by the operator.
+      - cd {{.ROOT_DIR}}/apps/cockroach-app && {{.MIRRORD_BIN}} exec -f {{.TLS_DIR}}/mirrord.json -- go run .
+
+  verify:
+    desc: Show the branch pod and its dump container logs (mTLS connection evidence)
+    cmds:
+      - kubectl -n {{.NAMESPACE}} get pods -l db-owner-name
+      - kubectl -n {{.NAMESPACE}} logs -l db-owner-name -c cockroachdb-branch-init --tail=20
+
+  clean:
+    desc: Tear down the namespace and generated certs
+    cmds:
+      - kubectl delete namespace {{.NAMESPACE}} --ignore-not-found
+      - rm -rf {{.CERTS_DIR}}
