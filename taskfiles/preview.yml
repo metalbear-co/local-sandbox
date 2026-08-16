@@ -15,6 +15,8 @@ version: "3"
 #   task preview:pattern:mixed:start  start a preview mixing pattern params (2 vars, 2 formats) with plain-variable params
 #   task preview:pattern:mixed:verify trace both pattern vars (Secret) and the plain-var overrides (literal env) side by side
 #   task preview:test:pattern:mixed   end-to-end: mixed:start then mixed:verify
+#   task preview:share:verify         check share-host minting + that the baggage header steals to the preview
+#   task preview:test:share           end-to-end: start a CUSTOM-filter preview, then share:verify
 #   task preview:idle:start           start a preview that auto-idles after 30s without traffic
 #   task preview:idle:start-idle      start a preview with ZERO pods from creation (start_idle)
 #   task preview:idle:watch           live phase + replicas view of an idle-capable preview
@@ -499,6 +501,104 @@ tasks:
     desc: Remove the mixed pattern-demo target (deployment, service)
     cmds:
       - kubectl delete deploy/echo-app-pattern-mixed svc/echo-app-pattern-mixed -n {{.NAMESPACE}} --ignore-not-found=true
+
+  share:verify:
+    desc: Verify share-host minting and that the injected baggage header steals to the preview, whatever the session's own filter
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-share"}}'
+    cmds:
+      # The session's own filter is `X-Preview: <key>` (mirrord-preview-single.json) - a
+      # CUSTOM filter, not the default key-derived baggage one. Three routing checks, each
+      # identifying the answering pod via /info's hostname (preview pods are named
+      # <session>-*, the original app's pods echo-app-*):
+      #   1. no header            -> original app (control)
+      #   2. baggage header       -> MUST reach the preview: only the baggage arm the
+      #                              operator adds at subscribe time can match it
+      #   3. X-Preview header     -> preview (the user's own filter survived the composition)
+      - |
+        set -uo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "no preview session found for key '{{.PREVIEW_KEY}}' - run 'task preview:test:share' or 'task preview:start PREVIEW_KEY={{.PREVIEW_KEY}}' first"
+          exit 1
+        fi
+        PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+        echo "preview session: $SESSION (phase: $PHASE, custom filter: X-Preview: {{.PREVIEW_KEY}})"
+        echo
+
+        FAILED=0
+
+        echo "==> [1/4] share host minted on the session status?"
+        SHARE_HOST=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.shareHost}')
+        if [ -n "$SHARE_HOST" ]; then
+          echo "    PASS: shareHost = $SHARE_HOST"
+        else
+          echo "    FAIL: no shareHost on the session."
+          echo "          An operator without the fix only mints one for the DEFAULT baggage filter,"
+          echo "          so this custom-filter session silently gets none. (Also check the operator"
+          echo "          has OPERATOR_SHARE_INGRESS_SHARE_DOMAIN set - operator-dev.yaml sets it.)"
+          FAILED=1
+        fi
+        echo
+
+        fetch_hostname() {
+          kubectl exec -n {{.NAMESPACE}} deploy/echo-app -- \
+            wget -q -O- -T 30 "$@" http://echo-app:8080/info 2>/dev/null \
+            | grep -o '"hostname":"[^"]*"' | cut -d'"' -f4
+        }
+
+        echo "==> [2/4] control: request with NO header -> the original app must answer"
+        HOST_PLAIN=$(fetch_hostname)
+        echo "    answered by: ${HOST_PLAIN:-<no response>}"
+        case "$HOST_PLAIN" in
+          "$SESSION"-*) echo "    FAIL: the preview answered unfiltered traffic?!"; FAILED=1 ;;
+          "") echo "    FAIL: no response from the target"; FAILED=1 ;;
+          *) echo "    PASS" ;;
+        esac
+        echo
+
+        echo "==> [3/4] baggage header (what share-ingress injects) -> the PREVIEW must answer"
+        HOST_BAGGAGE=$(fetch_hostname --header="baggage: mirrord-session={{.PREVIEW_KEY}}")
+        echo "    answered by: ${HOST_BAGGAGE:-<no response>}"
+        case "$HOST_BAGGAGE" in
+          "$SESSION"-*) echo "    PASS: stolen by the operator-added baggage filter arm" ;;
+          *) echo "    FAIL: answered by the ORIGINAL app - the session's custom filter doesn't"
+             echo "          match the baggage header and no baggage arm was added. This is the"
+             echo "          bug: a share link for this preview would show the original app."
+             FAILED=1 ;;
+        esac
+        echo
+
+        echo "==> [4/4] the session's own X-Preview filter -> the PREVIEW must still answer"
+        HOST_CUSTOM=$(fetch_hostname --header="X-Preview: {{.PREVIEW_KEY}}")
+        echo "    answered by: ${HOST_CUSTOM:-<no response>}"
+        case "$HOST_CUSTOM" in
+          "$SESSION"-*) echo "    PASS: the user's filter survived the composition" ;;
+          *) echo "    FAIL: the user's own filter stopped stealing"; FAILED=1 ;;
+        esac
+        echo
+
+        if [ "$FAILED" = "0" ]; then
+          echo "All share checks passed: host minted, baggage arm steals, user filter intact."
+        else
+          echo "Share checks FAILED (expected on an operator without the share-filter-arm fix)."
+        fi
+        exit "$FAILED"
+
+  test:share:
+    desc: End-to-end - start a preview with a CUSTOM filter and verify share minting + routing (needs the target deployed)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-share"}}'
+    cmds:
+      - task: start
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - task: share:verify
+        vars: { PREVIEW_KEY: '{{.PREVIEW_KEY}}' }
+      - |
+        echo
+        echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
 
   idle:start:
     desc: Start a preview that scales to zero after 30s without traffic (wake it with preview:idle:wake)

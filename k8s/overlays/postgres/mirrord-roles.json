@@ -2,7 +2,7 @@
   "operator": true,
   "target": {
     "path": {
-      "deployment": "pg-server-roles"
+      "pod": "pg-server-roles"
     },
     "namespace": "test-mirrord"
   },
@@ -15,20 +15,24 @@
     },
     "db_branches": [
       {
-        "id": "roles-branch-test",
-        "name": "roles_branch_db",
+        "id": "pg-roles-branch-{{ key }}",
+        "name": "source_db",
         "type": "pg",
         "version": "17",
         "ttl_secs": 600,
         "creation_timeout_secs": 90,
         "connection": {
-          "url": {
-            "type": "env",
-            "variable": "DATABASE_URL"
+          "type": "env",
+          "params": {
+            "host": "DB_HOST",
+            "port": "DB_PORT",
+            "user": "DB_USER",
+            "password": "DB_PASSWORD",
+            "database": "DB_NAME"
           }
         },
         "copy": {
-          "mode": "schema"
+          "mode": "all"
         }
       }
     ]

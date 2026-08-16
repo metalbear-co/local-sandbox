@@ -44,6 +44,8 @@ includes:
     taskfile: ./taskfiles/operator.yml
   mirrord:
     taskfile: ./taskfiles/mirrord.yml
+  ipv6:
+    taskfile: ./taskfiles/ipv6.yml
   sqs:
     taskfile: ./taskfiles/sqs.yml
   kafka:
@@ -90,6 +92,8 @@ includes:
     taskfile: ./taskfiles/lease.yml
   op:
     taskfile: ./taskfiles/op.yml
+  linkerd-repro:
+    taskfile: ./taskfiles/linkerd-repro.yml
 
 tasks:
   default:
@@ -124,6 +128,14 @@ tasks:
           task postgres:query:branch QUERY="SELECT count(*) FROM users;"
           task postgres:shell:branch        interactive shell into the branch
           task postgres:branches / logs / status / clean
+
+        postgres roles & credentials (dbPod.roles empty/full):
+
+          task postgres:roles:deploy        source DB + seeded roles + params target
+          task postgres:roles:full          switch local operator to full role fidelity
+          task postgres:run:local:roles     app connects as its real role (watch "Session identity")
+          task postgres:roles:login         log into the branch as app_user (real password)
+          task postgres:roles:probe         grant/denial/SET ROLE probes on the branch
 
         multicluster (2 local clusters + real Azure Service Bus topics):
 

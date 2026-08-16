@@ -1641,8 +1641,8 @@ tasks:
           kubectl --context "$CTX" -n test-multicluster get previewsessions -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,REPLICA:.metadata.labels.operator\.metalbear\.co/preview-replica' 2>/dev/null | sed 's/^/  /' || echo "  none"
           echo "replica pods:"
           kubectl --context "$CTX" -n test-multicluster get pods -l preview.metalbear.co/session-uid,app=combo-app --no-headers 2>/dev/null | sed 's/^/  /' || echo "  none"
-          echo "branch proxy (remote clusters only):"
-          kubectl --context "$CTX" -n test-multicluster get deploy 2>/dev/null | grep -- "-brdb-" | sed 's/^/  /' || echo "  (none - default cluster reaches the branch by pod IP)"
+          echo "DB sidecar TLS secrets (remote clusters only):"
+          kubectl --context "$CTX" -n test-multicluster get secret 2>/dev/null | grep -- "-db-sidecar-tls" | sed 's/^/  /' || echo "  (none - default cluster reaches the branch by pod IP)"
           echo ""
         done
         echo "=== queue splits (primary aggregates all clusters) ==="

@@ -7,6 +7,7 @@ version: "3"
 #   task migrations:image:build             build + load the baked-SQL flyway image into minikube
 #   task migrations:flyway:image:run        flyway with IN-IMAGE sql (locations, nothing uploaded)
 #   task migrations:container:run           container flavor: postgres:17 image runs psql via MIRRORD_DB_* env
+#   task migrations:badimage:run            INT-539 repro: unpullable migration image (old operator hangs, fixed one fails fast)
 #   task migrations:status                  branch CRDs, migration jobs, latest job logs
 #   task migrations:verify                  query the branch for the tables the migrations created
 #   task migrations:clean                   delete the branches these tasks created
@@ -28,7 +29,7 @@ vars:
   FLYWAY_BAKED_IMAGE: '{{.FLYWAY_BAKED_IMAGE | default "mirrord-flyway-baked:local"}}'
   OVERLAY_DIR: '{{.ROOT_DIR}}/k8s/overlays/postgres'
   APP_IMAGE: '{{.APP_IMAGE | default "mirrord-demo-app:local"}}'
-  BRANCH_IDS: "pg-migrations-flyway-local pg-migrations-flyway-image pg-migrations-container mysql-migrations-app"
+  BRANCH_IDS: "pg-migrations-flyway-local pg-migrations-flyway-image pg-migrations-container pg-migrations-badimage mysql-migrations-app"
 
 tasks:
   deploy:
@@ -73,6 +74,32 @@ tasks:
     cmds:
       - task: _run
         vars: { CONFIG: "{{.OVERLAY_DIR}}/mirrord-migrations-container.json" }
+
+  badimage:run:
+    desc: 'INT-539 repro: migrations with an unpullable image (old operator hangs then bare timeout; fixed one fails fast; Ctrl-C to stop)'
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      CONFIG: '{{.OVERLAY_DIR}}/mirrord-migrations-badimage.json'
+    preconditions:
+      - sh: test -f {{.CONFIG}}
+        msg: "mirrord config not found at {{.CONFIG}}"
+    cmds:
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        echo "The migration image in the config is unpullable on purpose. Expected:"
+        echo "  operator WITHOUT the INT-539 fix -> 'waiting for readiness' hangs the whole creation_timeout_secs (120s), then a bare timeout error"
+        echo "  operator WITH the fix           -> fails within seconds: branch Failed with the ImagePullBackOff reason"
+        echo ""
+        if {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- sh -c 'echo "UNEXPECTED: session started - the branch should have failed"'; then
+          exit 1
+        fi
+        echo ""
+        echo "Session failed as expected. See the branch status.error: task migrations:status"
+        echo "Delete the failed branch before rerunning: task migrations:clean"
 
   _run:
     internal: true
@@ -166,7 +193,7 @@ tasks:
       - |
         echo "== BranchDatabase CRDs =="
         kubectl get branchdatabases.dbs.mirrord.metalbear.co -n {{.NAMESPACE}} \
-          -o custom-columns='NAME:.metadata.name,ID:.spec.id,PHASE:.status.phase,MIGRATIONS:.status.migrations.phase,MIG_GEN:.status.migrations.observedGeneration' \
+          -o custom-columns='NAME:.metadata.name,ID:.spec.id,PHASE:.status.phase,MIGRATIONS:.status.migrations.phase,MIG_GEN:.status.migrations.observedGeneration,ERROR:.status.error' \
           2>/dev/null || echo "  none"
         echo ""
         echo "== Migration jobs =="

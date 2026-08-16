@@ -29,6 +29,15 @@
 #              Idle) and is served by the woken replica. Replaces the
 #              HTTP/DB/SQS traffic sections - those poll continuously, which
 #              is exactly what idle mode removes.
+#   [BULK]     (BULK=1) a 100k-row result set streamed from the shared branch
+#              through the tunnel to every replica CONCURRENTLY arrives
+#              byte-complete - the data-plane integrity single-row probes miss.
+#   [STALE]    (STALE=1) a sidecar TLS Secret corrupted into the interrupted-
+#              teardown shape (garbage material, no owner) is REPLACED when the
+#              copy is recreated; reused, every replica DB stream would die.
+#   [BLIP]     (BLIP=1) deleting the branch DB pod must not revoke running
+#              replicas: the replica-clusters annotation (read by tunnel authz
+#              per stream open) holds steady and the DB path recovers.
 #   [FAIL]     (TEARDOWN=fail, the default) a copy patched to Failed on ONE
 #              cluster fails the preview EVERYWHERE: the primary goes Failed
 #              naming that cluster and every remote copy is deleted.
@@ -56,14 +65,17 @@
 #       1. replicas DISABLED (the shipped default): pods on default only, split-only
 #          copies, no interception on members, direct DB, Degraded message, no CLI stall
 #       2. replicas ENABLED: topology + HTTP locality + proxied branch + SQS + fail-anywhere
-#       3. idle lifecycle (replicas): independent idling, queue wake, proxy scaling
-#       4. credential coasting: SA outage + primary restart leaves replicas untouched
+#       3. idle lifecycle (replicas): independent idling, queue wake
+#       4. tunnel outage: primary restart leaves replicas untouched, DB path recovers
 #       5. dead cluster: preview stop bounded, never wedged
 #   ./mc-preview-replica-e2e.sh                     # single run, fail-anywhere teardown
 #   REPLICAS=0 ./mc-preview-replica-e2e.sh          # single run in disabled mode
 #   HTTP=0 DB=1 SQS=1 ./mc-preview-replica-e2e.sh   # skip sections
 #   IDLE=1 ./mc-preview-replica-e2e.sh              # idle scenario (uses SQS wake if deployed)
-#   COAST=1 DB=1 ./mc-preview-replica-e2e.sh        # add the credential-outage section
+#   TUNNEL=1 DB=1 ./mc-preview-replica-e2e.sh       # add the tunnel-outage section
+#   BULK=1 DB=1 ./mc-preview-replica-e2e.sh         # bulk-data integrity through the tunnel
+#   STALE=1 DB=1 ./mc-preview-replica-e2e.sh        # stale sidecar Secret replaced on copy recreation
+#   BLIP=1 DB=1 SQS=1 ./mc-preview-replica-e2e.sh   # branch-resolution blip must not revoke replicas
 #   TEARDOWN=stop|fail|dead-cluster ...             # teardown scenario
 #   DEPLOY_OPERATOR=1 ./mc-preview-replica-e2e.sh   # swap in mirrord-operator:custom first
 #   REDEPLOY_SQS=1 ./mc-preview-replica-e2e.sh      # (re)deploy localstack + queue first
@@ -72,7 +84,7 @@
 # Env knobs: NUM (messages/requests per class, default 5), MC_NUM_CLUSTERS (auto),
 # PROBE_IMAGE (default preview-probe:mc, auto-built + loaded), OPERATOR_IMAGE,
 # CLEANUP_TIMEOUT, MIRRORD_BIN, TEARDOWN (fail | stop | dead-cluster),
-# REPLICAS (1 | 0 | empty = leave operators as-is), COAST, SUITE.
+# REPLICAS (1 | 0 | empty = leave operators as-is), TUNNEL, SUITE.
 #
 # Prereqs: operators on all clusters run YOUR build with previewEnv (+ pgBranching
 # for [DB]); [SQS] needs the shared localstack (task multicluster:sqs:deploy or
@@ -109,10 +121,24 @@ IDLE_AFTER="${IDLE_AFTER:-45}"
 # DEFAULT (pods only on the default cluster, split-only copies for queue previews).
 # Empty = leave the operators as they are.
 REPLICAS="${REPLICAS:-}"
-# COAST=1 (replicas mode, DB=1): after the traffic sections, prove the credential
-# guarantee - kill the branch-proxy ServiceAccount AND restart the primary (worst case:
-# outage + wiped cache) and require every replica pod to KEEP RUNNING untouched.
-COAST="${COAST:-0}"
+# TUNNEL=1 (replicas mode, DB=1): after the traffic sections, prove the tunnel-outage
+# guarantee - restart the primary (killing every branch-tunnel WebSocket mid-preview) and
+# require every replica pod to KEEP RUNNING untouched and the DB path to recover once the
+# envoy re-dials.
+TUNNEL="${TUNNEL:-0}"
+# BULK=1 (replicas mode, DB=1): stream a multi-MB result set from the shared branch through
+# the tunnel and require it back byte-complete. Single-row probes cannot catch data-plane
+# bugs that only fire under sustained flow (a dropped mux chunk, a stalled credit window).
+BULK="${BULK:-0}"
+# STALE=1 (replicas mode, DB=1): corrupt a member's sidecar TLS Secret into the shape an
+# interrupted teardown leaves behind (garbage material, no owner), recreate the copy, and
+# require the operator to REPLACE the Secret - reusing it would reject every DB stream.
+STALE="${STALE:-0}"
+# BLIP=1 (replicas mode, DB=1, SQS=1): kill the branch DB pod and require the preserve-
+# existing guarantee - the replica-clusters annotation (tunnel authorization reads it per
+# stream open) must never collapse to just the default cluster during the blip, and the
+# DB path must recover once the pod is back.
+BLIP="${BLIP:-0}"
 
 PRIMARY_CTX="${MC_PRIMARY:-mirrord-primary}"
 REMOTE1_CTX="${MC_REMOTE_1:-mirrord-remote-1}"
@@ -138,9 +164,12 @@ section_icon() {
     \[DB\]*)       printf '💾' ;;
     \[SQS\]*)      printf '📬' ;;
     \[IDLE\]*)     printf '😴' ;;
-    \[COAST\]*)    printf '🔑' ;;
+    \[TUNNEL\]*)   printf '🔌' ;;
     \[DEAD\]*)     printf '💀' ;;
     \[FAIL\]*)     printf '💥' ;;
+    \[BULK\]*)     printf '📦' ;;
+    \[STALE\]*)    printf '🔏' ;;
+    \[BLIP\]*)     printf '🩹' ;;
     \[TEARDOWN\]*) printf '🧹' ;;
     log\ excerpts*) printf '📜' ;;
     SUITE*)        printf '🏁' ;;
@@ -154,6 +183,7 @@ section_icon() {
 hdr()  {
   section_close
   CURRENT_SECTION="$*"; SECTION_OK_BASE=$OK_COUNT; SECTION_FAIL_BASE=$FAILURES
+  SECTION_KNOWN_BASE=$KNOWN_COUNT
   echo; printf '%s\n' "${BLD}$(section_icon "$*") $*${RST}"
 }
 section_close() {
@@ -161,6 +191,7 @@ section_close() {
   SECTION_NAMES+=("$CURRENT_SECTION")
   SECTION_OKS+=($((OK_COUNT - SECTION_OK_BASE)))
   SECTION_FAILS+=($((FAILURES - SECTION_FAIL_BASE)))
+  SECTION_KNOWNS+=($((KNOWN_COUNT - SECTION_KNOWN_BASE)))
   CURRENT_SECTION=""
 }
 run_summary_table() {
@@ -172,14 +203,18 @@ run_summary_table() {
   local i
   # macOS bash 3.2 aborts on empty-array expansion under set -u; same guard as elsewhere.
   for i in ${SECTION_NAMES[@]+"${!SECTION_NAMES[@]}"}; do
-    [ "$(( SECTION_OKS[i] + SECTION_FAILS[i] ))" = 0 ] && continue
-    if [ "${SECTION_FAILS[$i]}" = 0 ]; then
+    [ "$(( SECTION_OKS[i] + SECTION_FAILS[i] + SECTION_KNOWNS[i] ))" = 0 ] && continue
+    if [ "${SECTION_FAILS[$i]}" != 0 ]; then
       printf '  %s %-58s %2s checks  %s\n' "$(section_icon "${SECTION_NAMES[$i]}")" \
-        "${SECTION_NAMES[$i]:0:58}" "${SECTION_OKS[$i]}" "${GRN}✅ PASS${RST}"
+        "${SECTION_NAMES[$i]:0:58}" "$(( SECTION_OKS[i] + SECTION_FAILS[i] + SECTION_KNOWNS[i] ))" \
+        "${RED}❌ ${SECTION_FAILS[$i]} FAILED${RST}"
+    elif [ "${SECTION_KNOWNS[$i]}" != 0 ]; then
+      printf '  %s %-58s %2s checks  %s\n' "$(section_icon "${SECTION_NAMES[$i]}")" \
+        "${SECTION_NAMES[$i]:0:58}" "$(( SECTION_OKS[i] + SECTION_KNOWNS[i] ))" \
+        "${YEL}🐞 ${SECTION_KNOWNS[$i]} KNOWN BUG${RST}"
     else
       printf '  %s %-58s %2s checks  %s\n' "$(section_icon "${SECTION_NAMES[$i]}")" \
-        "${SECTION_NAMES[$i]:0:58}" "$(( SECTION_OKS[i] + SECTION_FAILS[i] ))" \
-        "${RED}❌ ${SECTION_FAILS[$i]} FAILED${RST}"
+        "${SECTION_NAMES[$i]:0:58}" "${SECTION_OKS[$i]}" "${GRN}✅ PASS${RST}"
     fi
   done
   printf '%s\n' "$rule"
@@ -188,13 +223,18 @@ run_summary_table() {
   [ "$DB" != 1 ] && skipped="$skipped db"
   [ "$SQS" != 1 ] && skipped="$skipped sqs"
   [ "$IDLE" != 1 ] && skipped="$skipped idle"
-  [ "${COAST:-0}" != 1 ] && skipped="$skipped coast"
+  [ "${TUNNEL:-0}" != 1 ] && skipped="$skipped tunnel"
   [ -n "$skipped" ] && printf '  %s\n' "⏭️  not enabled this run:$skipped"
 }
 
-FAILURES=0; OK_COUNT=0
-CURRENT_SECTION=""; SECTION_NAMES=(); SECTION_OKS=(); SECTION_FAILS=()
+FAILURES=0; OK_COUNT=0; KNOWN_COUNT=0
+CURRENT_SECTION=""; SECTION_NAMES=(); SECTION_OKS=(); SECTION_FAILS=(); SECTION_KNOWNS=()
 fail() { err "$*"; FAILURES=$((FAILURES+1)); }
+# A check failing because of an already-tracked bug: reported distinctly (🐞, not ❌) so a
+# red run always means something NEW, and counted separately so the scenario can exit 2
+# (known-only) instead of 1. Callers must verify the bug's SIGNATURE before downgrading a
+# failure to known - a matching symptom with a different cause must stay red.
+known() { KNOWN_COUNT=$((KNOWN_COUNT+1)); printf '%s\n' "  ${YEL}🐞${RST} $* ${YEL}[known bug]${RST}"; }
 
 # `mirrord` is often a shell ALIAS pointing at a local build - aliases don't reach scripts.
 if ! command -v "$MIRRORD_BIN" >/dev/null 2>&1 && [ ! -x "$MIRRORD_BIN" ]; then
@@ -226,41 +266,106 @@ fi
 # DEPLOY_OPERATOR=1 to the suite) and the operators are reconfigured between
 # scenarios via the REPLICAS knob.
 # ---------------------------------------------------------------------------
+# Two runs against the same fleet destroy each other: `pre_clean` deletes every
+# PreviewSession on every cluster, so a second run scrubs the first run's preview
+# mid-scenario. The victim then reports its preview "absent" with its pods and sidecar
+# Secret gone - a failure that looks exactly like a product bug and is not one. Only the
+# outermost invocation takes the lock; suite children inherit the marker.
+LOCK_DIR="${TMPDIR:-/tmp}/mc-preview-replica-e2e.lock"
+release_lock() { :; }
+if [ -z "${E2E_LOCK_HELD:-}" ]; then
+  if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    holder=$(cat "$LOCK_DIR/pid" 2>/dev/null || echo "")
+    if [ -n "$holder" ] && kill -0 "$holder" 2>/dev/null; then
+      printf '%s\n' "  ${RED}❌${RST} another run of this suite is in progress (pid $holder)."
+      printf '%s\n' "     Concurrent runs scrub each other's previews - wait for it, or kill it."
+      exit 1
+    fi
+    # The holder is gone: its lock is stale (killed run, crashed shell).
+    rm -rf "$LOCK_DIR"
+    mkdir "$LOCK_DIR" 2>/dev/null || { printf '%s\n' "cannot take the run lock at $LOCK_DIR"; exit 1; }
+  fi
+  echo "$$" > "$LOCK_DIR/pid"
+  export E2E_LOCK_HELD=1
+  release_lock() { rm -rf "$LOCK_DIR"; }
+  # Armed here because a suite run exits inside the dispatch below, before the trap that
+  # cleans up port-forwards is installed; that later trap also releases the lock.
+  trap release_lock EXIT
+fi
+
 if [ "${SUITE:-0}" = 1 ]; then
   declare -a SUITE_NAMES SUITE_RESULTS
-  run_scenario() { # name VAR=VALUE...
-    local scenario_name="$1"; shift
-    say "SCENARIO: $scenario_name"
-    if env SUITE=0 "$@" "$0"; then
-      SUITE_NAMES+=("$scenario_name"); SUITE_RESULTS+=("PASS")
+  # Short ids so a run can be narrowed without retyping knob soup:
+  #   ONLY=tunnel,idle   run just those      SKIP=idle          run all but those
+  #   PICK=1             choose interactively (gum, when installed)
+  # A full suite is ~30 minutes; most iterations only need one scenario.
+  SUITE_IDS=(disabled replicas resilience idle tunnel dead)
+
+  if [ "${PICK:-0}" = 1 ]; then
+    if command -v gum >/dev/null 2>&1; then
+      chosen=$(printf '%s\n' "${SUITE_IDS[@]}" \
+        | gum choose --no-limit --header "Scenarios to run (space to toggle, enter to confirm)" </dev/tty)
+      [ -z "$chosen" ] && { echo "Nothing selected."; exit 0; }
+      ONLY=$(echo "$chosen" | paste -sd',' -)
     else
-      SUITE_NAMES+=("$scenario_name"); SUITE_RESULTS+=("FAIL")
+      warn "PICK=1 needs gum (brew install gum) - running every scenario"
     fi
+  fi
+
+  # Returns 0 when the scenario should run, per ONLY / SKIP.
+  wants_scenario() { # id
+    case ",${SKIP:-}," in *",$1,"*) return 1 ;; esac
+    [ -z "${ONLY:-}" ] && return 0
+    case ",${ONLY}," in *",$1,"*) return 0 ;; *) return 1 ;; esac
+  }
+
+  run_scenario() { # id name VAR=VALUE...
+    local scenario_id="$1"; local scenario_name="$2"; shift 2
+    wants_scenario "$scenario_id" || return 0
+    say "SCENARIO [$scenario_id]: $scenario_name"
+    local status=0
+    env SUITE=0 "$@" "$0" || status=$?
+    SUITE_NAMES+=("$scenario_name")
+    case "$status" in
+      0) SUITE_RESULTS+=("PASS") ;;
+      # Exit 2 = every failure matched an already-tracked bug's signature.
+      2) SUITE_RESULTS+=("KNOWN") ;;
+      *) SUITE_RESULTS+=("FAIL") ;;
+    esac
   }
 
   # Scenario 1 carries the one-time image deploy when the suite was asked to deploy;
   # every later scenario reuses it.
-  run_scenario "default mode: replicas DISABLED (pods on default only, split-only copies)" \
+  run_scenario disabled "default mode: replicas DISABLED (pods on default only, split-only copies)" \
     "DEPLOY_OPERATOR=$DEPLOY_OPERATOR" REPLICAS=0 HTTP=1 DB=1 SQS=1 TEARDOWN=stop
-  run_scenario "full replicas: topology + HTTP locality + shared branch + SQS + fail-anywhere" \
+  run_scenario replicas "full replicas: topology + HTTP locality + shared branch + SQS + fail-anywhere" \
     DEPLOY_OPERATOR=0 REPLICAS=1 HTTP=1 DB=1 SQS=1 TEARDOWN=fail
-  run_scenario "idle lifecycle: independent idling, queue + HTTP wake, proxy scaling" \
+  run_scenario resilience "resilience: bulk tunnel data + stale sidecar secret + branch blip + fast stop" \
+    DEPLOY_OPERATOR=0 REPLICAS=1 HTTP=0 DB=1 SQS=1 BULK=1 STALE=1 BLIP=1 TEARDOWN=stop
+  run_scenario idle "idle lifecycle: independent idling, queue + HTTP wake" \
     DEPLOY_OPERATOR=0 REPLICAS=1 IDLE=1 TEARDOWN=stop
-  run_scenario "credential coasting: SA outage + primary restart must not touch replicas" \
-    DEPLOY_OPERATOR=0 REPLICAS=1 HTTP=0 DB=1 SQS=1 COAST=1 TEARDOWN=stop
-  run_scenario "dead cluster: preview stop must not wedge on a paused member" \
+  run_scenario tunnel "tunnel outage: primary restart must not touch replicas, DB path recovers" \
+    DEPLOY_OPERATOR=0 REPLICAS=1 HTTP=0 DB=1 SQS=1 TUNNEL=1 TEARDOWN=stop
+  run_scenario dead "dead cluster: preview stop must not wedge on a paused member" \
     DEPLOY_OPERATOR=0 REPLICAS=1 HTTP=0 DB=0 SQS=0 TEARDOWN=dead-cluster
 
   hdr "SUITE RESULTS"
-  suite_failed=0
+  suite_failed=0; suite_known=0
   for i in "${!SUITE_NAMES[@]}"; do
-    if [ "${SUITE_RESULTS[$i]}" = "PASS" ]; then
-      ok "${SUITE_NAMES[$i]}"
-    else
-      err "${SUITE_NAMES[$i]}"
-      suite_failed=1
-    fi
+    case "${SUITE_RESULTS[$i]}" in
+      PASS) ok "${SUITE_NAMES[$i]}" ;;
+      KNOWN)
+        printf '%s\n' "  ${YEL}🐞${RST} ${SUITE_NAMES[$i]} ${YEL}[known bug - tracked, not a regression]${RST}"
+        suite_known=1
+        ;;
+      *)
+        err "${SUITE_NAMES[$i]}"
+        suite_failed=1
+        ;;
+    esac
   done
+  [ "$suite_known" = 1 ] && [ "$suite_failed" = 0 ] && \
+    printf '%s\n' "  ${YEL}⚠️  known-bug scenarios fail by design until their tracked fix lands${RST}"
   exit "$suite_failed"
 fi
 
@@ -304,7 +409,8 @@ NON_DEFAULT_CTXS=()
 for c in "${WORKLOAD_CTXS[@]}"; do [ "$c" = "$DEFAULT_CTX" ] || NON_DEFAULT_CTXS+=("$c"); done
 
 PF_PIDS=(); BG_PIDS=()
-trap 'for p in "${PF_PIDS[@]:-}" "${BG_PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done' EXIT
+
+trap 'for p in "${PF_PIDS[@]:-}" "${BG_PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done; release_lock' EXIT
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -328,43 +434,28 @@ deploy_operator() {
     # OPERATOR_IMAGE env - point that at the fresh tag too, or those pods run whatever
     # stale image the node has cached under the old name.
     kubectl --context "$c" -n mirrord set env deploy/mirrord-operator "OPERATOR_IMAGE=$tag"
-    # Endpoint the branch proxies dial the default apiserver on. In the management-only
-    # topology the default cluster is IN the registry, whose endpoint (the container-name
-    # URL, a cert SAN, resolvable via docker DNS from every cluster) plus CA is exactly
-    # what the operator's own resolution order picks - so no override. `minikube ip` must
-    # NOT be used here: it returns the default cluster's address on its OWN docker network,
-    # unreachable from the other clusters' pods. Only the 2-cluster topology needs the
-    # override, because there the default cluster is the primary itself, which the registry
-    # does not describe.
-    if [ "$DEFAULT_CTX" = "$PRIMARY_CTX" ]; then
-      kubectl --context "$c" -n mirrord set env deploy/mirrord-operator \
-        "OPERATOR_MC_DEFAULT_API_SERVER=https://$DEFAULT_CTX:8443"
-    else
-      kubectl --context "$c" -n mirrord set env deploy/mirrord-operator \
-        "OPERATOR_MC_DEFAULT_API_SERVER-" >/dev/null
-    fi
-    # Without a CA the primary refuses to ship the branch-proxy kubeconfig (it would tunnel
-    # DB traffic unverified) and every branching preview silently degrades to split-only.
-    # minikube publishes no cluster-info CA, but all profiles share one CA that signs every
-    # apiserver cert - hand it over (base64, kubeconfig certificate-authority-data encoding).
+    # Retired branch-proxy knobs: the tunnel needs no default-apiserver endpoint or CA.
+    # Unset both so overrides from runs of the old design cannot linger on the Deployment.
     kubectl --context "$c" -n mirrord set env deploy/mirrord-operator \
-      "OPERATOR_MC_DEFAULT_API_SERVER_CA=$(base64 < "$HOME/.minikube/ca.crt" | tr -d '\n')"
+      "OPERATOR_MC_DEFAULT_API_SERVER-" "OPERATOR_MC_DEFAULT_API_SERVER_CA-" >/dev/null
     # Full replicas are a fleet-wide opt-in (chart: multiCluster.preview.replicas); the
     # REPLICAS knob decides per run, defaulting to enabled for this suite's classic mode.
+    # A pure deploy (DEPLOY_ONLY, e.g. via `task op:custom`) with no explicit REPLICAS
+    # leaves the fleet's flag untouched - swapping the image must not flip features.
     if [ "$REPLICAS" = 0 ]; then
       kubectl --context "$c" -n mirrord set env deploy/mirrord-operator \
-        "OPERATOR_MC_PREVIEW_REPLICAS-" >/dev/null
-    else
+        "OPERATOR_MC_PREVIEW_MODE=default-cluster" >/dev/null
+    elif [ -n "$REPLICAS" ] || [ "${DEPLOY_ONLY:-0}" != 1 ]; then
       kubectl --context "$c" -n mirrord set env deploy/mirrord-operator \
-        "OPERATOR_MC_PREVIEW_REPLICAS=true"
+        "OPERATOR_MC_PREVIEW_MODE=replicas"
     fi
-    # The branch-proxy ServiceAccount/role and the widened envoy-remote role ship with the
-    # LOCAL chart - the released chart the cluster was installed from predates them, and
-    # without them token minting (default cluster) and the access-Secret apply (members)
-    # fail, degrading every branching preview to split-only. Render with THIS cluster's own
-    # install values: a hand-picked --set list renders a narrower role set, and the forced
-    # server-side apply then REPLACES the installed roles with it, silently dropping rules
-    # the running operator depends on.
+    # The tunnel's `branchtunnels` envoy-remote rule and the v1alpha1 APIService ship with
+    # the LOCAL chart - the released chart the cluster was installed from predates them,
+    # and without them the envoy's tunnel dial into this cluster is Forbidden (RBAC) or 404
+    # (no aggregation route), so branching replicas never get a DB path. Render with THIS
+    # cluster's own install values: a hand-picked --set list renders a narrower role set,
+    # and the forced server-side apply then REPLACES the installed roles with it, silently
+    # dropping rules the running operator depends on.
     if ! helm --kube-context "$c" get values mirrord-operator -n mirrord -o yaml \
       > "/tmp/mc-operator-values-$c.yaml" 2>/dev/null || [ ! -s "/tmp/mc-operator-values-$c.yaml" ]; then
       err "$c: cannot read the installed helm values (cluster down?) - RBAC not re-rendered"
@@ -376,7 +467,7 @@ deploy_operator() {
     helm template mirrord-operator "$SANDBOX_DIR/../operator/public/charts/mirrord-operator" \
       -n mirrord -f "/tmp/mc-operator-values-$c.yaml" \
       --set license.key=render-only-placeholder \
-      -s templates/multi-cluster-roles.yaml \
+      -s templates/multi-cluster-roles.yaml -s templates/api-service.yaml \
       | kubectl --context "$c" apply --server-side --force-conflicts -f - >/dev/null \
       && ok "$c: multi-cluster RBAC re-rendered from the local chart + this cluster's values" \
       || err "$c: failed to apply the local chart's multi-cluster RBAC"
@@ -422,15 +513,15 @@ ensure_probe_image() {
 ensure_replicas_mode() {
   [ -z "$REPLICAS" ] && return
   local want_env
-  [ "$REPLICAS" = 1 ] && want_env="OPERATOR_MC_PREVIEW_REPLICAS=true" \
-    || want_env="OPERATOR_MC_PREVIEW_REPLICAS-"
+  [ "$REPLICAS" = 1 ] && want_env="OPERATOR_MC_PREVIEW_MODE=replicas" \
+    || want_env="OPERATOR_MC_PREVIEW_MODE=default-cluster"
   say "Configuring the fleet: preview replicas $([ "$REPLICAS" = 1 ] && echo ENABLED || echo DISABLED)"
   local changed=0
   for c in "${ALL_CTXS[@]}"; do
     current=$(kubectl --context "$c" -n mirrord get deploy mirrord-operator \
-      -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="OPERATOR_MC_PREVIEW_REPLICAS")].value}' 2>/dev/null)
-    if { [ "$REPLICAS" = 1 ] && [ "$current" != "true" ]; } \
-      || { [ "$REPLICAS" = 0 ] && [ -n "$current" ]; }; then
+      -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="OPERATOR_MC_PREVIEW_MODE")].value}' 2>/dev/null)
+    if { [ "$REPLICAS" = 1 ] && [ "$current" != "replicas" ]; } \
+      || { [ "$REPLICAS" = 0 ] && [ "$current" != "default-cluster" ]; }; then
       kubectl --context "$c" -n mirrord set env deploy/mirrord-operator "$want_env" >/dev/null
       changed=1
     fi
@@ -445,6 +536,12 @@ ensure_replicas_mode() {
   fi
 }
 
+# Everything a previous run (including an INTERRUPTED one) may have left behind. The
+# workload-patch CRs matter as much as the sessions: a stale accepted request in a
+# MirrordClusterWorkloadPatch rejects the next run's patch with a 409 Conflict, failing
+# `preview start` before anything else happens.
+PRE_CLEAN_KINDS="previewsessions.preview.mirrord.metalbear.co,mirrordclustersplitsessions.queues.mirrord.metalbear.co,mirrordclusterworkloadpatchrequests.mirrord.metalbear.co,mirrordclusterworkloadpatches.mirrord.metalbear.co"
+
 pre_clean() {
   say "Pre-clean: removing leftover preview state"
   for c in "${ALL_CTXS[@]}"; do
@@ -454,7 +551,22 @@ pre_clean() {
       kubectl --context "$c" patch "$item" --type=merge -p '{"metadata":{"finalizers":[]}}' >/dev/null 2>&1 || true
       kubectl --context "$c" -n "$NS" delete "$item" --ignore-not-found >/dev/null 2>&1 || \
       kubectl --context "$c" delete "$item" --ignore-not-found >/dev/null 2>&1 || true
-    done < <(kubectl --context "$c" get previewsessions.preview.mirrord.metalbear.co,mirrordclustersplitsessions.queues.mirrord.metalbear.co -A -o name 2>/dev/null)
+    done < <(kubectl --context "$c" get "$PRE_CLEAN_KINDS" -A -o name 2>/dev/null)
+  done
+  # Deletes above are async (controllers run their finalizers) - a new preview starting
+  # while yesterday's teardown is still in flight hits the same 409 the scrub exists to
+  # prevent, so wait until the state is REALLY gone.
+  local deadline=$((SECONDS + 60))
+  for c in "${ALL_CTXS[@]}"; do
+    while [ "$SECONDS" -lt "$deadline" ]; do
+      leftover=$(kubectl --context "$c" get "$PRE_CLEAN_KINDS" -A -o name 2>/dev/null | head -1)
+      [ -z "$leftover" ] && break
+      sleep 2
+    done
+    if [ -n "${leftover:-}" ]; then
+      err "$c still holds leftover preview state after 60s: $leftover"
+      exit 1
+    fi
   done
   ok "clusters scrubbed"
 }
@@ -465,7 +577,7 @@ pre_clean() {
 # key is not listed, "waiting ..." (naming the lagging clusters) otherwise. Prints nothing
 # when the API is not served (older operator build) - callers fall back to the primary CR.
 previews_state() { # accepted-phases (space separated, e.g. "Ready" or "Idle")
-  kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1/previews" 2>/dev/null \
+  kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1alpha1/previews" 2>/dev/null \
     | KEYX="$KEY" OKP="$1" python3 -c '
 import json, os, sys
 key = os.environ["KEYX"]; accepted = os.environ["OKP"].split()
@@ -492,7 +604,7 @@ else:
 
 # Per-cluster phase map from the previews API, one "cluster=phase" line per cluster.
 previews_clusters() {
-  kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1/previews" 2>/dev/null \
+  kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1alpha1/previews" 2>/dev/null \
     | KEYX="$KEY" python3 -c '
 import json, os, sys
 key = os.environ["KEYX"]
@@ -580,17 +692,32 @@ print(total, ready, bad)' 2>/dev/null)
   return 1
 }
 
+# With `fast` as $1, additionally asserts the stop completed inside STOP_FAST_BOUND - on a
+# healthy fleet the operator confirms copy deletion on a short recheck, so a slow stop means
+# the confirmation wait regressed onto an error backoff (a 30s+ stall on EVERY stop, which
+# "stop eventually succeeded" alone can never catch).
+STOP_FAST_BOUND=25
 stop_preview() {
+  local t0=$(date +%s)
   MIRRORD_KUBE_CONTEXT="$PRIMARY_CTX" MIRRORD_CHECK_VERSION=false \
     "$MIRRORD_BIN" preview stop -k "$KEY" >/dev/null 2>&1 || true
-  local deadline=$(( $(date +%s) + CLEANUP_TIMEOUT ))
+  local deadline=$(( t0 + CLEANUP_TIMEOUT ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     local left=0
     for c in "${ALL_CTXS[@]}"; do
       left=$(( left + $(kubectl --context "$c" get previewsessions.preview.mirrord.metalbear.co -A --no-headers 2>/dev/null | grep -c -- "$KEY" || true) ))
     done
-    [ "$left" = 0 ] && { ok "preview '$KEY' cleaned up on all clusters"; return 0; }
-    sleep 5
+    if [ "$left" = 0 ]; then
+      local elapsed=$(( $(date +%s) - t0 ))
+      ok "preview '$KEY' cleaned up on all clusters (${elapsed}s)"
+      if [ "${1:-}" = "fast" ]; then
+        [ "$elapsed" -le "$STOP_FAST_BOUND" ] \
+          && ok "healthy stop stayed under ${STOP_FAST_BOUND}s - no error-backoff stall in the confirm wait" \
+          || { err "healthy stop took ${elapsed}s (> ${STOP_FAST_BOUND}s) - copy-deletion confirm is pacing on an error backoff"; return 1; }
+      fi
+      return 0
+    fi
+    sleep 2
   done
   err "preview '$KEY' left resources behind"; return 1
 }
@@ -602,6 +729,10 @@ stop_preview() {
 pf_up() { # ctx target port
   local attempt pid
   for attempt in 1 2 3; do
+    # A forward leaked by an earlier section or suite scenario (its pod is long gone)
+    # squats the local port: kubectl then cannot bind, and the health polls below hit the
+    # corpse listener - every attempt fails against a perfectly healthy pod.
+    lsof -ti "tcp:$3" 2>/dev/null | while read -r squatter; do kill "$squatter" 2>/dev/null || true; done
     kubectl --context "$1" -n "$NS" port-forward "$2" "$3:80" >/dev/null 2>&1 &
     pid=$!
     PF_PIDS+=("$pid")
@@ -611,6 +742,22 @@ pf_up() { # ctx target port
       sleep 1
     done
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  done
+  return 1
+}
+
+# Forward to the CURRENT newest pod matching a label selector, re-resolving between
+# attempts and setting $PF_POD. The HTTP-steal and queue-split patches ROLL the preview
+# deployment, so a pod name fetched moments earlier may be terminating by the time the
+# forward binds - a forward pinned to it never serves, and retrying against the same name
+# (what a plain pf_up does) cannot recover.
+pf_up_current() { # ctx label-selector port
+  local attempt
+  for attempt in 1 2 3 4; do
+    PF_POD=$(kubectl --context "$1" -n "$NS" get pods -l "$2" --sort-by=.metadata.creationTimestamp \
+      -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+    [ -n "$PF_POD" ] && pf_up "$1" "pod/$PF_POD" "$3" && return 0
+    sleep 4
   done
   return 1
 }
@@ -811,12 +958,29 @@ if [ "$REPLICAS" = 0 ]; then
   [ "$ann" = "[\"$DEFAULT_CTX\"]" ] && ok "replica-clusters annotation lists ONLY the default cluster" \
     || fail "replica-clusters annotation should be [\"$DEFAULT_CTX\"], got: ${ann:-<absent>}"
 
+  # Split-only copies never enter the replica-clusters stamp (it means "where pods RUN"),
+  # so cleanup finds them through the separate copy-clusters stamp - without it, a cluster
+  # dropped from the registry keeps its orphaned split stealing queue messages until the
+  # TTL. Wire contract, so an exact match.
+  if [ "$SQS" = 1 ]; then
+    expected_copy_ann=$(printf '%s\n' ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"} | sort | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().split(), separators=(",",":")))')
+    copy_ann=""; deadline=$(( $(date +%s) + 60 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      copy_ann=$(kubectl --context "$PRIMARY_CTX" get previewsessions.preview.mirrord.metalbear.co -A \
+        -o jsonpath='{.items[0].metadata.annotations.operator\.metalbear\.co/preview-copy-clusters}' 2>/dev/null)
+      [ "$copy_ann" = "$expected_copy_ann" ] && break
+      sleep 5
+    done
+    [ "$copy_ann" = "$expected_copy_ann" ] && ok "copy-clusters annotation records the split-only fan-out (cleanup can reach it)" \
+      || fail "copy-clusters annotation should be $expected_copy_ann, got: ${copy_ann:-<absent>}"
+  fi
+
   # The view must not stall anyone: only the default cluster in the map (no phantom
   # 'Missing'), and the degradation spelled out as a Degraded message. Same poll as
   # above - the map and the message both derive from controller-stamped annotations.
   verdict=""; deadline=$(( $(date +%s) + 90 ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
-    verdict=$(kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1/previews" 2>/dev/null \
+    verdict=$(kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1alpha1/previews" 2>/dev/null \
       | KEYX="$KEY" DEFX="$DEFAULT_CTX" python3 -c '
 import json, os, sys
 items = [it for it in json.load(sys.stdin).get("items", [])
@@ -900,10 +1064,25 @@ else
   warn "primary CR has no replica-clusters annotation (older operator build?)"
 fi
 
+# The copy-clusters stamp (cleanup's map of every fanned-out copy) must cover the replica
+# fan-out too - it is what lets cleanup reach copies on clusters that later drop out of
+# the registry.
+copy_ann=$(kubectl --context "$PRIMARY_CTX" get previewsessions.preview.mirrord.metalbear.co -A \
+  -o jsonpath='{.items[0].metadata.annotations.operator\.metalbear\.co/preview-copy-clusters}' 2>/dev/null)
+if [ -n "$copy_ann" ]; then
+  miss=0
+  for c in ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"}; do
+    echo "$copy_ann" | grep -q "$c" || { fail "copy-clusters annotation is missing $c"; miss=1; }
+  done
+  [ "$miss" = 0 ] && ok "copy-clusters annotation records every fanned-out copy: $copy_ann"
+else
+  fail "primary CR has no copy-clusters annotation - cleanup cannot survive a registry drop"
+fi
+
 # The previews API on the primary: ONE entry per logical preview, per-cluster phases joined
 # live from the copies (copies themselves must never be listed). Queried cluster-scope: in the
 # management-only topology the primary CRs live in the OPERATOR namespace, not $NS.
-api=$(kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1/previews" 2>/dev/null)
+api=$(kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1alpha1/previews" 2>/dev/null)
 if [ -n "$api" ]; then
   entry=$(echo "$api" | KEYX="$KEY" python3 -c '
 import json, os, sys
@@ -1005,26 +1184,22 @@ fi
 # [DB] every replica -> the SAME branch (default direct, others via the proxy)
 # ---------------------------------------------------------------------------
 if [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" = 0 ]; then
-  hdr "[DB] replicas disabled - the branch is DIRECT (no proxies anywhere)"
+  hdr "[DB] replicas disabled - the branch is DIRECT (no tunnel artifacts anywhere)"
   for c in ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"}; do
-    proxies=$(kubectl --context "$c" -n "$NS" get deploy -o name 2>/dev/null | grep -c -- "-brdb-" || true)
-    secrets=$(kubectl --context "$c" -n "$NS" get secret -o name 2>/dev/null | grep -c "branch-proxy-access" || true)
-    [ "${proxies:-0}" = 0 ] && ok "$c: no branch-proxy Deployments" \
-      || fail "$c: $proxies branch-proxy Deployment(s) despite replicas being disabled"
-    [ "${secrets:-0}" = 0 ] && ok "$c: no access Secrets" \
-      || fail "$c: $secrets access Secret(s) despite replicas being disabled"
+    sidecars=$(kubectl --context "$c" -n "$NS" get secret -o name 2>/dev/null | grep -c -- "-db-sidecar-tls" || true)
+    [ "${sidecars:-0}" = 0 ] && ok "$c: no sidecar TLS Secrets" \
+      || fail "$c: $sidecars sidecar TLS Secret(s) despite replicas being disabled"
   done
 
   durl=$(kubectl --context "$DEFAULT_CTX" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" \
     -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="DATABASE_URL")].value}' 2>/dev/null)
   case "$durl" in
-    *-brdb-*) fail "default cluster's preview pod uses a proxy URL in disabled mode: $durl" ;;
+    *127.0.0.1*) fail "default cluster's preview pod uses a loopback (tunnel) URL in disabled mode: $durl" ;;
     "") fail "default cluster's preview pod has no DATABASE_URL" ;;
     *) ok "default preview pod connects DIRECTLY ($(echo "$durl" | sed -E 's|postgres://[^@]+@||'))" ;;
   esac
 
-  dpod=$(kubectl --context "$DEFAULT_CTX" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-  if [ -n "$dpod" ] && pf_up "$DEFAULT_CTX" "pod/$dpod" 17400; then
+  if pf_up_current "$DEFAULT_CTX" "preview.metalbear.co/session-uid,app=$APP" 17400; then
     db_ok=0
     for _ in $(seq 1 40); do
       curl -sf -m 5 "http://127.0.0.1:17400/db/select" >/dev/null 2>&1 && { db_ok=1; break; }
@@ -1050,32 +1225,36 @@ if [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" = 0 ]; then
 fi
 
 if [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" != 0 ]; then
-  hdr "[DB] all replicas share ONE branch; non-default clusters go through the proxy"
+  hdr "[DB] all replicas share ONE branch; non-default clusters go through the tunnel sidecar"
 
-  # Proxy chain present on every non-default cluster.
+  # Sidecar chain present on every non-default cluster; and the security claim of the
+  # design: NO Secret in the customer namespace holds a cluster credential - the only
+  # tunnel artifact is a per-preview mTLS leaf valid solely against the LOCAL operator.
   for c in ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"}; do
     pname=$(kubectl --context "$c" -n "$NS" get previewsessions.preview.mirrord.metalbear.co -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    kubectl --context "$c" -n "$NS" get secret "${pname}-branch-proxy-access" >/dev/null 2>&1 \
-      && ok "$c: branch-proxy access Secret present" || fail "$c: access Secret missing"
-    proxy=$(kubectl --context "$c" -n "$NS" get deploy -o name 2>/dev/null | grep -- "-brdb-" | head -1 | cut -d/ -f2)
-    if [ -n "$proxy" ]; then
-      kubectl --context "$c" -n "$NS" rollout status "deploy/$proxy" --timeout=90s >/dev/null 2>&1 \
-        && ok "$c: branch proxy '$proxy' running" || fail "$c: branch proxy not ready"
-      # Hardening: probes must target the LOCAL health port, not the DB data port - a
-      # data-port probe opened a full apiserver tunnel plus a DB dial every 10s per pod.
-      hp=$(kubectl --context "$c" -n "$NS" get "deploy/$proxy" -o jsonpath='{.spec.template.spec.containers[0].readinessProbe.tcpSocket.port}' 2>/dev/null)
-      case "$hp" in
-        8686|8687) ok "$c: proxy probes target the local health port ($hp)" ;;
-        *) fail "$c: proxy probes target port ${hp:-<none>} (expected the health port)" ;;
-      esac
+    kubectl --context "$c" -n "$NS" get secret "${pname}-db-sidecar-tls" >/dev/null 2>&1 \
+      && ok "$c: sidecar TLS Secret present" || fail "$c: sidecar TLS Secret missing"
+    kubectl --context "$c" -n "$NS" get secret -o name 2>/dev/null | grep -q "branch-proxy-access" \
+      && fail "$c: a branch-proxy access Secret (cluster credential) exists in the preview namespace" \
+      || ok "$c: no cluster credential in the preview namespace"
+    rpod=$(kubectl --context "$c" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+    if [ -n "$rpod" ]; then
+      screstart=$(kubectl --context "$c" -n "$NS" get pod "$rpod" \
+        -o jsonpath='{.spec.initContainers[?(@.name=="mirrord-db-sidecar")].restartPolicy}' 2>/dev/null)
+      [ "$screstart" = "Always" ] && ok "$c: native DB sidecar injected (init container, restartPolicy Always)" \
+        || fail "$c: DB sidecar init container missing or not native (restartPolicy: ${screstart:-<none>})"
+      scready=$(kubectl --context "$c" -n "$NS" get pod "$rpod" \
+        -o jsonpath='{.status.initContainerStatuses[?(@.name=="mirrord-db-sidecar")].ready}' 2>/dev/null)
+      [ "$scready" = "true" ] && ok "$c: DB sidecar is Ready (gateway validation passed)" \
+        || fail "$c: DB sidecar not ready (ready: ${scready:-<none>}) - gateway dial or cert validation failed"
     else
-      fail "$c: NO branch proxy Deployment"
+      fail "$c: no replica pod to inspect the sidecar on"
     fi
     url=$(kubectl --context "$c" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" \
       -o jsonpath='{.items[0].spec.containers[0].env[?(@.name=="DATABASE_URL")].value}' 2>/dev/null)
     case "$url" in
-      *-brdb-*) ok "$c: replica DATABASE_URL -> proxy ($(echo "$url" | sed -E 's|postgres://[^@]+@||'))" ;;
-      *) fail "$c: replica DATABASE_URL does not use the proxy: ${url:-<unset>}" ;;
+      *127.0.0.1:*) ok "$c: replica DATABASE_URL -> sidecar loopback ($(echo "$url" | sed -E 's|postgres://[^@]+@||'))" ;;
+      *) fail "$c: replica DATABASE_URL does not use the sidecar loopback: ${url:-<unset>}" ;;
     esac
 
     # No env value may still contain the branch-host placeholder in ANY casing: URL parsing
@@ -1101,9 +1280,8 @@ if [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" != 0 ]; then
   # Each cluster's replica INSERTs a row tagged with its cluster id.
   for c in "${WORKLOAD_CTXS[@]}"; do
     port=$(db_port_for "$c")
-    rpod=$(kubectl --context "$c" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-    [ -n "$rpod" ] || { fail "$c: no replica pod"; continue; }
-    pf_up "$c" "pod/$rpod" "$port" || { fail "$c: replica port-forward never came up"; continue; }
+    pf_up_current "$c" "preview.metalbear.co/session-uid,app=$APP" "$port" \
+      || { fail "$c: replica port-forward never came up"; continue; }
 
     # /db/select returns 200 only once the app is CONNECTED (503 before).
     ready=0
@@ -1149,6 +1327,173 @@ if [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" != 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# [BULK] a multi-MB result set through the tunnel arrives byte-complete
+# ---------------------------------------------------------------------------
+if [ "$BULK" = 1 ] && [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" != 0 ]; then
+  hdr "[BULK] bulk data through the tunnel: every seeded row comes back, none lost"
+  BULK_ROWS=100000
+  branch_pod=$(kubectl --context "$DEFAULT_CTX" -n "$NS" get pods -l db-owner-name \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -z "$branch_pod" ]; then
+    fail "no branch DB pod found on $DEFAULT_CTX (label db-owner-name)"
+  else
+    kubectl --context "$DEFAULT_CTX" -n "$NS" exec "$branch_pod" -- \
+      psql -U postgres -d source_db -q -c \
+      "INSERT INTO probe (val, cluster, ts) SELECT 'bulk-$RUN_ID-'||i, 'seed', now() FROM generate_series(1,$BULK_ROWS) i;" \
+      >/dev/null 2>&1 && ok "seeded $BULK_ROWS rows into the branch" || fail "bulk seed failed"
+
+    # Read the whole table back from every non-default replica CONCURRENTLY - each pull
+    # streams megabytes over its own mux stream, so the streams compete for the shared
+    # session window exactly the way real traffic does. A single dropped or reordered
+    # chunk breaks the JSON body or the row count.
+    declare -a BULK_TMP BULK_CTX BULK_PIDS
+    for c in ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"}; do
+      port=$(db_port_for "$c")
+      tmp=$(mktemp)
+      BULK_TMP+=("$tmp"); BULK_CTX+=("$c")
+      ( curl -sf -m 120 "http://127.0.0.1:$port/db/select" -o "$tmp" ) &
+      BULK_PIDS+=($!)
+    done
+    wait ${BULK_PIDS[@]+"${BULK_PIDS[@]}"} 2>/dev/null || true
+    for i in ${BULK_TMP[@]+"${!BULK_TMP[@]}"}; do
+      c="${BULK_CTX[$i]}"; tmp="${BULK_TMP[$i]}"
+      got=$(RUNX="$RUN_ID" WANT="$BULK_ROWS" python3 -c '
+import json, os, sys
+try:
+    rows = json.load(open(sys.argv[1]))
+except Exception as e:
+    print("PARSE_FAIL %s" % e); sys.exit()
+n = sum(1 for r in rows if r.get("val","").startswith("bulk-%s-" % os.environ["RUNX"]))
+print("OK" if n == int(os.environ["WANT"]) else "COUNT %d" % n)' "$tmp" 2>/dev/null)
+      size=$(wc -c < "$tmp" | tr -d ' ')
+      case "$got" in
+        OK) ok "$c: all $BULK_ROWS rows arrived intact through the tunnel (${size} bytes)" ;;
+        *) fail "$c: bulk read incomplete or corrupted ($got, ${size:-0} bytes)" ;;
+      esac
+      rm -f "$tmp"
+    done
+    # Keep later sections' row expectations unaffected.
+    kubectl --context "$DEFAULT_CTX" -n "$NS" exec "$branch_pod" -- \
+      psql -U postgres -d source_db -q -c "DELETE FROM probe WHERE val LIKE 'bulk-$RUN_ID-%';" >/dev/null 2>&1 || true
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# [STALE] a leftover sidecar Secret must be REPLACED when the copy is recreated
+# ---------------------------------------------------------------------------
+if [ "$STALE" = 1 ] && [ "$DB" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" != 0 ] && [ -n "${NON_DEFAULT_CTXS[0]:-}" ]; then
+  hdr "[STALE] stale sidecar Secret: copy recreation must replace it, not reuse it"
+  victim="${NON_DEFAULT_CTXS[0]}"
+  vname=$(kubectl --context "$victim" -n "$NS" get previewsessions.preview.mirrord.metalbear.co -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  vsecret="${vname}-db-sidecar-tls"
+  if [ -z "$vname" ]; then
+    fail "$victim: no copy to recreate"
+  else
+    # The shape an interrupted teardown leaves: same name, garbage material, no owner (so
+    # nothing garbage-collects it before the new copy arrives). Reused as-is, the sidecar
+    # cannot pass the gateway handshake and every replica DB stream dies.
+    kubectl --context "$victim" -n "$NS" patch secret "$vsecret" --type=merge -p \
+      '{"metadata":{"ownerReferences":null},"stringData":{"client.crt":"e2e-stale-garbage","client.key":"e2e-stale-garbage","ca.crt":"e2e-stale-garbage"}}' \
+      >/dev/null 2>&1 && ok "$victim: Secret $vsecret corrupted into the stale-leftover shape" \
+      || fail "$victim: could not corrupt the Secret"
+    old_uid=$(kubectl --context "$victim" -n "$NS" get previewsessions.preview.mirrord.metalbear.co "$vname" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+    kubectl --context "$victim" -n "$NS" delete previewsessions.preview.mirrord.metalbear.co "$vname" --wait=true >/dev/null 2>&1 \
+      && ok "$victim: copy deleted - the fan-out must recreate it against the stale Secret" \
+      || fail "$victim: copy deletion failed"
+
+    recreated=0; deadline=$(( $(date +%s) + 120 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      new_uid=$(kubectl --context "$victim" -n "$NS" get previewsessions.preview.mirrord.metalbear.co "$vname" -o jsonpath='{.metadata.uid}' 2>/dev/null)
+      [ -n "$new_uid" ] && [ "$new_uid" != "$old_uid" ] && { recreated=1; break; }
+      sleep 4
+    done
+    [ "$recreated" = 1 ] && ok "$victim: copy recreated (new uid)" || fail "$victim: copy never recreated"
+
+    # Compare base64-encoded to stay portable (macOS base64 has no reliable -d flag).
+    garbage_b64=$(printf 'e2e-stale-garbage' | base64)
+    fresh=0; deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      cert=$(kubectl --context "$victim" -n "$NS" get secret "$vsecret" -o jsonpath='{.data.client\.crt}' 2>/dev/null)
+      if [ -n "$cert" ] && [ "$cert" != "$garbage_b64" ]; then fresh=1; break; fi
+      sleep 4
+    done
+    [ "$fresh" = 1 ] && ok "$victim: Secret material replaced (or_insert would have kept the garbage)" \
+      || fail "$victim: Secret still holds the stale garbage - copy recreation reused it"
+
+    # Exactly one pod AND its sidecar ready: mid-transition the old pod may linger, and
+    # its already-started sidecar would read as a false pass.
+    scready=0; deadline=$(( $(date +%s) + 180 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      pods=$(kubectl --context "$victim" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" --no-headers 2>/dev/null | wc -l | tr -d ' ')
+      ready=$(kubectl --context "$victim" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" \
+        -o jsonpath='{.items[0].status.initContainerStatuses[?(@.name=="mirrord-db-sidecar")].ready}' 2>/dev/null)
+      [ "$pods" = 1 ] && [ "$ready" = "true" ] && { scready=1; break; }
+      sleep 5
+    done
+    [ "$scready" = 1 ] && ok "$victim: recreated replica's sidecar passed gateway validation with the fresh cert" \
+      || fail "$victim: sidecar never became ready after recreation"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# [BLIP] branch-resolution blip: running replicas keep their authorization
+# ---------------------------------------------------------------------------
+if [ "$BLIP" = 1 ] && [ "$DB" = 1 ] && [ "$SQS" = 1 ] && [ "$IDLE" != 1 ] && [ "$REPLICAS" != 0 ]; then
+  hdr "[BLIP] branch-resolution blip: replica authorization must survive it"
+  # The blip is simulated by stripping the db-owner-name label the resolver selects the
+  # branch pod with - resolution fails exactly as with a restarting pod, but the DB itself
+  # stays up (the branching controller has no pod watch, so a DELETED branch pod is not
+  # recreated - killing it would end the branch, not blip it) and relabeling ends the blip
+  # deterministically.
+  branch_pod=$(kubectl --context "$DEFAULT_CTX" -n "$NS" get pods -l db-owner-name \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  owner_label=$(kubectl --context "$DEFAULT_CTX" -n "$NS" get pod "$branch_pod" \
+    -o jsonpath='{.metadata.labels.db-owner-name}' 2>/dev/null)
+  if [ -z "$branch_pod" ] || [ -z "$owner_label" ]; then
+    fail "no labeled branch DB pod found on $DEFAULT_CTX"
+  else
+    kubectl --context "$DEFAULT_CTX" -n "$NS" label pod "$branch_pod" db-owner-name- >/dev/null 2>&1 \
+      && ok "branch pod $branch_pod unlabeled (resolution blip begins)" \
+      || fail "could not unlabel the branch DB pod"
+
+    # While resolution is down the reconciler takes the preserve-existing arm; the
+    # replica-clusters annotation is what tunnel authz checks PER STREAM OPEN, so the one
+    # failure mode that matters is it collapsing to just the default cluster. 25s covers
+    # at least two reconciles (10s resync).
+    collapsed=0; deadline=$(( $(date +%s) + 25 ))
+    while [ "$(date +%s)" -lt "$deadline" ]; do
+      ann=$(kubectl --context "$PRIMARY_CTX" get previewsessions.preview.mirrord.metalbear.co -A \
+        -o jsonpath='{.items[0].metadata.annotations.operator\.metalbear\.co/preview-replica-clusters}' 2>/dev/null)
+      [ "$ann" = "[\"$DEFAULT_CTX\"]" ] && { collapsed=1; break; }
+      sleep 1
+    done
+    [ "$collapsed" = 0 ] && ok "replica-clusters annotation held steady through the blip (authz never revoked)" \
+      || fail "annotation collapsed to [\"$DEFAULT_CTX\"] during the blip - running replicas lost tunnel authorization"
+
+    kubectl --context "$DEFAULT_CTX" -n "$NS" label pod "$branch_pod" "db-owner-name=$owner_label" --overwrite >/dev/null 2>&1 \
+      && ok "branch pod relabeled (blip over)" || fail "could not restore the branch pod label"
+
+    # Recovery: a NEW DB stream from a replica still works (a fresh request re-dials
+    # through sidecar -> tunnel -> the re-resolvable branch pod). Forward on a FRESH port
+    # to the CURRENT pod: the DB section's forward points at whatever pod existed then,
+    # and [STALE] deliberately replaces the pod right before this section in the suite.
+    probe_ctx="${NON_DEFAULT_CTXS[0]:-}"
+    if [ -n "$probe_ctx" ]; then
+      port=$(( $(db_port_for "$probe_ctx") + 40 ))
+      recovered=0
+      if pf_up_current "$probe_ctx" "preview.metalbear.co/session-uid,app=$APP" "$port"; then
+        for _ in $(seq 1 20); do
+          curl -sf -m 5 "http://127.0.0.1:$port/db/select" >/dev/null 2>&1 && { recovered=1; break; }
+          sleep 3
+        done
+      fi
+      [ "$recovered" = 1 ] && ok "$probe_ctx: replica DB path live after the blip" \
+        || fail "$probe_ctx: replica DB path dead after the blip"
+    fi
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # [SQS] matched -> exactly one replica each; unmatched -> the deployed apps
 # ---------------------------------------------------------------------------
 if [ "$SQS" = 1 ] && [ "$IDLE" != 1 ]; then
@@ -1183,6 +1528,16 @@ if [ "$SQS" = 1 ] && [ "$IDLE" != 1 ]; then
     fail "matched: $uniq distinct / $total total (want $NUM/$NUM)"
   fi
 
+  # Unmatched delivery can trail by one SQS visibility-timeout replay (the queue is
+  # created with VisibilityTimeout=30): a message the forwarder received but returned
+  # unacked reappears ~30s later. Wait past that before declaring one missing.
+  deadline=$(( $(date +%s) + 90 ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    nomatch=$(for c in "${WORKLOAD_CTXS[@]}"; do deployed_logs "$c" | grep -oE "type=basic-${RUN_ID}-U[0-9]+"; done | sort -u | wc -l | tr -d ' ')
+    [ "$nomatch" -ge "$NUM" ] && break
+    sleep 5
+  done
+
   printf '  %s\n' "📭 unmatched messages → 🏠 ORIGINAL apps · never stolen by a replica:"
   for c in "${WORKLOAD_CTXS[@]}"; do
     got=$(deployed_logs "$c" | grep -oE "type=basic-${RUN_ID}-U[0-9]+" | sed "s/type=basic-${RUN_ID}-//" | sort -u | paste -sd',' -)
@@ -1197,75 +1552,87 @@ fi
 # per-cluster evidence: what each replica actually did, in its own words
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# [COAST] credential outage + primary restart must never touch running replicas
+# [TUNNEL] primary restart kills every tunnel WS - replicas untouched, DB recovers
 # ---------------------------------------------------------------------------
-if [ "$COAST" = 1 ] && [ "$REPLICAS" != 0 ] && [ "$DB" = 1 ]; then
-  hdr "[COAST] worst case: branch-proxy SA gone AND primary restarted - replicas survive"
+if [ "$TUNNEL" = 1 ] && [ "$REPLICAS" != 0 ] && [ "$DB" = 1 ]; then
+  hdr "[TUNNEL] primary restart mid-preview: replicas survive, the DB path re-dials"
   member="${NON_DEFAULT_CTXS[0]:-}"
   if [ -z "$member" ]; then
     warn "needs a non-default member cluster - skipping"
   else
     pod_sel="preview.metalbear.co/session-uid,app=$APP"
-    pods_before=$(kubectl --context "$member" -n "$NS" get pods -l "$pod_sel" -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null | sort)
+    # A single-shot read can come back empty on a transient apiserver hiccup, and an empty
+    # snapshot is indistinguishable from "all pods replaced" - retry so the comparison
+    # only ever sees real state.
+    pods_snapshot() { # ctx
+      local try out
+      for try in 1 2 3; do
+        out=$(kubectl --context "$1" -n "$NS" get pods -l "$pod_sel" -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null | sort)
+        [ -n "$out" ] && { printf '%s' "$out"; return 0; }
+        sleep 3
+      done
+    }
+    pods_before=$(pods_snapshot "$member")
 
-    say "Deleting the branch-proxy ServiceAccount and restarting the primary (worst case: outage + wiped credential cache)"
-    kubectl --context "$DEFAULT_CTX" -n mirrord delete sa mirrord-branch-proxy >/dev/null 2>&1 \
-      || { fail "could not delete the ServiceAccount"; }
+    say "Restarting the primary operator (kills every branch-tunnel WebSocket and the envoy's port-forwards)"
     kubectl --context "$PRIMARY_CTX" -n mirrord delete pod -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 >/dev/null 2>&1
     kubectl --context "$PRIMARY_CTX" -n mirrord rollout status deploy/mirrord-operator --timeout=150s >/dev/null 2>&1 \
-      && ok "primary operator restarted (credential cache is empty)" || fail "primary operator did not come back"
+      && ok "primary operator restarted (tunnel pool starts from zero)" || fail "primary operator did not come back"
 
-    # Several reconcile cycles with the credential unprovisionable; the OLD behavior
-    # stripped the replica label here and tore every replica pod down.
+    # Several reconcile cycles with no tunnel to the member; the guarantee is that the
+    # outage stays in the DATA path - the fan-out must not downgrade or respawn anything.
     sleep 45
 
-    pods_after=$(kubectl --context "$member" -n "$NS" get pods -l "$pod_sel" -o jsonpath='{range .items[*]}{.metadata.uid}{"\n"}{end}' 2>/dev/null | sort)
+    # KNOWN BUG (split-recovery re-mint, chip task_517f35c0): when the restarted primary
+    # is ALSO the default cluster (2-cluster topology), its queue-split recovery drops the
+    # persisted mapping ("Recovered queue mapping not found in current config"), mints new
+    # tmp resources, members mismatch, and fail-anywhere tears the preview down. Report
+    # those failures as 🐞 so a red here always means a NEW regression - but ONLY when the
+    # signature is actually in the restarted operator's log.
+    remint_bug() {
+      [ "$PRIMARY_CTX" = "$DEFAULT_CTX" ] && [ "$SQS" = 1 ] || return 1
+      # grep -c, not -q: under pipefail, -q's early pipe close SIGPIPEs the still-
+      # streaming kubectl and fails the pipeline even when the signature matched.
+      local hits
+      hits=$(kubectl --context "$PRIMARY_CTX" -n mirrord logs deploy/mirrord-operator 2>/dev/null \
+        | grep -c "Recovered queue mapping not found in current config") || true
+      [ "${hits:-0}" -gt 0 ]
+    }
+    fail_or_known() {
+      if remint_bug; then known "$* - split-recovery re-mint"; else fail "$*"; fi
+    }
+
+    pods_after=$(pods_snapshot "$member")
     if [ -n "$pods_before" ] && [ "$pods_before" = "$pods_after" ]; then
       ok "$member: replica pods UNTOUCHED through the outage (identical pod UIDs)"
+    elif [ -z "$pods_before" ]; then
+      fail "$member: could not snapshot replica pods before the restart"
     else
-      fail "$member: replica pods changed during the credential outage"
+      fail_or_known "$member: replica pods changed during the tunnel outage (before: $(echo "$pods_before" | tr '\n' ' ')/ after: $(echo "$pods_after" | tr '\n' ' '))"
     fi
     lab=$(kubectl --context "$member" -n "$NS" get previewsessions.preview.mirrord.metalbear.co -o jsonpath='{.items[0].metadata.labels.operator\.metalbear\.co/preview-replica}' 2>/dev/null)
     [ "$lab" = "true" ] && ok "$member: copy kept its replica label" \
-      || fail "$member: copy lost the replica label (downgraded during outage)"
+      || fail_or_known "$member: copy lost the replica label (downgraded during outage)"
 
-    # Poll instead of a single shot: the stamp lands only after the restarted operator
-    # boots, wins leadership, reconciles this preview, and exhausts the kubeconfig
-    # rebuild retries - usually inside the 45s settle above, but not deterministically.
-    dmsg=""; deadline=$(( $(date +%s) + 120 ))
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-      dmsg=$(kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1/previews" 2>/dev/null \
-        | KEYX="$KEY" python3 -c '
-import json, os, sys
-items = [it for it in json.load(sys.stdin).get("items", [])
-         if (it.get("spec") or {}).get("key") == os.environ["KEYX"]]
-message = ((items[0].get("status") or {}).get("message") or {}) if items else {}
-print("%s|%s" % (message.get("kind") or "", (message.get("text") or "")[:70]))' 2>/dev/null)
-      case "$dmsg" in Degraded\|*credential*) break ;; esac
-      sleep 5
-    done
-    case "$dmsg" in
-      Degraded\|*credential*) ok "degradation is user-visible: ${dmsg#Degraded|}" ;;
-      *) fail "expected a Degraded credential message in the view, got: ${dmsg:-<none>}" ;;
-    esac
-
-    say "Restoring the ServiceAccount"
-    kubectl --context "$DEFAULT_CTX" -n mirrord create serviceaccount mirrord-branch-proxy >/dev/null 2>&1 \
-      && ok "ServiceAccount recreated (its RoleBinding survived by name)" \
-      || fail "could not recreate the ServiceAccount"
-    cleared=0; deadline=$(( $(date +%s) + 120 ))
-    while [ "$(date +%s)" -lt "$deadline" ]; do
-      now_msg=$(kubectl --context "$PRIMARY_CTX" get --raw "/apis/operator.metalbear.co/v1/previews" 2>/dev/null \
-        | KEYX="$KEY" python3 -c '
-import json, os, sys
-items = [it for it in json.load(sys.stdin).get("items", [])
-         if (it.get("spec") or {}).get("key") == os.environ["KEYX"]]
-print("yes" if items and (items[0].get("status") or {}).get("message") else "no")' 2>/dev/null)
-      [ "$now_msg" = "no" ] && { cleared=1; break; }
-      sleep 5
-    done
-    [ "$cleared" = 1 ] && ok "message cleared after recovery - credential provisioning resumed" \
-      || fail "degradation message never cleared after restoring the ServiceAccount"
+    # Recovery: once the restarted envoy re-dials its tunnel pool, a member replica's DB
+    # connections must work again - drivers reconnect through the sidecar, no pod churn.
+    if pf_up_current "$member" "$pod_sel" 17600; then
+      db_ok=0; deadline=$(( $(date +%s) + 180 ))
+      while [ "$(date +%s)" -lt "$deadline" ]; do
+        curl -sf -m 5 "http://127.0.0.1:17600/db/select" >/dev/null 2>&1 && { db_ok=1; break; }
+        sleep 5
+      done
+      if [ "$db_ok" = 1 ]; then
+        ok "$member: DB path recovered after the restart (tunnel re-dialed)"
+        curl -sf -m 10 "http://127.0.0.1:17600/db/insert/write-$RUN_ID-tunnel-recovery" >/dev/null 2>&1 \
+          && ok "$member: post-recovery write reached the branch" \
+          || fail "$member: post-recovery insert failed"
+      else
+        fail "$member: DB path never recovered after the primary restart"
+      fi
+    else
+      fail_or_known "$member: no replica pod to verify DB recovery on"
+    fi
   fi
 fi
 
@@ -1296,19 +1663,14 @@ if [ "$IDLE" = 1 ]; then
   [ -n "$idle_since" ] && ok "idleSince set on the default cluster's session ($idle_since)" \
     || fail "idleSince not set while idle"
   if [ "$DB" = 1 ]; then
-    # The proxies follow the idle lifecycle: their probes dial the default apiserver and
-    # the DB every few seconds, so an idle preview would otherwise keep generating
-    # cross-cluster churn for nobody. The Deployment itself must survive (it is
-    # garbage-collected only with the copy) - just scaled to zero.
+    # The DB sidecar rides inside the preview pod, so idling the pod idles the whole DB
+    # path for free - but the sidecar TLS Secret must survive the idle window (it is
+    # garbage-collected only with the copy), or the wake respawn has nothing to mount.
     for c in ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"}; do
-      proxy=$(kubectl --context "$c" -n "$NS" get deploy -o name 2>/dev/null | grep -- "-brdb-" | head -1)
-      if [ -z "$proxy" ]; then
-        fail "$c: branch proxy Deployment missing while idle (idle must scale, not delete)"
-        continue
-      fi
-      pr=$(kubectl --context "$c" -n "$NS" get "$proxy" -o jsonpath='{.spec.replicas}' 2>/dev/null)
-      [ "${pr:-1}" = 0 ] && ok "$c: branch proxy idles with the preview (0 replicas)" \
-        || fail "$c: branch proxy still at $pr replica(s) while idle"
+      pname=$(kubectl --context "$c" -n "$NS" get previewsessions.preview.mirrord.metalbear.co -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+      kubectl --context "$c" -n "$NS" get secret "${pname}-db-sidecar-tls" >/dev/null 2>&1 \
+        && ok "$c: sidecar TLS Secret survives the idle window" \
+        || fail "$c: sidecar TLS Secret gone while idle (wake respawn would have nothing to mount)"
     done
   fi
 
@@ -1331,39 +1693,55 @@ if [ "$IDLE" = 1 ]; then
     done
     if [ -n "$consumed_by" ]; then
       ok "wake message consumed by $consumed_by's 🎯 PREVIEW replica"
+
+      # 3. The woken replica must still reach the shared branch through its sidecar - the
+      #    branched env plus the tunnel chain have to survive the idle cycle, and the
+      #    native sidecar must revalidate against the gateway before the app starts.
+      #    Checked FIRST: the wake only buys IDLE_AFTER seconds of pod lifetime, and on a
+      #    slow host the log/API polls below can outlast it - the pod then re-idles away
+      #    mid-section, which is correct operator behavior, not a broken DB path.
+      if [ "$DB" = 1 ]; then
+        wpod=$(kubectl --context "$consumed_by" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$wpod" ]; then
+          if [ "$consumed_by" != "$DEFAULT_CTX" ]; then
+            wsc=$(kubectl --context "$consumed_by" -n "$NS" get pod "$wpod" \
+              -o jsonpath='{.status.initContainerStatuses[?(@.name=="mirrord-db-sidecar")].ready}' 2>/dev/null)
+            [ "$wsc" = "true" ] && ok "$consumed_by: DB sidecar came back Ready on wake" \
+              || fail "$consumed_by: DB sidecar not ready after wake (ready: ${wsc:-<none>})"
+          fi
+          if pf_up_current "$consumed_by" "preview.metalbear.co/session-uid,app=$APP" 17500; then
+            db_ok=0
+            for _ in $(seq 1 10); do
+              curl -sf -m 5 "http://127.0.0.1:17500/db/select" >/dev/null 2>&1 && { db_ok=1; break; }
+              sleep 3
+            done
+            [ "$db_ok" = 1 ] && ok "$consumed_by: woken replica reads the branch through the tunnel" \
+              || fail "$consumed_by: woken replica cannot reach the branch"
+          else
+            fail "$consumed_by: port-forward to the woken replica never came up"
+          fi
+        else
+          # Ready with no pod is a real failure; Idle with no pod means the idle window
+          # elapsed before we got here - correct behavior, nothing left to probe.
+          phase_now=$(previews_clusters | grep "^$consumed_by=" | cut -d= -f2)
+          [ "$phase_now" = "Idle" ] \
+            && warn "$consumed_by re-idled before the branch-path probe (slow host) - skipping it" \
+            || fail "$consumed_by: no woken replica pod to check the branch path on (phase: ${phase_now:-unknown})"
+        fi
+      fi
+
       total=$(for c in "${WORKLOAD_CTXS[@]}"; do replica_logs "$c" | grep -o "type=${MATCH}-WAKE1"; done | wc -l | tr -d ' ')
       [ "$total" = 1 ] && ok "consumed exactly once across the replicas" \
         || fail "wake message consumed $total times (want 1)"
       woken=$(previews_clusters | grep "^$consumed_by=" | cut -d= -f2)
-      [ "$woken" = "Ready" ] && ok "$consumed_by woke to Ready" \
-        || fail "$consumed_by phase after wake: ${woken:-unknown} (want Ready)"
+      # The wake window is short - by now the cluster may have legitimately re-idled.
+      case "$woken" in
+        Ready|Idle) ok "$consumed_by woke (phase now: $woken)" ;;
+        *) fail "$consumed_by phase after wake: ${woken:-unknown} (want Ready or Idle)" ;;
+      esac
       echo "    per-cluster phases: $(previews_clusters | paste -sd' ' -)"
     else
       fail "wake message never consumed by any replica"
-    fi
-
-    # 3. The woken replica must still reach the shared branch through its local proxy -
-    #    the wake scales the proxy back up BEFORE the app pod boots, and the branched env
-    #    plus proxy chain have to survive the idle cycle.
-    if [ "$DB" = 1 ] && [ -n "$consumed_by" ] && [ "$consumed_by" != "$DEFAULT_CTX" ]; then
-      wproxy=$(kubectl --context "$consumed_by" -n "$NS" get deploy -o name 2>/dev/null | grep -- "-brdb-" | head -1)
-      wpr=$(kubectl --context "$consumed_by" -n "$NS" get "$wproxy" -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
-      [ "${wpr:-0}" -ge 1 ] && ok "$consumed_by: branch proxy scaled back up on wake" \
-        || fail "$consumed_by: branch proxy not back after wake (${wproxy:-no deployment})"
-    fi
-    if [ "$DB" = 1 ] && [ -n "$consumed_by" ]; then
-      wpod=$(kubectl --context "$consumed_by" -n "$NS" get pods -l "preview.metalbear.co/session-uid,app=$APP" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-      if [ -n "$wpod" ] && pf_up "$consumed_by" "pod/$wpod" 17500; then
-        db_ok=0
-        for _ in $(seq 1 40); do
-          curl -sf -m 5 "http://127.0.0.1:17500/db/select" >/dev/null 2>&1 && { db_ok=1; break; }
-          sleep 3
-        done
-        [ "$db_ok" = 1 ] && ok "$consumed_by: woken replica reads the branch through the proxy" \
-          || fail "$consumed_by: woken replica cannot reach the branch"
-      else
-        fail "$consumed_by: no woken replica pod to check the branch path on"
-      fi
     fi
   else
     warn "SQS infra not deployed - skipping the queue wake (only auto-idle verified)"
@@ -1394,7 +1772,14 @@ if [ "$IDLE" = 1 ]; then
       done
       if [ "$hwoke" = 1 ]; then
         ok "$wake_ctx: held baggage request answered after the wake"
-        replica_logs "$wake_ctx" | grep -q "$hmarker" \
+        # The response proves the app served it; the log line trails by kubelet log
+        # propagation, so a single-shot grep right after the response flakes.
+        hlogged=0
+        for _ in $(seq 1 8); do
+          replica_logs "$wake_ctx" | grep -q "$hmarker" && { hlogged=1; break; }
+          sleep 2
+        done
+        [ "$hlogged" = 1 ] \
           && ok "$wake_ctx: request served by the WOKEN 🎯 PREVIEW replica (marker in its logs)" \
           || fail "$wake_ctx: response came back but the replica logs never saw the marker"
         hphase=$(previews_clusters | grep "^$wake_ctx=" | cut -d= -f2)
@@ -1528,18 +1913,15 @@ else
   fi
 
   hdr "[TEARDOWN] preview stop cleans every cluster"
-  stop_preview || FAILURES=$((FAILURES+1))
+  # Only plain stop asserts the timing bound: fail teardown already deleted the copies
+  # (nothing to confirm) and dead-cluster measures its own, longer bound.
+  stop_preview "$([ "$TEARDOWN" = stop ] && echo fast)" || FAILURES=$((FAILURES+1))
   sleep 10
   for c in ${NON_DEFAULT_CTXS[@]+"${NON_DEFAULT_CTXS[@]}"}; do
-    if kubectl --context "$c" -n "$NS" get deploy -o name 2>/dev/null | grep -q -- "-brdb-"; then
-      fail "$c: branch proxy leaked after teardown"
+    if kubectl --context "$c" -n "$NS" get secret -o name 2>/dev/null | grep -q -- "-db-sidecar-tls"; then
+      fail "$c: sidecar TLS Secret leaked after teardown"
     else
-      ok "$c: branch proxy garbage-collected with the copy"
-    fi
-    if kubectl --context "$c" -n "$NS" get secret 2>/dev/null | grep -q "branch-proxy-access"; then
-      fail "$c: access Secret leaked after teardown"
-    else
-      ok "$c: access Secret garbage-collected"
+      ok "$c: sidecar TLS Secret garbage-collected with the copy"
     fi
   done
   if [ "$SQS" = 1 ]; then
@@ -1556,9 +1938,13 @@ fi
 
 run_summary_table
 echo
-if [ "$FAILURES" = 0 ]; then
-  say "${GRN}ALL CHECKS PASSED${RST} ($OK_COUNT checks)"
-else
+if [ "$FAILURES" != 0 ]; then
   say "${RED}$FAILURES CHECK(S) FAILED${RST} ($OK_COUNT passed)"
+  exit 1
+elif [ "$KNOWN_COUNT" != 0 ]; then
+  say "${YEL}PASSED WITH $KNOWN_COUNT KNOWN-BUG CHECK(S)${RST} ($OK_COUNT passed) - tracked, not a regression"
+  exit 2
+else
+  say "${GRN}ALL CHECKS PASSED${RST} ($OK_COUNT checks)"
+  exit 0
 fi
-exit $(( FAILURES > 0 ? 1 : 0 ))

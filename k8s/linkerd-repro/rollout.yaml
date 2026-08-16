@@ -1,0 +1,33 @@
+# Mirrors the customer's target: a 2-replica Argo Rollout in a linkerd-meshed
+# namespace, targeted with incoming off (outgoing only, no stealing).
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: alert-triage
+  namespace: torq-repro
+spec:
+  replicas: 2
+  strategy:
+    canary: {}
+  selector:
+    matchLabels:
+      app: alert-triage
+  template:
+    metadata:
+      labels:
+        app: alert-triage
+    spec:
+      containers:
+        - name: alert-triage
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          env:
+            - name: BACKEND_URL
+              value: "http://backend.torq-repro.svc.cluster.local"
+            # Same shape as the customer's env overrides, so the config's
+            # feature.env.override has something real to replace.
+            - name: PUBSUB_PAUSE_SUBSCRIBER
+              value: "false"
+            - name: VERSION_PROGRAM
+              value: "alert-triage"

@@ -61,6 +61,11 @@ feature:
       # operator/crates/operator-proxy/src/config.rs
       OPERATOR_GENERIC_BRANCHING: "true"
       OPERATOR_PG_BRANCHING: "true"
+      OPERATOR_KAFKA_SPLITTING: "true"
+      # Share hosts for preview sessions (task preview:test:share). The domain doesn't
+      # need to resolve: minting and the baggage-arm steal are what the sandbox verifies,
+      # no mirrord-share-ingress deployment involved.
+      OPERATOR_SHARE_INGRESS_SHARE_DOMAIN: "preview.sandbox.local"
       # Branch pod config for generic branches (resources: JVM services like OpenSearch OOM
       # on the 512Mi default). This is a LOCAL file - the fs `local` pattern above makes the
       # operator read it from this repo instead of the deployed pod, so it's versioned here
@@ -72,6 +77,9 @@ feature:
       # Redis branch pod config for the TLS demo. Swapped between the plain and TLS
       # variants by task redis:tls:enable / redis:tls:disable (hot-reloaded).
       OPERATOR_REDIS_BRANCH_CONFIG: "../local-sandbox/configs/redis-branch-config.yaml"
+      # PostgreSQL branch pod config for the roles demo. Swapped between the empty and
+      # full variants by task postgres:roles:full / postgres:roles:empty (hot-reloaded).
+      OPERATOR_PG_BRANCH_CONFIG: "../local-sandbox/configs/pg-branch-config.yaml"
       # # OPERATOR_DYNAMODB_BRANCHING: "true"
       # OPERATOR_CLICKHOUSE_BRANCHING: "true"
 

@@ -7,7 +7,7 @@
 #
 #   A. standby-handover   - 2 replicas, delete the LEADER pod: the standby must
 #                           hold the lease and carry the leader label within
-#                           20s. Old behavior: 30-60s wait for pod garbage
+#                           30s (drain + release). Old behavior: 30-60s GC wait
 #                           collection.
 #   B. crash-reclaim      - overwrite the lease holder with a ghost id: the
 #                           leader notices within ~2s, error-exits, and the
@@ -17,11 +17,11 @@
 #                           expire.
 #   C. graceful-release   - scale the operator to 0: the lease must be left
 #                           with NO holder (or deleted by garbage collection)
-#                           within 20s. Old behavior: holder stayed set until
+#                           within 30s (after the task drain). Old behavior: set until
 #                           expiry.
 #   D. rollout-downtime   - rollout restart while probing the operator API
-#                           twice a second: total downtime must stay under 10s
-#                           (expected 1-3s). This is the upgrade experience.
+#                           twice a second: total downtime must stay under 20s
+#                           (expected a few seconds). The upgrade experience.
 #
 # Prereqs: an operator built from the branch with the lease rework, deployed in
 # the "mirrord" namespace. Run nothing else against the operator meanwhile.
@@ -119,7 +119,7 @@ brief \
   "A. standby-handover" \
   "   Scale to 2 replicas, then delete the LEADER pod." \
   "   Watch for: the dying pod logs 'Released the leadership lease', and the" \
-  "   OTHER pod takes the lease + leader label within 20 seconds." \
+  "   OTHER pod takes the lease + leader label within 30 seconds (the dying leader drains its tasks first)." \
   "   Old behavior: the standby waited 30-60s for pod garbage collection."
 
 scale_and_wait 2
@@ -133,10 +133,12 @@ else
   new_leader_up() { local l; l=$(leader_pod); [ -n "$l" ] && [ "$l" != "$OLD_LEADER" ]; }
   if wait_for 60 new_leader_up; then
     TOOK=$((SECONDS - START))
-    if [ "$TOOK" -le 20 ]; then
+    # The dying leader drains its tasks (up to 15s) before releasing, so the
+    # ceiling is drain + release + standby poll; idle operators hand over in seconds.
+    if [ "$TOOK" -le 30 ]; then
       verdict "standby-handover" 0 "new leader $(leader_pod) in ${TOOK}s"
     else
-      verdict "standby-handover" 1 "took ${TOOK}s (expected under 20s - lease probably not released)"
+      verdict "standby-handover" 1 "took ${TOOK}s (expected under 30s - lease probably not released)"
     fi
   else
     verdict "standby-handover" 1 "no new leader within 60s"
@@ -188,7 +190,7 @@ brief \
   "C. graceful-release" \
   "   Scale the operator to 0." \
   "   Watch for: the lease holder becomes EMPTY (or the lease disappears)" \
-  "   within 20 seconds - that empty holder is the release." \
+  "   within 30 seconds (after the task drain) - that empty holder is the release." \
   "   Old behavior: the dead process's id stayed on the lease until expiry."
 
 log "scaling $DEPLOY to 0"
@@ -199,15 +201,15 @@ released() {
   h=$(holder)
   [ -z "$h" ]
 }
-if wait_for 30 released; then
+if wait_for 40 released; then
   TOOK=$((SECONDS - START))
-  if [ "$TOOK" -le 20 ]; then
+  if [ "$TOOK" -le 30 ]; then
     verdict "graceful-release" 0 "holder cleared in ${TOOK}s"
   else
-    verdict "graceful-release" 1 "took ${TOOK}s (expected under 20s)"
+    verdict "graceful-release" 1 "took ${TOOK}s (expected under 30s)"
   fi
 else
-  verdict "graceful-release" 1 "holder still '$(holder)' after 30s"
+  verdict "graceful-release" 1 "holder still '$(holder)' after 40s"
 fi
 log "scaling back to $ORIGINAL_REPLICAS"
 scale_and_wait "$ORIGINAL_REPLICAS"
@@ -216,7 +218,7 @@ scale_and_wait "$ORIGINAL_REPLICAS"
 brief \
   "D. rollout-downtime" \
   "   Rollout-restart the operator while probing its API twice a second." \
-  "   Watch for: total API downtime under 10 seconds (expected 1-3s)." \
+  "   Watch for: total API downtime under 20 seconds (a few when idle)." \
   "   This is what a customer upgrade feels like. Old behavior: 30-60s."
 
 PROBE_LOG=$(mktemp /tmp/lease-probe.XXXXXX)
@@ -237,10 +239,10 @@ sleep 5
 kill "$PROBE_PID" 2>/dev/null; wait "$PROBE_PID" 2>/dev/null
 DOWN_SAMPLES=$(grep -c DOWN "$PROBE_LOG" || true)
 DOWNTIME=$(( DOWN_SAMPLES / 2 ))
-if [ "$DOWN_SAMPLES" -le 20 ]; then
+if [ "$DOWN_SAMPLES" -le 40 ]; then
   verdict "rollout-downtime" 0 "~${DOWNTIME}s of API downtime ($DOWN_SAMPLES samples of 0.5s)"
 else
-  verdict "rollout-downtime" 1 "~${DOWNTIME}s of API downtime (expected under 10s)"
+  verdict "rollout-downtime" 1 "~${DOWNTIME}s of API downtime (expected under 20s)"
 fi
 rm -f "$PROBE_LOG"
 

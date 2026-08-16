@@ -109,6 +109,12 @@ tasks:
         else
           echo "Deploying your build to $TOPO clusters..."
           task multicluster:operator:use VERSION=custom MC_NUM_CLUSTERS="$TOPO"
+          # The e2e suites only trust a unique e2e-* image tag: a mutable :custom tag can
+          # hide a stale image in a cluster's cache, so the helm install above is followed
+          # by the same tar-based unique-tag swap the suites use. After this, the preview
+          # suite runs without DEPLOY_OPERATOR=1.
+          echo "Swapping in a uniquely tagged build (e2e-*) so test suites trust the image..."
+          task multicluster:operator:deploy
         fi
       - task: _verify
       - task: _followup
@@ -202,6 +208,54 @@ tasks:
           AGENT=$(minikube -p "$P" image ls 2>/dev/null | grep -q "library/{{.AGENT_IMAGE}}:" && echo "agent '{{.AGENT_IMAGE}}' loaded" || echo "agent MISSING")
           echo "  $P: operator=$IMG  $AGENT"
         done
+
+  preview:e2e:
+    silent: true
+    desc: "One command for the preview / branch-tunnel e2e: reconciles the fleet to N=2|3 clusters (deleting or adding one as needed), deploys YOUR build, sets up SQS, then runs the suite. ONLY=/SKIP=/PICK=1 pick scenarios; SKIP_SETUP=1 goes straight to the tests."
+    vars:
+      N: '{{.N | default "3"}}'
+    cmds:
+      - |
+        set -euo pipefail
+        WANT="{{.N}}"
+        case "$WANT" in 2|3) ;; *) echo "N must be 2 or 3 (got '$WANT')"; exit 1 ;; esac
+
+        running() { minikube status -p "$1" >/dev/null 2>&1; }
+
+        if [ "${SKIP_SETUP:-0}" != 1 ]; then
+          # The fleet is defined by which profiles run: a 2-cluster run must not leave
+          # mirrord-remote-2 around, or the primary keeps its config entry and the suite
+          # derives the wrong default cluster.
+          if [ "$WANT" = 2 ] && running mirrord-remote-2; then
+            echo "==> Fleet is 3 clusters, want 2 - deleting mirrord-remote-2"
+            minikube delete -p mirrord-remote-2
+          fi
+
+          HAVE=0
+          for P in mirrord-primary mirrord-remote-1 mirrord-remote-2; do
+            running "$P" && HAVE=$((HAVE+1)) || true
+          done
+          echo "==> Fleet: $HAVE cluster(s) running, want $WANT"
+
+          # Idempotent: creates what is missing and reinstalls the operators against the
+          # values file for this cluster count, which is what rewrites the primary's
+          # cluster list when the topology changed.
+          task op:clusters N="$WANT"
+
+          echo "==> Deploying your operator build to all $WANT clusters"
+          task op:custom
+
+          # LocalStack belongs on the DEFAULT cluster, which differs per topology
+          # (primary at 2, mirrord-remote-1 at 3) - the count decides.
+          echo "==> Deploying the SQS test environment"
+          MC_NUM_CLUSTERS="$WANT" task multicluster:sqs:deploy
+        else
+          echo "==> SKIP_SETUP=1 - using the fleet as it is"
+        fi
+
+        # pg-source and the probe app are deployed by the suite itself, per scenario.
+        echo "==> Running the preview e2e suite ($WANT clusters)"
+        MC_NUM_CLUSTERS="$WANT" SUITE=1 {{.ROOT_DIR}}/scripts/mc-preview-replica-e2e.sh
 
   _verify:
     internal: true
