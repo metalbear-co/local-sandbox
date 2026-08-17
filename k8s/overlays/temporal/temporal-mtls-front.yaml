@@ -1,0 +1,94 @@
+# TLS-terminating gRPC front for the Temporal frontend that REQUIRES client
+# certificates (ssl_verify_client on). It exists purely to test the operator's
+# mTLS support for Temporal queue splitting: point the `temporal-connection`
+# property list at this service (task temporal:mtls:deploy does that) and the
+# operator's polls, Respond* forwards, and passthrough RPCs all have to present
+# a client certificate to get through.
+#
+# The plain temporal-frontend service keeps working next to it; the cluster
+# worker and the tctl commands are unaffected.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: temporal-mtls-nginx
+  namespace: temporal
+data:
+  nginx.conf: |
+    worker_processes 1;
+    events { worker_connections 1024; }
+    http {
+      server {
+        listen 7233 ssl;
+        http2 on;
+
+        ssl_certificate /etc/temporal-mtls/tls.crt;
+        ssl_certificate_key /etc/temporal-mtls/tls.key;
+        ssl_client_certificate /etc/temporal-mtls/ca.crt;
+        ssl_verify_client on;
+
+        # Temporal workflow/activity polls are long polls (60-70s); keep the
+        # proxy read window comfortably above that so polls are not cut off.
+        grpc_read_timeout 300s;
+        grpc_send_timeout 300s;
+        client_body_timeout 300s;
+
+        location / {
+          grpc_pass grpc://temporal-frontend.temporal.svc.cluster.local:7233;
+        }
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: temporal-mtls
+  namespace: temporal
+  labels:
+    app: temporal-mtls
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: temporal-mtls
+  template:
+    metadata:
+      labels:
+        app: temporal-mtls
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.27-alpine
+        ports:
+        - containerPort: 7233
+        volumeMounts:
+        - name: nginx-conf
+          mountPath: /etc/nginx/nginx.conf
+          subPath: nginx.conf
+        - name: tls
+          mountPath: /etc/temporal-mtls
+          readOnly: true
+        readinessProbe:
+          tcpSocket:
+            port: 7233
+          initialDelaySeconds: 2
+          periodSeconds: 5
+      volumes:
+      - name: nginx-conf
+        configMap:
+          name: temporal-mtls-nginx
+      - name: tls
+        secret:
+          secretName: temporal-mtls-server
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: temporal-mtls
+  namespace: temporal
+spec:
+  selector:
+    app: temporal-mtls
+  ports:
+  - port: 7233
+    targetPort: 7233
+    name: grpc-tls

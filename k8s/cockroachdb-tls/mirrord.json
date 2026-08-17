@@ -1,0 +1,21 @@
+{
+  "target": { "path": { "pod": "cockroachdb-server-tls" }, "namespace": "crdb-tls-test" },
+  "operator": true,
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": { "incoming": "off", "outgoing": true },
+    "db_branches": [
+      {
+        "id": "crdb-tls-branch",
+        "type": "cockroachdb",
+        "version": "latest-v26.2",
+        "name": "tls_branch",
+        "ttl_secs": 300,
+        "creation_timeout_secs": 180,
+        "connection": { "url": { "type": "env", "variable": "DATABASE_URL" } },
+        "copy": { "mode": "all" }
+      }
+    ]
+  }
+}

@@ -41,9 +41,6 @@ operator:
       mirrord-remote-1:
         authType: bearerToken
         isDefault: true
-      mirrord-remote-2:
-        authType: bearerToken
-        isDefault: false
 agent:
   image: mirrord-agent:custom
 license:

@@ -1,0 +1,58 @@
+version: "3"
+
+# Leadership lease failover testing (release-on-shutdown, same-pod reclaim).
+#
+#   task lease:test        all scenarios with briefings (Enter between them)
+#   task lease:test:auto   same without pauses (CI-style)
+#   task lease:watch       live scoreboard: lease holder + labeled leader pod
+#   task lease:status      one-shot view of lease, leader pod, and API health
+#
+# Scenarios: standby handover (<20s), crash reclaim (<45s), graceful release
+# (<20s), rollout downtime (<10s). Old operators fail all four - run against
+# a build with the lease rework (task multicluster:operator:use VERSION=custom).
+#
+# CTX picks the cluster (default: mirrord-primary if it exists, else current).
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+
+tasks:
+  test:
+    desc: "Lease failover suite: standby handover, crash reclaim, graceful release, rollout downtime (interactive)"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-lease-failover.sh"
+
+  test:auto:
+    desc: "Lease failover suite without pauses"
+    interactive: true
+    cmds:
+      - NO_PAUSE=1 {{.ROOT_DIR}}/scripts/test-lease-failover.sh
+
+  watch:
+    desc: "Live scoreboard: lease holder + leader pod, one line per second"
+    interactive: true
+    cmds:
+      - |
+        CTX="${CTX:-$(kubectl config get-contexts mirrord-primary >/dev/null 2>&1 && echo mirrord-primary || kubectl config current-context)}"
+        echo "watching context $CTX (Ctrl-C to stop)"
+        while true; do
+          echo "$(date +%H:%M:%S)  holder=$(kubectl --context "$CTX" get lease mirrord-operator-leader -n mirrord -o jsonpath='{.spec.holderIdentity}' 2>/dev/null)  leader=$(kubectl --context "$CTX" get pods -n mirrord -l mirrord-operator-leader=true --no-headers -o custom-columns=:metadata.name 2>/dev/null | head -1)"
+          sleep 1
+        done
+
+  status:
+    desc: "One-shot view of the lease, leader pod, and operator API health"
+    silent: true
+    cmds:
+      - |
+        CTX="${CTX:-$(kubectl config get-contexts mirrord-primary >/dev/null 2>&1 && echo mirrord-primary || kubectl config current-context)}"
+        echo "── lease (context $CTX) ──"
+        kubectl --context "$CTX" get lease mirrord-operator-leader -n mirrord -o jsonpath='holder: {.spec.holderIdentity}{"\n"}renewed: {.spec.renewTime}{"\n"}' 2>/dev/null || echo "(no lease)"
+        echo "── operator pods ──"
+        kubectl --context "$CTX" get pods -n mirrord -l app=mirrord-operator -o wide 2>/dev/null
+        echo "── leader label ──"
+        kubectl --context "$CTX" get pods -n mirrord -l mirrord-operator-leader=true --no-headers -o custom-columns=:metadata.name 2>/dev/null || true
+        echo "── API ──"
+        kubectl --context "$CTX" get mirrordoperators operator -o name >/dev/null 2>&1 && echo "reachable" || echo "NOT reachable"

@@ -1,0 +1,41 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: multi-topic-split
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: servicebus-multi-consumer
+  clientConfigs:
+    azureServiceBus: servicebus-azure-config
+  # Each queue's subscription is bound to its own pod env var so the operator
+  # rewrites exactly the var the consumer reads (SERVICEBUS_SUBSCRIPTION_N),
+  # pointing the pod at the per-session `mirrord-s-*` sub. The topic name is read
+  # from SERVICEBUS_TOPIC_N.
+  #
+  # The case mismatch lives on topic-2: the pod sets `test-sub-2` (lowercase)
+  # while the real Azure subscription is `Test-sub-2`. Azure entity lookups are
+  # case-insensitive, so the operator installs its rules on the mixed-case sub -
+  # the same drift the client has between a lowercase config and mixed-case
+  # Azure. topic-1 matches case (test-sub) as the control.
+  queues:
+  - id: topic-1
+    kind: azureServiceBus
+    appConfig:
+      subscription:
+      - env: SERVICEBUS_SUBSCRIPTION_1
+        fallback: test-sub
+      topic:
+      - env: SERVICEBUS_TOPIC_1
+        fallback: test-topic
+  - id: topic-2
+    kind: azureServiceBus
+    appConfig:
+      subscription:
+      - env: SERVICEBUS_SUBSCRIPTION_2
+        fallback: test-sub-2
+      topic:
+      - env: SERVICEBUS_TOPIC_2
+        fallback: test-topic-2

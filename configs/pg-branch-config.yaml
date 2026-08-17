@@ -1,0 +1,4 @@
+# Full role fidelity: real role attributes and memberships, owner/ACL-preserving
+# copy, and the session leaves the app's own user/password env vars untouched.
+dbPod:
+  roles: "full"

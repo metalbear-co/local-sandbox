@@ -1,0 +1,81 @@
+version: "3"
+
+# Runs each repo's CI lint-check locally against the sibling checkouts
+# (../mirrord, ../operator). Repos that are not checked out are skipped.
+#
+#   task lint            lint both repos
+#   task lint:mirrord    cargo fmt, clippy (CI flags), crd check, shear, typos
+#   task lint:operator   cargo fmt, taplo fmt, clippy
+
+vars:
+  MIRRORD_DIR: "{{.ROOT_DIR}}/../mirrord"
+  OPERATOR_DIR: "{{.ROOT_DIR}}/../operator"
+
+tasks:
+  default:
+    desc: "Run CI lint checks for both mirrord and operator"
+    cmds:
+      - task: mirrord
+      - task: operator
+
+  mirrord:
+    desc: "mirrord repo lint - mirrors .github/workflows/check-lint.yaml (lint, shear, typos jobs)"
+    cmds:
+      - |
+        set -uo pipefail
+        cd "{{.MIRRORD_DIR}}" 2>/dev/null || { echo "-- skipping mirrord: {{.MIRRORD_DIR}} not found"; exit 0; }
+        echo "linting $(pwd)"
+
+        fails=()
+        run() { echo; echo "==> $*"; "$@" || fails+=("$*"); }
+        skip() { echo; echo "-- skipping: $1 ($2)"; }
+
+        run cargo fmt --all
+        run cargo clippy --all-targets --all-features -- "-Wclippy::indexing_slicing" -D warnings
+        run cargo check -p mirrord-operator --features crd
+
+        if command -v cargo-shear >/dev/null; then
+          run cargo shear --deny-warnings
+        else
+          skip "cargo shear" "install with: cargo install cargo-shear --locked"
+        fi
+
+        if command -v typos >/dev/null; then
+          run bash -c "typos --format brief \$(git ls-files '*.md') \$(git ls-files 'mirrord/config/*.rs')"
+        else
+          skip "typos" "install with: cargo install typos-cli --locked"
+        fi
+
+        echo
+        if [ "${#fails[@]}" -gt 0 ]; then
+          echo "FAILED mirrord checks:"; printf '  - %s\n' "${fails[@]}"; exit 1
+        fi
+        echo "mirrord lint passed - CI lint-check should be green"
+
+  operator:
+    desc: "operator repo lint - mirrors .github/workflows/check-lint.yaml"
+    cmds:
+      - |
+        set -uo pipefail
+        cd "{{.OPERATOR_DIR}}" 2>/dev/null || { echo "-- skipping operator: {{.OPERATOR_DIR}} not found"; exit 0; }
+        echo "linting $(pwd)"
+
+        fails=()
+        run() { echo; echo "==> $*"; "$@" || fails+=("$*"); }
+        skip() { echo; echo "-- skipping: $1 ($2)"; }
+
+        run cargo fmt --all
+
+        if command -v taplo >/dev/null; then
+          run taplo fmt
+        else
+          skip "taplo fmt" "install with: cargo install taplo-cli --locked"
+        fi
+
+        run cargo clippy --all-targets --all-features -- -D warnings
+
+        echo
+        if [ "${#fails[@]}" -gt 0 ]; then
+          echo "FAILED operator checks:"; printf '  - %s\n' "${fails[@]}"; exit 1
+        fi
+        echo "operator lint passed - CI lint-check should be green"

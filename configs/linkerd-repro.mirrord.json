@@ -1,0 +1,13 @@
+{
+  "target": { "path": "rollout/alert-triage", "namespace": "torq-repro" },
+  "feature": {
+    "network": { "incoming": "off", "outgoing": true },
+    "fs": "read",
+    "env": {
+      "override": {
+        "PUBSUB_PAUSE_SUBSCRIBER": "true",
+        "VERSION_PROGRAM": "alert-triage-local"
+      }
+    }
+  }
+}

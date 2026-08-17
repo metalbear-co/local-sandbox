@@ -1,0 +1,34 @@
+{
+    "operator": true,
+    "feature": {
+        "db_branches": [
+            {
+                "type": "generic",
+                "id": "cassandra-generic-branch-copy",
+                "ttl_secs": 300,
+                "creation_timeout_secs": 360,
+                "image": "cassandra:5",
+                "port": 9042,
+                "connection": {
+                    "params": {
+                        "host": { "env_var_name": "CASSANDRA_ADDR", "value_pattern": "^(?P<host>[^:]+):" },
+                        "port": { "env_var_name": "CASSANDRA_ADDR", "value_pattern": ":(?P<port>[0-9]+)$" }
+                    }
+                },
+                "env": {
+                    "MAX_HEAP_SIZE": "512M",
+                    "HEAP_NEWSIZE": "128M",
+                    "CASSANDRA_SNITCH": "SimpleSnitch"
+                },
+                "readiness": {
+                    "type": "exec",
+                    "command": ["sh", "-c", "cqlsh -e 'SELECT now() FROM system.local' > /dev/null 2>&1"]
+                },
+                "copy": {
+                    "image": "cassandra:5",
+                    "script_path": "./copy-cassandra.sh"
+                }
+            }
+        ]
+    }
+}

@@ -1,0 +1,19 @@
+{
+    "feature": {
+        "db_branches": [
+            {
+                "type": "redis",
+                "location": "remote",
+                "connection": {
+                    "url": {
+                        "type": "env",
+                        "variable": "REDIS_URL"
+                    }
+                },
+                "copy": {
+                    "mode": "all"
+                }
+            }
+        ]
+    }
+}

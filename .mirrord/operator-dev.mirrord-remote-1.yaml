@@ -68,6 +68,7 @@ feature:
       # Force flags the deployed released chart doesn't render (see
       # operator/crates/operator-proxy/src/config.rs for the full list).
       OPERATOR_GENERIC_BRANCHING: "true"
+      OPERATOR_SQS_SPLITTING: "true"
       OPERATOR_AZURE_SERVICE_BUS_SPLITTING: "true"
       # Relative to ../operator (operator:dev runs the binary from there).
       OPERATOR_GENERIC_BRANCH_CONFIG: "../local-sandbox/configs/generic-branch-config.yaml"

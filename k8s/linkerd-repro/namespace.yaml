@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: torq-repro
+  annotations:
+    # Namespace-level injection, like the customer's target namespace: every
+    # pod created here gets a linkerd-proxy sidecar.
+    linkerd.io/inject: enabled

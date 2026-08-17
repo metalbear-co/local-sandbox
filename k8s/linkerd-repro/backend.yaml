@@ -1,0 +1,35 @@
+# Stands in for the customer's staging dependencies (their local binary makes
+# outgoing calls only). The repro binary curls this service through the env
+# imported from the target pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: torq-repro
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend
+  template:
+    metadata:
+      labels:
+        app: backend
+    spec:
+      containers:
+        - name: backend
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: torq-repro
+spec:
+  selector:
+    app: backend
+  ports:
+    - port: 80
+      targetPort: 80

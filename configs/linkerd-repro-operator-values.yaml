@@ -1,0 +1,21 @@
+# Values for the linkerd-repro module only. Deliberately NOT the sandbox's
+# operator-values.yaml: that file overrides the agent image to the local
+# "test" build, while this repro must run the operator's compiled-in default
+# agent (ghcr.io/metalbear-co/mirrord:<pinned mirrord version>, 3.243.0 for
+# operator 3.190.0) exactly like the customer does.
+operator:
+  # The customer's limits at the time of the report (chart default until 3.191.0).
+  limits:
+    cpu: 200m
+    memory: 200Mi
+  jsonLog: false
+  logLevel: "mirrord=info,operator=info,kube_runtime=warn"
+
+# Matches the customer's agent-config.yaml configmap: inject_headers plus the
+# chart-default priority class, nothing else. No image override.
+agent:
+  extraConfig:
+    inject_headers: true
+
+disableTelemetries: true
+createNamespace: false

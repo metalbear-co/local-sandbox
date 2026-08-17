@@ -1,0 +1,47 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "mssql-real-target"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "mssql-real-subset",
+        "name": "AdventureWorks",
+        "type": "mssql",
+        "version": "2022-latest",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 900,
+        "connection": {
+          "url": {
+            "type": "env",
+            "variable": "DATABASE_URL"
+          }
+        },
+        "copy": {
+          "mode": "subset",
+          "tables": {
+            "SalesLT.Customer": {
+              "conditions": [
+                { "column": "CustomerID", "op": "eq", "value": 29847 }
+              ]
+            }
+          },
+          "limits": {
+            "max_total_rows": 100000,
+            "max_rows_per_table": 50000
+          }
+        }
+      }
+    ]
+  }
+}

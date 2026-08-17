@@ -26,9 +26,12 @@ vars:
   MONGODB_DIR: '{{.ROOT_DIR}}/k8s/mongodb'
   SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/mongodb/modular-tests/scenarios'
   MONGODB_MIRRORD_CONFIG: '{{.MONGODB_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mongodb/mirrord.json")}}'
+  MONGODB_MIRRORD_REAL_CONFIG: '{{.MONGODB_MIRRORD_REAL_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mongodb/mirrord-real.json")}}'
   # Connection strings: source requires auth, branch pods run open on localhost.
   MONGODB_SOURCE_URI: "mongodb://admin:password@localhost:27017/source_db?authSource=admin"
-  MONGODB_BRANCH_URI: "mongodb://localhost:27017/branch_db"
+  # branch mongod runs with auth enabled; root creds are set by the operator
+  # (operator-db-branching src/mongodb/initializer.rs: DB_ROOT_USERNAME/DB_ROOT_PASSWORD)
+  MONGODB_BRANCH_URI: "mongodb://root:mongodb-branch-pod-root-password@localhost:27017/branch_db?authSource=admin"
 
 tasks:
   deploy:
@@ -185,3 +188,84 @@ tasks:
         done
         echo "Branch pod did not come up; check 'task mongodb:status'"
         exit 1
+
+  deploy:real:
+    desc: Deploy a realistic source DB — Atlas sample_analytics (customers -> accounts via ARRAY field -> transactions; relations declared in the config) — plus its mirrord target pod
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/mongodb/real
+      - echo "Waiting for the real source database (downloads and loads the dataset on first start)..."
+      - kubectl wait --for=condition=ready pod mongodb-real -n {{.NAMESPACE}} --timeout=600s
+      - kubectl wait --for=condition=ready pod mongo-real-target -n {{.NAMESPACE}} --timeout=120s
+      - echo "Real source ready. Start a subset branch with 'task mongodb:run:real:local'."
+
+  run:real:local:
+    desc: Run the app under mirrord with a `subset` branch of the real DB (seed customers username = "fmiller"; Ctrl-C to stop)
+    interactive: true
+    dir: apps/mongodb-app
+    preconditions:
+      - sh: test -f {{.MONGODB_MIRRORD_REAL_CONFIG}}
+        msg: "mirrord config not found at {{.MONGODB_MIRRORD_REAL_CONFIG}}"
+    cmds:
+      - go build -o /tmp/mongodb-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.MONGODB_MIRRORD_REAL_CONFIG}} -- /tmp/mongodb-app
+      # Inspect the closure afterwards, e.g.: mongosh into the branch pod: use sample_analytics; db.accounts.countDocuments()
+
+  clean:real:
+    desc: Remove the real-data source DB and its target pod
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/mongodb/real --ignore-not-found=true 2>/dev/null || true
+
+  tables:source:
+    desc: 'List tables + exact row counts on the source (auto-detects mongodb-test/mongodb-real; override with POD=... DB=...)'
+    silent: true
+    vars:
+      POD: '{{.POD | default ""}}'
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD="{{.POD}}"; DB="{{.DB}}"
+        if [ -z "$POD" ]; then
+          if kubectl get pod mongodb-test -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=mongodb-test
+          elif kubectl get pod mongodb-real -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=mongodb-real; [ -z "$DB" ] && DB=sample_analytics
+          else
+            echo "No source pod found (mongodb-test or mongodb-real). Deploy one first."; exit 1
+          fi
+        fi
+        [ -z "$DB" ] && DB=source_db
+        echo "=== source pod: $POD (db: $DB) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mongosh "mongodb://admin:password@localhost:27017/$DB?authSource=admin" --quiet --eval 'db.getCollectionNames().sort().forEach(function(c){ print(c + ": " + db[c].countDocuments()) })'
+  tables:branch:
+    desc: 'List collections + document counts on the newest branch (all user DBs; narrow with DB=...)'
+    silent: true
+    vars:
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | grep mirrord-mongodb-branch | tail -1 | cut -d/ -f2)
+        if [ -z "$POD" ]; then echo "No running mongodb branch pod found."; exit 1; fi
+        echo "=== branch pod: $POD ==="
+        # branch mongod runs with auth enabled; root creds are set by the operator
+        # (operator-db-branching src/mongodb/initializer.rs: DB_ROOT_USERNAME/DB_ROOT_PASSWORD)
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- mongosh "mongodb://root:mongodb-branch-pod-root-password@localhost:27017/admin" --quiet --eval '
+          var only = "{{.DB}}";
+          db.adminCommand({ listDatabases: 1 }).databases
+            .map(function(d){ return d.name })
+            .filter(function(n){ return ["admin","config","local"].indexOf(n) === -1 && (only === "" || n === only) })
+            .forEach(function(n){
+              print("--- db: " + n + " ---");
+              var d = db.getSiblingDB(n);
+              d.getCollectionNames().sort().forEach(function(c){ print(c + ": " + d[c].countDocuments()) });
+            })'

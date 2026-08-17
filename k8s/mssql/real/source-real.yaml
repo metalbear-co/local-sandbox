@@ -1,0 +1,68 @@
+# "Real" MSSQL source: the AdventureWorksLT sample restored from its .bak at pod
+# start. LT is the lightweight variant (SalesLT schema, FK-rich but bounded) so a
+# bidirectional subset closure stays small; for the full AdventureWorks2019.bak swap
+# the URL below and raise the limits in mirrord-real.json — its dense product/order
+# graph makes closures large by nature.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mssql-real
+  labels:
+    app: mssql-real
+spec:
+  initContainers:
+    - name: fetch-adventureworks
+      image: busybox:1.36
+      command: ["sh", "-c"]
+      args:
+        - |
+          set -e
+          wget -q -O /restore/adventureworks.bak https://github.com/Microsoft/sql-server-samples/releases/download/adventureworks/AdventureWorksLT2019.bak
+          echo "bak downloaded: $(wc -c < /restore/adventureworks.bak) bytes"
+      volumeMounts:
+        - name: restore
+          mountPath: /restore
+  containers:
+    - name: mssql
+      image: mcr.microsoft.com/mssql/server:2022-latest
+      env:
+        - name: ACCEPT_EULA
+          value: "Y"
+        - name: MSSQL_SA_PASSWORD
+          value: "TestP@ssw0rd!"
+      ports:
+        - containerPort: 1433
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          /opt/mssql/bin/sqlservr & SQLPID=$!
+          SQLCMD="/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P TestP@ssw0rd! -C"
+          for i in $(seq 1 60); do
+            $SQLCMD -Q 'SELECT 1' -l 1 &>/dev/null && break
+            sleep 1
+          done
+          # Build the MOVE list from the bak's logical file names so the restore works
+          # regardless of which AdventureWorks variant the init container fetched.
+          MOVES=$($SQLCMD -h -1 -W -s '|' -Q "SET NOCOUNT ON; RESTORE FILELISTONLY FROM DISK='/restore/adventureworks.bak'" \
+            | awk -F'|' 'NF>2 { ext = ($3=="L") ? ".ldf" : ".mdf"; printf ", MOVE '\''%s'\'' TO '\''/var/opt/mssql/data/%s%s'\''", $1, $1, ext }')
+          $SQLCMD -Q "RESTORE DATABASE AdventureWorks FROM DISK='/restore/adventureworks.bak' WITH REPLACE$MOVES"
+          $SQLCMD -Q "SELECT name FROM sys.databases"
+          wait $SQLPID
+      volumeMounts:
+        - name: restore
+          mountPath: /restore
+  volumes:
+    - name: restore
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mssql-real
+spec:
+  selector:
+    app: mssql-real
+  ports:
+    - name: mssql
+      port: 1433
+      targetPort: 1433

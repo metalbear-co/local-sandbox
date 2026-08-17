@@ -1,0 +1,25 @@
+{
+  "target": {
+    "path": "deploy/echo-app",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "env": {
+      "override": {
+        "CLUSTER_ID": "preview-pod"
+      }
+    },
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "http_filter": {
+          "header_filter": "X-Preview: {{ key }}"
+        }
+      }
+    }
+  }
+}

@@ -14,6 +14,7 @@ operator:
   mssqlBranching: true
   spannerBranching: true
   genericBranching: true
+  cockroachdbBranching: true
   # Generic branch pods default to a 512Mi limit - too small for JVM services like
   # OpenSearch. This admin config applies to ALL generic branch pods in this sandbox.
   genericBranchConfig:

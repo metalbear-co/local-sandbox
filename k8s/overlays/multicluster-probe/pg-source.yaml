@@ -1,0 +1,27 @@
+# Branch source DB for the combined replica demo (lives on the DEFAULT cluster only).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pg-source
+  labels: { app: pg-source }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: pg-source } }
+  template:
+    metadata: { labels: { app: pg-source } }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          env:
+            - { name: POSTGRES_PASSWORD, value: sourcepass }
+            - { name: POSTGRES_DB, value: source_db }
+          ports: [ { containerPort: 5432 } ]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pg-source
+spec:
+  selector: { app: pg-source }
+  ports: [ { port: 5432, targetPort: 5432 } ]

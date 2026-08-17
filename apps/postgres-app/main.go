@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -17,7 +18,15 @@ func main() {
 
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
-		log.Fatal("DATABASE_URL environment variable is not set")
+		// Params-style scenarios (e.g. the roles scenario) carry the connection as
+		// individual DB_* vars, like apps that build their own connection string.
+		host := os.Getenv("DB_HOST")
+		if host == "" {
+			log.Fatal("Neither DATABASE_URL nor DB_HOST environment variables are set")
+		}
+		dbURL = "postgres://" + url.UserPassword(os.Getenv("DB_USER"), os.Getenv("DB_PASSWORD")).String() +
+			"@" + host + ":" + os.Getenv("DB_PORT") + "/" + os.Getenv("DB_NAME")
+		log.Println("DATABASE_URL not set, built connection string from DB_* variables")
 	}
 
 	// Add sslmode=disable to the connection string if not already present
@@ -56,6 +65,18 @@ func main() {
 	}
 
 	log.Println("Connected to PostgreSQL database")
+
+	// Show which role this session actually runs as - the visible difference between
+	// the roles modes (branch superuser vs the app's own role).
+	var currentUser string
+	var isSuperuser bool
+	if err := db.QueryRow(
+		"SELECT current_user, rolsuper FROM pg_roles WHERE rolname = current_user",
+	).Scan(&currentUser, &isSuperuser); err != nil {
+		log.Printf("Warning: failed to read session identity: %v", err)
+	} else {
+		log.Printf("Session identity: user=%s superuser=%t", currentUser, isSuperuser)
+	}
 
 	// Create table
 	createTableQuery := `

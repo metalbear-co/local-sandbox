@@ -1,0 +1,3 @@
+# Default PostgreSQL branch pod config: source roles become NOLOGIN shells.
+dbPod:
+  roles: "empty"

@@ -1,0 +1,159 @@
+version: "3"
+
+# Ari's kafka-demo (event-driven mode) from the playground repo, recreated on the
+# local sandbox so the preview-idle + Kafka split behavior can be tested locally.
+#
+#   task kafka-demo:deploy          kafka+postgres infra, build+load images, apply the
+#                                   kafka-demo-event overlay on the target cluster
+#   task kafka-demo:session:idle    Ari's preview-idle split session (SLEEP=30 reproduces
+#                                   his too-short idle window, SLEEP=300 is his fix)
+#   task kafka-demo:trigger         one matched message through the gateway (session key)
+#   task kafka-demo:trigger:plain   one unmatched message (production path)
+#   task kafka-demo:offsets         consumer group offsets on the shared Kafka - shows the
+#                                   CURRENT-OFFSET=- symptom while a consumer never commits
+#   task kafka-demo:logs            service-b-ev + pod overview
+#   task kafka-demo:clean           remove the kafka-demo-event namespace
+#
+# The service-b code in playground already contains Ari's offset fix
+# (kgo.ConsumeResetOffset AtStart, service-b/main.go). To reproduce his issue 2
+# (woken consumer skips the message that woke it), flip that line to .AtEnd(),
+# then task kafka-demo:build + task kafka-demo:deploy again.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  PLAYGROUND_DIR: '{{.KAFKA_DEMO_PLAYGROUND_DIR | default (print .ROOT_DIR "/../playground")}}'
+  CONTEXT: '{{.KAFKA_DEMO_CONTEXT | default "bearkube"}}'
+  NS: kafka-demo-event
+  INFRA_NS: infra
+  KEY: '{{.KAFKA_DEMO_KEY | default "changed-responce"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  REGISTRY: ghcr.io/metalbear-co
+  IMAGES: gateway service-a service-b service-c cronjob
+  DATABASE_URL: '{{.KAFKA_DEMO_DATABASE_URL | default "postgresql://postgres:postgres@postgres.infra.svc.cluster.local:5432/postgres"}}'
+
+tasks:
+  infra:
+    desc: Deploy Kafka + Postgres (playground infrastructure manifests) into the infra namespace
+    cmds:
+      - kubectl --context {{.CONTEXT}} create namespace {{.INFRA_NS}} --dry-run=client -o yaml | kubectl --context {{.CONTEXT}} apply -f -
+      - kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} create secret generic postgres-credentials --from-literal=password=postgres --dry-run=client -o yaml | kubectl --context {{.CONTEXT}} apply -f -
+      - kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} apply -k {{.PLAYGROUND_DIR}}/manifests/infrastructure/kafka
+      - kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} apply -k {{.PLAYGROUND_DIR}}/manifests/infrastructure/postgres
+      - kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} rollout status statefulset/kafka --timeout=300s
+      - kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} rollout status deployment/postgres --timeout=300s
+
+  build:
+    desc: Build the kafka-demo images locally and load them into the target minikube profile
+    cmds:
+      - for: { var: IMAGES }
+        cmd: cd {{.PLAYGROUND_DIR}} && {{.CONTAINER_RUNTIME}} build -f apps/kafka-demo/{{.ITEM}}/Dockerfile -t {{.REGISTRY}}/playground-kafka-demo-{{.ITEM}}:latest .
+      - for: { var: IMAGES }
+        cmd: minikube -p {{.CONTEXT}} image load {{.REGISTRY}}/playground-kafka-demo-{{.ITEM}}:latest
+
+  deploy:
+    desc: Full setup - infra, images, DB secret, event-driven overlay
+    deps: []
+    cmds:
+      - task: infra
+      - task: build
+      # franz-go does not request topic auto-creation, so the topics must exist up front
+      # (on the playground GKE cluster they already did).
+      - for: ["kafka-demo.ev.a", "kafka-demo.ev.b", "kafka-demo.ev.c", "kafka-demo.ev.trace"]
+        cmd: kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} exec kafka-0 -- /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic {{.ITEM}} --partitions 1 --replication-factor 1
+      - kubectl --context {{.CONTEXT}} create namespace {{.NS}} --dry-run=client -o yaml | kubectl --context {{.CONTEXT}} apply -f -
+      - kubectl --context {{.CONTEXT}} -n {{.NS}} create secret generic kafka-demo-db --from-literal=url='{{.DATABASE_URL}}' --dry-run=client -o yaml | kubectl --context {{.CONTEXT}} apply -f -
+      # The overlay carries two GKE-only resources (HTTPRoute, HealthCheckPolicy) whose
+      # CRDs do not exist on minikube; the gateway is reached via port-forward instead.
+      - |
+        kubectl --context {{.CONTEXT}} kustomize {{.PLAYGROUND_DIR}}/manifests/kafka-demo/overlays/event-driven \
+          | python3 -c '
+        import sys, yaml
+        docs = [d for d in yaml.safe_load_all(sys.stdin) if d and d.get("kind") not in ("HTTPRoute", "HealthCheckPolicy")]
+        print(yaml.safe_dump_all(docs))' \
+          | kubectl --context {{.CONTEXT}} apply -f -
+      # Images are loaded into minikube, never pulled - Always would hit GHCR and fetch
+      # whatever was pushed there instead of the local build.
+      - for: ["gateway-ev", "service-a-ev", "service-b-ev", "service-c-ev"]
+        cmd: kubectl --context {{.CONTEXT}} -n {{.NS}} patch deployment {{.ITEM}} --type=json -p '[{"op":"replace","path":"/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
+      - kubectl --context {{.CONTEXT}} -n {{.NS}} patch cronjob cronjob-z --type=json -p '[{"op":"replace","path":"/spec/jobTemplate/spec/template/spec/containers/0/imagePullPolicy","value":"IfNotPresent"}]'
+      - for: ["gateway-ev", "service-a-ev", "service-b-ev", "service-c-ev"]
+        cmd: kubectl --context {{.CONTEXT}} -n {{.NS}} rollout status deployment/{{.ITEM}} --timeout=180s
+      - 'echo "kafka-demo-event ready on {{.CONTEXT}}. Next: task kafka-demo:session:idle"'
+
+  session:idle:
+    desc: 'Run Ari''s preview-idle split session (TARGET=b|c picks the service, SLEEP=30 reproduces the short-idle bug, SLEEP=300 is his fix; KEY overrides the session key)'
+    interactive: true
+    vars:
+      TARGET: '{{.TARGET | default "b"}}'
+      SLEEP: '{{.SLEEP | default "30"}}'
+      MIRRORD_BIN:
+        sh: |
+          for c in "{{.ROOT_DIR}}"/../mirrord/target/*/debug/mirrord; do
+            [ -x "$c" ] && echo "$c" && exit 0
+          done
+          echo mirrord
+    cmds:
+      # The configs live in this repo (configs/kafka-demo/) because the playground
+      # checkout may sit on a branch without the event-driven mode.
+      - |
+        python3 - << 'PYEOF'
+        import json
+        cfg = json.load(open("{{.ROOT_DIR}}/configs/kafka-demo/mirrord-event-prev-idle-service-{{.TARGET}}.json"))
+        cfg["key"] = "{{.KEY}}"
+        cfg["feature"]["preview"]["idle"]["sleep_after_secs"] = int("{{.SLEEP}}")
+        # Only :latest is loaded into minikube; any other tag would hit GHCR.
+        cfg["feature"]["preview"]["image"] = "{{.REGISTRY}}/playground-kafka-demo-service-{{.TARGET}}:latest"
+        # The pg branch needs cluster-side DB branching plumbing and is irrelevant to
+        # the Kafka repro; the split + preview idle are the subject under test.
+        cfg["feature"].pop("db_branches", None)
+        json.dump(cfg, open("/tmp/kafka-demo-preview-idle-{{.TARGET}}.json", "w"), indent=2)
+        print("rendered /tmp/kafka-demo-preview-idle-{{.TARGET}}.json (sleep_after_secs={{.SLEEP}}, key={{.KEY}})")
+        PYEOF
+      - cd {{.PLAYGROUND_DIR}} && go build -o /tmp/kafka-demo-service-{{.TARGET}} ./apps/kafka-demo/service-{{.TARGET}}
+      - MIRRORD_KUBE_CONTEXT={{.CONTEXT}} {{.MIRRORD_BIN}} exec -f /tmp/kafka-demo-preview-idle-{{.TARGET}}.json -- /tmp/kafka-demo-service-{{.TARGET}}
+
+  trigger:
+    desc: 'Send one MATCHED message through the gateway (tagged with the session key; PAYLOAD=... overrides)'
+    cmds:
+      - |
+        kubectl --context {{.CONTEXT}} -n {{.NS}} port-forward svc/gateway-ev 18090:80 >/dev/null 2>&1 &
+        PF=$!; trap "kill $PF 2>/dev/null" EXIT
+        for i in $(seq 1 20); do curl -sf http://localhost:18090/health >/dev/null 2>&1 && break; sleep 1; done
+        curl -sf -X POST http://localhost:18090/kafka-demo-ev/produce \
+          -H 'Content-Type: application/json' \
+          -d '{"payload":"{{.PAYLOAD | default "hello from sandbox"}}","session":"{{.KEY}}"}'
+        echo ""
+
+  trigger:plain:
+    desc: 'Send one UNMATCHED message (production path, no session key)'
+    cmds:
+      - |
+        kubectl --context {{.CONTEXT}} -n {{.NS}} port-forward svc/gateway-ev 18090:80 >/dev/null 2>&1 &
+        PF=$!; trap "kill $PF 2>/dev/null" EXIT
+        for i in $(seq 1 20); do curl -sf http://localhost:18090/health >/dev/null 2>&1 && break; sleep 1; done
+        curl -sf -X POST http://localhost:18090/kafka-demo-ev/produce \
+          -H 'Content-Type: application/json' \
+          -d '{"payload":"{{.PAYLOAD | default "plain production message"}}"}'
+        echo ""
+
+  offsets:
+    desc: Show consumer group offsets on the shared Kafka (CURRENT-OFFSET=- means a consumer joined but never committed - Ari's symptom)
+    cmds:
+      - kubectl --context {{.CONTEXT}} -n {{.INFRA_NS}} exec kafka-0 -- /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
+
+  logs:
+    desc: service-b-ev logs and pod overview (preview pods appear here when the session is up)
+    cmds:
+      - kubectl --context {{.CONTEXT}} -n {{.NS}} get pods -o wide
+      - kubectl --context {{.CONTEXT}} -n {{.NS}} logs deploy/service-b-ev --tail=40
+
+  test:
+    desc: 'Automated Ari-repro: short idle window (expect starvation), long window (expect delivery), then cross-wake check (does a message for B also wake C); exit 0 = all fixed'
+    cmds:
+      - CONTEXT={{.CONTEXT}} KEY={{.KEY}} PLAYGROUND_DIR={{.PLAYGROUND_DIR}} REGISTRY={{.REGISTRY}} {{.ROOT_DIR}}/scripts/test-kafka-demo-idle.sh
+
+  clean:
+    desc: Remove the kafka-demo-event namespace (infra stays for reuse)
+    cmds:
+      - kubectl --context {{.CONTEXT}} delete namespace {{.NS}} --ignore-not-found

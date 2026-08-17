@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: servicebus-shared-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: servicebus-shared-consumer
+  template:
+    metadata:
+      labels:
+        app: servicebus-shared-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: servicebus-consumer:local
+        imagePullPolicy: Never
+        env:
+        # Reproduction of the client's NServiceBus-style setup against REAL
+        # Azure Service Bus: ONE service name drives the subscription on EVERY
+        # topic the app consumes. The split config binds all its queues to
+        # this single env var, which is the trigger for the
+        # shared-subscription-env bug: the operator makes a different
+        # per-session subscription per topic but can only write one value
+        # here.
+        - name: SERVICEBUS_TOPICS
+          value: "test-topic,test-topic-2"
+        - name: SERVICEBUS_SERVICE_NAME
+          value: "test-service"
+        # ...and one topic with its OWN subscription from its OWN env var, so
+        # a single session exercises the mixed shape: the two topics above must
+        # share one per-session name (one var = one value), while this one gets
+        # its own independent name.
+        - name: SERVICEBUS_TOPIC_1
+          value: "test-topic-3"
+        - name: SERVICEBUS_SUBSCRIPTION_1
+          value: "test-sub-3"
+        # Like NServiceBus endpoint installers: create the subscription named
+        # after the service name on any topic where it is missing. This is
+        # what physically creates the orphaned mirrord-s-* subscriptions, and
+        # also what bootstraps test-service itself on first deploy.
+        - name: SERVICEBUS_AUTO_PROVISION
+          value: "true"
+        - name: APP_NAME
+          value: "servicebus-shared-consumer"
+        - name: SERVICEBUS_CONNECTION_STRING
+          valueFrom:
+            secretKeyRef:
+              name: servicebus-azure-conn
+              key: connection_string

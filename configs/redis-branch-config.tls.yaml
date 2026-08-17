@@ -1,0 +1,22 @@
+# TLS Redis branch pod config: a "custom image with TLS baked in"
+# (redis-tls-local:7-alpine, built by task redis:tls:build:redis-image) plus the
+# dbServerArgs/tls settings that make the operator respect it.
+#
+# task redis:tls:enable copies this over redis-branch-config.yaml; the operator
+# hot-reloads the file, so branches created afterwards come up TLS-only.
+dbPod:
+  image:
+    registry: "redis-tls-local"
+  imagePullPolicy: "Never"
+  dbServerArgs:
+    - "--tls-port"
+    - "6379"
+    - "--port"
+    - "0"
+    - "--tls-cert-file"
+    - "/certs/server.crt"
+    - "--tls-key-file"
+    - "/certs/server.key"
+    - "--tls-auth-clients"
+    - "no"
+  tls: true

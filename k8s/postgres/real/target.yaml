@@ -1,0 +1,16 @@
+# mirrord target pod for the real-data scenario: carries the DATABASE_URL the
+# operator reads to locate the source database.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: pg-real-target
+  labels:
+    test-scenario: real
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo 'Postgres real-data scenario target' && sleep infinity"]
+      env:
+        - name: DATABASE_URL
+          value: "postgresql://postgres:postgres@postgres-real:5432/pagila"

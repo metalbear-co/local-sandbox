@@ -1,0 +1,319 @@
+version: "3"
+
+# Local reproduction of the Torq "no live mirrord-agents" incident:
+# linkerd-meshed operator + meshed 2-replica Argo Rollout target, outgoing-only
+# mirrord sessions run back to back.
+#
+#   task linkerd-repro:deploy         everything: linkerd, argo rollouts, target,
+#                                     operator 3.190.0 with a linkerd-proxy sidecar
+#   task linkerd-repro:repro          N back-to-back mirrord exec attempts, timing +
+#                                     pass/fail summary (ATTEMPTS=12)
+#   task linkerd-repro:watch:agents   poll agent pods at 0.4s, like the customer's watcher
+#   task linkerd-repro:sessions       'mirrord operator status' vs the session CRs -
+#                                     a mismatch means the operator's watch cache is stale
+#   task linkerd-repro:mesh:off      the A/B experiment: un-mesh the operator pod, re-run repro
+#   task linkerd-repro:mesh:on       re-mesh it
+#   task linkerd-repro:logs:operator  router aborts + broken agent connections only
+#   task linkerd-repro:clean          remove target ns; linkerd:uninstall for the mesh
+#
+# What to expect if the mesh theory holds: failures ("no live mirrord-agents"
+# after ~63s, agent pod pairs churning every ~6s) with mesh:on, clean runs with
+# mesh:off. Session ghosts (status lists sessions that kubectl does not) confirm
+# the stale-store symptom.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  NS: torq-repro
+  # The customer's operator version. VERSION=3.193.0 tests the fixed release.
+  OPERATOR_VERSION: '{{.OPERATOR_VERSION | default "3.190.0"}}'
+  # The customer runs edge-26.6.1. Override if that edge is not installable.
+  LINKERD_VERSION: '{{.LINKERD_VERSION | default "edge-26.6.1"}}'
+  ROLLOUTS_VERSION: '{{.ROLLOUTS_VERSION | default "v1.8.3"}}'
+  LINKERD_BIN: '{{.ROOT_DIR}}/.versions/linkerd/linkerd'
+  # linkerd edge requires the Gateway API CRDs to exist before install; this is
+  # the version its own error message asks for.
+  GATEWAY_API_VERSION: '{{.GATEWAY_API_VERSION | default "v1.2.1"}}'
+  LINKERD_REPRO_CONFIG: '{{.ROOT_DIR}}/configs/linkerd-repro.mirrord.json'
+
+tasks:
+  ui:
+    desc: "Interactive gum runner: repro loop with logs, ghosts check, mesh A/B, version switch"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/linkerd-repro.sh"
+
+  deploy:
+    desc: "Full meshed repro env: linkerd + argo rollouts + target + operator {{.OPERATOR_VERSION}} (meshed)"
+    cmds:
+      - task: :cluster:start
+      - task: linkerd:install
+      - task: rollouts:install
+      - task: target:deploy
+      - task: operator:deploy
+      - task: mesh:on
+      - |
+        echo ""
+        echo "Meshed repro env is up. Next:"
+        echo "  task linkerd-repro:repro                     # back-to-back attempts (ATTEMPTS=12)"
+        echo "  task linkerd-repro:watch:agents              # in a second terminal, agent pod churn"
+        echo "  task linkerd-repro:sessions                  # status vs CRs after failures"
+        echo "  task linkerd-repro:mesh:off && task linkerd-repro:repro   # the A/B experiment"
+
+  linkerd:install:
+    desc: "Install the linkerd CLI ({{.LINKERD_VERSION}}) and control plane into the cluster"
+    cmds:
+      - |
+        set -euo pipefail
+        if [ ! -x "{{.LINKERD_BIN}}" ]; then
+          echo "Downloading linkerd CLI {{.LINKERD_VERSION}}..."
+          mkdir -p "$(dirname {{.LINKERD_BIN}})"
+          curl -sL https://run.linkerd.io/install-edge | LINKERD2_VERSION={{.LINKERD_VERSION}} INSTALLROOT="{{.ROOT_DIR}}/.versions/linkerd/root" sh
+          cp "{{.ROOT_DIR}}/.versions/linkerd/root/bin/linkerd" "{{.LINKERD_BIN}}"
+        fi
+        "{{.LINKERD_BIN}}" version --client
+        if kubectl get ns linkerd >/dev/null 2>&1; then
+          echo "linkerd control plane already installed."
+        else
+          kubectl apply --server-side -f https://github.com/kubernetes-sigs/gateway-api/releases/download/{{.GATEWAY_API_VERSION}}/standard-install.yaml
+          "{{.LINKERD_BIN}}" install --crds | kubectl apply -f -
+          # runAsRoot: required on minikube's docker runtime for proxy-init.
+          "{{.LINKERD_BIN}}" install --set proxyInit.runAsRoot=true | kubectl apply -f -
+        fi
+        "{{.LINKERD_BIN}}" check --wait 5m
+
+  linkerd:uninstall:
+    desc: Remove the linkerd control plane from the cluster
+    cmds:
+      - '"{{.LINKERD_BIN}}" uninstall | kubectl delete -f - || true'
+
+  rollouts:install:
+    desc: "Install the Argo Rollouts controller ({{.ROLLOUTS_VERSION}})"
+    cmds:
+      - |
+        set -euo pipefail
+        if kubectl get deploy argo-rollouts -n argo-rollouts >/dev/null 2>&1; then
+          echo "Argo Rollouts already installed."
+        else
+          kubectl create namespace argo-rollouts --dry-run=client -o yaml | kubectl apply -f -
+          kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/download/{{.ROLLOUTS_VERSION}}/install.yaml
+        fi
+        kubectl rollout status deploy/argo-rollouts -n argo-rollouts --timeout=180s
+
+  target:deploy:
+    desc: "Deploy the meshed 2-replica rollout/alert-triage target and its backend"
+    cmds:
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/linkerd-repro
+      - kubectl rollout status deploy/backend -n {{.NS}} --timeout=180s
+      - |
+        # Rollout readiness: wait until both replicas are available. The pods
+        # must show 2/2 (app + linkerd-proxy) or the namespace injection is off.
+        kubectl wait rollout/alert-triage -n {{.NS}} --for=condition=Available --timeout=180s 2>/dev/null || {
+          echo "Waiting for rollout pods directly..."
+          sleep 5
+          kubectl wait pods -n {{.NS}} -l app=alert-triage --for=condition=Ready --timeout=180s
+        }
+        echo ""
+        kubectl get pods -n {{.NS}}
+        echo ""
+        # linkerd edge injects the proxy as a native sidecar, i.e. an initContainer.
+        MESHED=$(kubectl get pods -n {{.NS}} -l app=alert-triage -o jsonpath='{range .items[*]}{.spec.initContainers[*].name} {.spec.containers[*].name}{"\n"}{end}' | grep -c linkerd-proxy || true)
+        echo "target pods with linkerd-proxy sidecar: $MESHED (expect 2)"
+
+  operator:deploy:
+    desc: "Deploy released operator {{.OPERATOR_VERSION}} with repro values (real ghcr agents, customer limits)"
+    cmds:
+      - task: :operator:use
+        vars:
+          VERSION: "{{.OPERATOR_VERSION}}"
+          VALUES_FILE: "{{.ROOT_DIR}}/configs/linkerd-repro-operator-values.yaml"
+
+  mesh:on:
+    desc: "Mesh the operator pod (linkerd.io/inject: enabled), like the customer's setup"
+    cmds:
+      - kubectl -n mirrord patch deploy mirrord-operator --type=strategic -p '{"spec":{"template":{"metadata":{"annotations":{"linkerd.io/inject":"enabled"}}}}}'
+      - task: :operator:restart
+      - task: mesh:status
+
+  mesh:off:
+    desc: "Un-mesh the operator pod - the discriminating experiment"
+    cmds:
+      - kubectl -n mirrord patch deploy mirrord-operator --type=strategic -p '{"spec":{"template":{"metadata":{"annotations":{"linkerd.io/inject":"disabled"}}}}}'
+      - task: :operator:restart
+      - task: mesh:status
+
+  mesh:status:
+    desc: Show whether the operator pod carries a linkerd-proxy sidecar
+    silent: true
+    cmds:
+      - |
+        # Right after a restart the old pod can still be listed; read the newest
+        # one and give it a moment to become Ready so the answer is about the
+        # pod that will actually serve sessions.
+        POD=""
+        for _ in $(seq 1 30); do
+          POD=$(kubectl get pods -n mirrord -l app=mirrord-operator --sort-by=.metadata.creationTimestamp -o name | tail -1)
+          [ -n "$POD" ] && kubectl wait "$POD" -n mirrord --for=condition=Ready --timeout=5s >/dev/null 2>&1 && break
+          sleep 2
+        done
+        [ -n "$POD" ] || { echo "no operator pod found"; exit 1; }
+        CONTAINERS=$(kubectl get $POD -n mirrord -o jsonpath='{.spec.initContainers[*].name} {.spec.containers[*].name}')
+        echo "operator pod containers: $CONTAINERS"
+        case "$CONTAINERS" in
+          *linkerd-proxy*) echo "=> operator is MESHED (customer's failing setup)";;
+          *)               echo "=> operator is UNMESHED (proposed fix)";;
+        esac
+
+  run:
+    desc: "One mirrord exec attempt (outgoing-only, short-lived, like the customer's binary)"
+    interactive: true
+    cmds:
+      - |
+        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.LINKERD_REPRO_CONFIG}} -- \
+          sh -c 'echo "BACKEND_URL=$BACKEND_URL PUBSUB_PAUSE_SUBSCRIBER=$PUBSUB_PAUSE_SUBSCRIBER"; curl -sf --max-time 10 "$BACKEND_URL" >/dev/null && echo "outgoing OK"'
+
+  repro:
+    desc: "Back-to-back attempts with timing and a pass/fail summary. ATTEMPTS=12 PAUSE=0"
+    interactive: true
+    vars:
+      ATTEMPTS: '{{.ATTEMPTS | default "12"}}'
+      PAUSE: '{{.PAUSE | default "0"}}'
+    cmds:
+      - |
+        set -uo pipefail
+        PASS=0; FAIL=0
+        echo "config: {{.LINKERD_REPRO_CONFIG}}"
+        echo "cli:    $({{.MIRRORD_BIN}} --version 2>/dev/null || echo unknown)"
+        echo ""
+        for i in $(seq 1 {{.ATTEMPTS}}); do
+          START=$(date +%s)
+          if MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.LINKERD_REPRO_CONFIG}} -- \
+               sh -c 'curl -sf --max-time 10 "$BACKEND_URL" >/dev/null && echo "outgoing OK"'; then
+            RESULT=SUCCESS; PASS=$((PASS+1))
+          else
+            RESULT=FAIL; FAIL=$((FAIL+1))
+          fi
+          END=$(date +%s)
+          echo "--- attempt $i/{{.ATTEMPTS}}: $RESULT in $((END-START))s (running total: $PASS pass / $FAIL fail)"
+          [ "{{.PAUSE}}" != "0" ] && sleep {{.PAUSE}}
+        done
+        echo ""
+        echo "==> $PASS/{{.ATTEMPTS}} succeeded. Customer baseline: ~1/3 degrading to 0, each failure ~63s."
+        echo ""
+        echo "Now check:"
+        echo "  task linkerd-repro:sessions        # ghost sessions?"
+        echo "  task linkerd-repro:logs:operator   # router aborts / broken agent connections"
+
+  watch:agents:
+    desc: "Poll agent pods every 0.4s (like the customer's watcher). Ctrl-C to stop."
+    interactive: true
+    cmds:
+      - |
+        SEEN=0
+        while true; do
+          TS=$(date +%H:%M:%S)
+          PODS=$(kubectl get pods -A --no-headers 2>/dev/null | grep mirrord-agent || true)
+          COUNT=0; [ -n "$PODS" ] && COUNT=$(printf '%s\n' "$PODS" | wc -l | tr -d ' ')
+          if [ "$COUNT" != "$SEEN" ]; then
+            echo "[$TS] $COUNT agent pod(s)"
+            [ -n "$PODS" ] && printf '%s\n' "$PODS" | awk '{printf "         %s/%s  %s  %s\n", $1, $2, $4, $5}'
+            SEEN=$COUNT
+          fi
+          sleep 0.4
+        done
+
+  sessions:
+    desc: "The stale-store check: operator status sessions vs actual session CRs"
+    silent: true
+    cmds:
+      - |
+        echo "=== mirrord operator status (served from the operator's in-memory watch cache) ==="
+        {{.MIRRORD_BIN}} operator status || true
+        echo ""
+        echo "=== mirrordclustersessions (the same CRs, read from the apiserver) ==="
+        kubectl get mirrordclustersessions 2>&1 || true
+        echo ""
+        echo "A session listed above in status but absent from the CR list is a ghost:"
+        echo "the operator's watch cache is stale (the customer's 9 leaked sessions)."
+
+  logs:operator:
+    desc: "Operator log lines relevant to the incident (router aborts, broken agent connections, session lifecycle)"
+    cmds:
+      - kubectl logs -n mirrord -l app=mirrord-operator --tail=2000 | grep -E "no live mirrord-agents|Agent broke connection|Agent router|Session Start|Session End" || echo "no matching lines"
+
+  chaos:on:
+    desc: "Stall a fraction of the operator's apiserver connections through toxiproxy (TOXICITY=0.5). Simulates the suspected GKE watch-degradation ingredient."
+    vars:
+      TOXICITY: '{{.TOXICITY | default "0.5"}}'
+    cmds:
+      - |
+        set -euo pipefail
+        API_EP=$(kubectl get endpoints kubernetes -o jsonpath='{.subsets[0].addresses[0].ip}:{.subsets[0].ports[0].port}' 2>/dev/null)
+        echo "apiserver endpoint: $API_EP"
+        kubectl apply -f {{.ROOT_DIR}}/k8s/linkerd-repro/toxiproxy.yaml
+        kubectl rollout status deploy/toxiproxy -n mirrord --timeout=120s
+        TOXI_IP=$(kubectl get pod -n mirrord -l app=toxiproxy -o jsonpath='{.items[0].status.podIP}')
+        kubectl exec -n mirrord deploy/toxiproxy -- /toxiproxy-cli create -l 0.0.0.0:8443 -u "$API_EP" k8s 2>/dev/null || echo "proxy k8s already exists"
+        kubectl exec -n mirrord deploy/toxiproxy -- /toxiproxy-cli toxic add -t timeout -a timeout=0 --toxicity {{.TOXICITY}} -n stall k8s 2>/dev/null || echo "toxic already exists"
+        OP_IP=$(kubectl get pods -n mirrord -l app=mirrord-operator --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].status.podIP}')
+        echo "operator pod IP: $OP_IP -> toxiproxy $TOXI_IP:8443"
+        # Route only the operator's apiserver traffic through toxiproxy. Two
+        # rules: an unmeshed operator dials the service IP (10.96.0.1:443); a
+        # meshed one has linkerd resolve the endpoint and dial it directly.
+        API_IP=${API_EP%:*}; API_PORT=${API_EP#*:}
+        minikube -p {{.CLUSTER_NAME}} ssh -- "sudo iptables -t nat -I PREROUTING 1 -s $OP_IP/32 -d 10.96.0.1/32 -p tcp --dport 443 -m comment --comment linkerd-repro-chaos -j DNAT --to-destination $TOXI_IP:8443" 2>/dev/null || true
+        minikube -p {{.CLUSTER_NAME}} ssh -- "sudo iptables -t nat -I PREROUTING 1 -s $OP_IP/32 -d $API_IP/32 -p tcp --dport $API_PORT -m comment --comment linkerd-repro-chaos -j DNAT --to-destination $TOXI_IP:8443" 2>/dev/null || true
+        # Drop established flows so every connection re-dials through the proxy.
+        minikube -p {{.CLUSTER_NAME}} ssh -- "sudo conntrack -D -p tcp --orig-src $OP_IP" 2>/dev/null || true
+        echo ""
+        echo "Chaos ON: {{.TOXICITY}} of the operator's apiserver connections now stall silently."
+        echo "  task linkerd-repro:repro ATTEMPTS=8      # watch failures emerge"
+        echo "  task linkerd-repro:sessions              # look for ghosts"
+        echo "  task linkerd-repro:chaos:off             # heal"
+
+  chaos:off:
+    desc: Remove the apiserver fault injection and heal the operator's connections
+    cmds:
+      - |
+        set -uo pipefail
+        while true; do
+          LINE=$(minikube -p {{.CLUSTER_NAME}} ssh -- "sudo iptables -t nat -L PREROUTING -n --line-numbers" 2>/dev/null | grep linkerd-repro-chaos | head -1 | awk '{print $1}')
+          [ -z "$LINE" ] && break
+          minikube -p {{.CLUSTER_NAME}} ssh -- "sudo iptables -t nat -D PREROUTING $LINE"
+        done
+        OP_IP=$(kubectl get pods -n mirrord -l app=mirrord-operator --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].status.podIP}' 2>/dev/null || true)
+        [ -n "$OP_IP" ] && minikube -p {{.CLUSTER_NAME}} ssh -- "sudo conntrack -D --orig-src $OP_IP" 2>/dev/null || true
+        kubectl delete deploy toxiproxy -n mirrord --ignore-not-found=true
+        echo "Chaos OFF. Note: watch streams already hung stay hung until the operator reconnects;"
+        echo "restart it to fully heal: task operator:restart"
+
+  chaos:idle-reap:
+    desc: "Silently blackhole the operator's IDLE apiserver watch streams (cloud LB idle-timeout stand-in). Runs in the foreground. SAMPLE=20 IDLE_THRESHOLD=6 MAX_KILL_PER_ROUND=1"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/linkerd-repro-idle-reap.sh start"
+
+  chaos:idle-reap:off:
+    desc: Remove the idle-reaper blackholes
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/linkerd-repro-idle-reap.sh stop"
+
+  chaos:idle-reap:status:
+    desc: Show active idle-reaper blackholes
+    silent: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/linkerd-repro-idle-reap.sh status"
+
+  chaos:status:
+    desc: Show the chaos DNAT rule and toxiproxy toxics
+    silent: true
+    cmds:
+      - minikube -p {{.CLUSTER_NAME}} ssh -- "sudo iptables -t nat -L PREROUTING -n --line-numbers" 2>/dev/null | grep linkerd-repro-chaos || echo "no chaos DNAT rule"
+      - kubectl exec -n mirrord deploy/toxiproxy -- /toxiproxy-cli inspect k8s 2>/dev/null || echo "toxiproxy not deployed"
+
+  clean:
+    desc: Remove the repro target namespace (operator and linkerd stay; use operator:uninstall / linkerd:uninstall)
+    cmds:
+      - kubectl delete ns {{.NS}} --ignore-not-found=true

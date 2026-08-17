@@ -1,0 +1,215 @@
+version: "3"
+
+# IPv6-by-default verification (mirrord feature.network.ipv6 now defaults to true).
+#
+# Quick checks on the CURRENT cluster (bearkube / any IPv4 cluster is fine):
+#
+#   task ipv6:deploy            deploy the echo app (agent target for the checks)
+#   task ipv6:check             default config: socket(AF_INET6) + getaddrinfo("::") work
+#   task ipv6:check:disabled    ipv6=false still blocks v6 sockets with EAFNOSUPPORT
+#   task ipv6:fallback          v6-first app falls back to v4 and connects (the compat promise)
+#
+# Real IPv6-only cluster (the user scenario from the Slack thread - needs kind):
+#
+#   task ipv6:cluster:create    kind cluster with ipFamily ipv6 + agent image loaded
+#   task ipv6:deploy            same app - the service comes up single-stack IPv6
+#   task ipv6:run:local         steal from the v6 service with NO ipv6 key in any config
+#   task ipv6:send              curl the service - "local-dev-response" means steal works
+#
+#   task ipv6:status / clean / cluster:delete
+#
+# Point MIRRORD_BIN at the freshly built CLI (task mirrord:cli:build), otherwise the
+# installed mirrord (old default) is what gets tested:
+#
+#   task ipv6:check MIRRORD_BIN=../mirrord/target/aarch64-apple-darwin/debug/mirrord
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  AGENT_IMAGE: "test"
+  IPV6_CLUSTER: '{{.IPV6_CLUSTER | default "bearkube-ipv6"}}'
+  TARGET: deployment/ipv6-echo
+  # One HTTP server for both the cluster pod and the local steal session; binding "::"
+  # also exercises the getaddrinfo("::") path that used to be rewritten to 0.0.0.0.
+  PY_SERVER: |
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    import os, socket
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200); self.end_headers()
+            self.wfile.write(os.environ.get("ECHO_RESPONSE", "response").encode() + b"\n")
+    class V6(HTTPServer):
+        address_family = socket.AF_INET6
+    print("listening on [::]:8080", flush=True)
+    V6(("::", 8080), H).serve_forever()
+
+tasks:
+  deploy:
+    desc: Deploy the ipv6-echo app into the current cluster
+    cmds:
+      - |
+        kubectl apply -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: ipv6-echo
+          labels: { app: ipv6-echo }
+        spec:
+          replicas: 1
+          selector: { matchLabels: { app: ipv6-echo } }
+          template:
+            metadata:
+              labels: { app: ipv6-echo }
+            spec:
+              containers:
+                - name: echo
+                  image: python:3.12-alpine
+                  command: ["python3", "-u", "-c"]
+                  args:
+                    - |
+                      from http.server import HTTPServer, BaseHTTPRequestHandler
+                      import socket
+                      class H(BaseHTTPRequestHandler):
+                          def do_GET(self):
+                              self.send_response(200); self.end_headers()
+                              self.wfile.write(b"remote-cluster-response\n")
+                      class V6(HTTPServer):
+                          address_family = socket.AF_INET6
+                      print("listening on [::]:8080", flush=True)
+                      V6(("::", 8080), H).serve_forever()
+                  ports: [{ containerPort: 8080 }]
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: ipv6-echo
+        spec:
+          selector: { app: ipv6-echo }
+          ports: [{ port: 80, targetPort: 8080 }]
+        EOF
+      - kubectl rollout status deployment/ipv6-echo --timeout=120s
+      - echo ""
+      - 'echo "Next: task ipv6:check    (or task ipv6:run:local on the IPv6 cluster)"'
+
+  check:
+    desc: "Default config: v6 sockets open and the literal :: resolves (no ipv6 key set anywhere)"
+    preconditions:
+      - sh: kubectl get deployment ipv6-echo >/dev/null 2>&1
+        msg: "ipv6-echo not found in the current cluster. Run: task ipv6:deploy"
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} exec -t {{.TARGET}} -- python3 -c '
+        import socket
+        socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        print("socket(AF_INET6): ok - not blocked by default anymore")
+        addr = socket.getaddrinfo("::", 8080, socket.AF_INET6)[0][4][0]
+        print(f"getaddrinfo(\"::\"): {addr} (was rewritten to 0.0.0.0 with the old default)")
+        '
+      - echo ""
+      - 'echo "Next: task ipv6:check:disabled and task ipv6:fallback"'
+
+  check:disabled:
+    desc: "ipv6=false opt-out: socket(AF_INET6) must still fail with EAFNOSUPPORT"
+    preconditions:
+      - sh: kubectl get deployment ipv6-echo >/dev/null 2>&1
+        msg: "ipv6-echo not found in the current cluster. Run: task ipv6:deploy"
+    cmds:
+      - |
+        MIRRORD_ENABLE_IPV6=false {{.MIRRORD_BIN}} exec -t {{.TARGET}} -- python3 -c '
+        import errno, socket
+        try:
+            socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        except OSError as e:
+            assert e.errno == errno.EAFNOSUPPORT, f"wrong errno: {e}"
+            print("socket(AF_INET6) failed with EAFNOSUPPORT - opt-out works")
+            raise SystemExit(0)
+        raise SystemExit("socket(AF_INET6) unexpectedly succeeded with ipv6 disabled")
+        '
+
+  fallback:
+    desc: "IPv4 cluster + default config: an app trying IPv6 first still connects via IPv4"
+    preconditions:
+      - sh: kubectl get deployment ipv6-echo >/dev/null 2>&1
+        msg: "ipv6-echo not found in the current cluster. Run: task ipv6:deploy"
+    cmds:
+      - |
+        {{.MIRRORD_BIN}} exec -t {{.TARGET}} -- python3 -c '
+        import socket
+        # create_connection walks getaddrinfo results (AAAA first when present),
+        # so on a v4-only cluster the v6 attempt fails and it moves on to v4 -
+        # exactly the fallback that must keep working with the new default.
+        conn = socket.create_connection(("www.rust-lang.org", 443), timeout=30)
+        family = "IPv6" if conn.family == socket.AF_INET6 else "IPv4"
+        print(f"connected via {family} - fallback path intact")
+        '
+
+  cluster:create:
+    desc: Create a single-stack IPv6 kind cluster and load the agent image into it
+    preconditions:
+      - sh: command -v kind >/dev/null
+        msg: "kind is required for an IPv6 cluster (minikube has no IPv6 support): brew install kind"
+      - sh: docker image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1
+        msg: "Agent image '{{.AGENT_IMAGE}}' not found in docker. Build it first: task mirrord:agent:build"
+    cmds:
+      - |
+        kind create cluster --name {{.IPV6_CLUSTER}} --config - <<'EOF'
+        kind: Cluster
+        apiVersion: kind.x-k8s.io/v1alpha4
+        networking:
+          ipFamily: ipv6
+          apiServerAddress: 127.0.0.1
+        EOF
+      - kind load docker-image {{.AGENT_IMAGE}} --name {{.IPV6_CLUSTER}}
+      - kubectl config use-context kind-{{.IPV6_CLUSTER}}
+      - echo ""
+      - 'echo "IPv6 cluster ready. Next: task ipv6:deploy && task ipv6:run:local"'
+      - 'echo "Back to bearkube afterwards: kubectl config use-context bearkube"'
+
+  run:local:
+    desc: Steal traffic from the IPv6 service with the default config (no ipv6 key anywhere)
+    preconditions:
+      - sh: kubectl get deployment ipv6-echo >/dev/null 2>&1
+        msg: "ipv6-echo not found in the current cluster. Run: task ipv6:deploy"
+    cmds:
+      - 'echo "Stealing from {{.TARGET}} - run task ipv6:send from another terminal."'
+      - |
+        ECHO_RESPONSE=local-dev-response {{.MIRRORD_BIN}} exec -t {{.TARGET}} --steal -- python3 -u -c '{{.PY_SERVER}}'
+
+  send:
+    desc: Curl the service through a port-forward (local-dev-response = steal works)
+    cmds:
+      - |
+        kubectl port-forward svc/ipv6-echo 18080:80 >/dev/null 2>&1 &
+        PF_PID=$!
+        trap "kill $PF_PID 2>/dev/null" EXIT
+        sleep 2
+        RESPONSE=$(curl -s --max-time 10 http://localhost:18080/)
+        echo "response: $RESPONSE"
+        if [ "$RESPONSE" = "local-dev-response" ]; then
+          echo "steal over IPv6 works - the session needed zero ipv6 config"
+        else
+          echo "traffic still answered by the cluster pod - is task ipv6:run:local running?"
+          exit 1
+        fi
+
+  status:
+    desc: Show the echo app and current kube context
+    cmds:
+      - kubectl config current-context
+      - kubectl get deployment,svc,pod -l app=ipv6-echo 2>/dev/null || true
+      - |
+        FAMILIES=$(kubectl get svc ipv6-echo -o jsonpath='{.spec.ipFamilies}' 2>/dev/null) || true
+        [ -n "$FAMILIES" ] && echo "service ipFamilies: $FAMILIES"
+
+  clean:
+    desc: Remove the echo app from the current cluster
+    cmds:
+      - kubectl delete deployment/ipv6-echo service/ipv6-echo --ignore-not-found
+
+  cluster:delete:
+    desc: Delete the IPv6 kind cluster
+    cmds:
+      - kind delete cluster --name {{.IPV6_CLUSTER}}
+      - 'echo "Switch back: kubectl config use-context bearkube"'

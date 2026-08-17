@@ -38,14 +38,55 @@ check, `task --list` for every core task.
 ```bash
 cp .env.example .env      # then edit
 task check                # verify tools, cluster, operator, agent image
-task cluster:create       # create/start the minikube cluster
 ```
+
+## Operator setup (`op:` — start here)
+
+The `op:` tasks are the one place to stand up clusters and pick an operator, so
+you don't have to remember the build/load/install steps. Two choices each time:
+
+1. **How many clusters** — `task op:clusters N=1` (single) or `N=2` / `N=3`
+   (multicluster).
+2. **Which operator** — your local build or a real released one:
+
+```bash
+task op:custom                     # YOUR docker build (mirrord-operator:custom)
+task op:released VERSION=latest    # a released operator (latest | x.y.z | pick)
+```
+
+`op:custom` and `op:released` detect single-vs-multi from the running clusters
+and **always load the agent image first**, building it if it is missing — so a
+fresh cluster never fails with "agent image not found". They also build the
+operator image on demand.
+
+Rebuild a piece only when you actually want to:
+
+```bash
+task op:build           # rebuild the operator image only
+task op:agent:rebuild   # rebuild the agent image and reload it into the clusters
+task op:status          # topology + deployed operator image + agent state
+```
+
+Common flows:
+
+```bash
+# single cluster, your build
+task op:clusters N=1 && task op:custom
+
+# 3 clusters, released latest
+task op:clusters N=3 && task op:released VERSION=latest
+
+# swap a running multicluster to your build
+task op:custom
+```
+
+Every `op:` task prints the relevant follow-up commands when it finishes.
 
 ## Quick start
 
 ```bash
-# operator: released image in the cluster, your code on top via mirrord
-task operator:use                     # VERSION=latest|x.y.z|pick
+# operator: cluster + operator (see "Operator setup" above), your code on top via mirrord
+task op:clusters N=1 && task op:released VERSION=latest   # or: task op:custom
 task operator:dev                     # local operator-service, stealing traffic
 
 # queue splitting (same verbs for every queue module)
@@ -53,6 +94,13 @@ task sqs:deploy
 task sqs:run:local                    # local consumer under mirrord
 task sqs:send:match MESSAGE="hi"      # -> your local session
 task sqs:send:nomatch                 # -> cluster consumer
+
+# Azure Service Bus multi-topic preview (real Azure; needs `az login`,
+# AZURE_SB_RG + AZURE_SB_NAMESPACE in .env, or pass CONN='Endpoint=sb://...')
+task servicebus:multi:deploy                        # deploy consumer + create secret from az
+task servicebus:multi:preview:start NAME=prev-1     # start preview, session key prev-1
+task servicebus:multi:send TOPIC=test-topic KEY=prev-1   # -> preview 'prev-1' (omit KEY -> cluster)
+task servicebus:multi:preview:stop NAME=prev-1      # stop the preview
 
 # database branching (same verbs for every DB module)
 task postgres:deploy

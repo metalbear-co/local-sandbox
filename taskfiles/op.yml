@@ -1,0 +1,291 @@
+version: "3"
+
+# One place for the operator dev loop. You make two choices:
+#
+#   1. How many clusters:   task op:clusters N=1   (single)  N=2 / N=3 (multicluster)
+#   2. Which operator:      task op:custom          YOUR local docker build
+#                           task op:released VERSION=latest   a REAL released operator
+#                                                             (latest | x.y.z | pick)
+#
+# op:custom and op:released figure out single-vs-multi from the running clusters
+# on their own, and always make sure the agent image is loaded first (building it
+# if it is missing). You never have to remember the agent-load step.
+#
+# Rebuild pieces on purpose (otherwise they are only built when missing):
+#   task op:build           rebuild the operator image (mirrord-operator:custom)
+#   task op:agent:rebuild   rebuild the agent image and reload it into the clusters
+#
+# Quick starts:
+#   single cluster, your build:     task op:clusters N=1 && task op:custom
+#   3 clusters, released latest:    task op:clusters N=3 && task op:released VERSION=latest
+#   swap a running MC to your build: task op:custom
+#
+# Every task prints the follow-up commands when it finishes.
+
+vars:
+  N: '{{.N | default "1"}}'
+  VERSION: '{{.VERSION | default "latest"}}'
+  AGENT_IMAGE: '{{.AGENT_IMAGE | default "test"}}'
+  # Vars from sibling include files are not visible here, so redeclare the few we use.
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_DIR: '{{.MIRRORD_DIR | default (print .ROOT_DIR "/../mirrord")}}'
+  # Detects the running topology once, reused by the operator/agent tasks below.
+  # Prints "single", "2", or "3" (empty when no known clusters exist).
+  DETECT_TOPOLOGY: |
+    if kubectl config get-contexts mirrord-primary >/dev/null 2>&1; then
+      if kubectl config get-contexts mirrord-remote-2 >/dev/null 2>&1; then echo 3; else echo 2; fi
+    elif kubectl config get-contexts bearkube >/dev/null 2>&1; then
+      echo single
+    else
+      echo ""
+    fi
+  # Echoes the minikube profiles (space separated) for the topology in the shell
+  # variable $TOPO. Set TOPO before expanding this.
+  PROFILES_FOR: |
+    case "$TOPO" in
+      single) echo bearkube ;;
+      2) echo "mirrord-primary mirrord-remote-1" ;;
+      3) echo "mirrord-primary mirrord-remote-1 mirrord-remote-2" ;;
+    esac
+
+tasks:
+  clusters:
+    desc: "Create the clusters. N=1 single (bearkube), N=2|3 multicluster. Reuses existing ones."
+    cmds:
+      - |
+        set -euo pipefail
+        case "{{.N}}" in
+          1)
+            task cluster:create
+            echo ""
+            echo "Single cluster 'bearkube' ready. Next - pick an operator:"
+            echo "  task op:custom                     deploy your local build"
+            echo "  task op:released VERSION=latest    deploy a released operator"
+            ;;
+          2|3)
+            # multicluster:up is the tested path: it detaches/attaches the cross-cluster
+            # network mesh around creation and loads the agent - steps that are fragile to
+            # replicate. It also installs the RELEASED latest operator; swap to your build
+            # afterwards with 'task op:custom' if that is what you want.
+            task multicluster:up MC_NUM_CLUSTERS={{.N}}
+            echo ""
+            echo "{{.N}} clusters ready with the RELEASED latest operator. To change the operator:"
+            echo "  task op:custom                     swap in your local build (all clusters)"
+            echo "  task op:released VERSION=x.y.z      pin a different release"
+            ;;
+          *)
+            echo "N must be 1, 2, or 3 (got '{{.N}}')"; exit 1 ;;
+        esac
+
+  build:
+    desc: "Rebuild the operator image (mirrord-operator:custom) from your checkout"
+    cmds:
+      - task -t {{.ROOT_DIR}}/Taskfile.legacy.yml build:operator:multicluster
+      - |
+        echo ""
+        echo "Built mirrord-operator:custom. Deploy it with:"
+        echo "  task op:custom"
+
+  custom:
+    desc: "Deploy YOUR local operator build to the running clusters (single or multi). Builds it if missing."
+    cmds:
+      - |
+        set -euo pipefail
+        TOPO=$({{.DETECT_TOPOLOGY}})
+        [ -n "$TOPO" ] || { echo "No clusters found - run 'task op:clusters N=1' (or N=2/N=3) first."; exit 1; }
+
+        # Build the operator image on demand so the user never hits "image not found".
+        # Explicit rebuilds go through 'task op:build'.
+        if ! {{.CONTAINER_RUNTIME}} image inspect mirrord-operator:custom >/dev/null 2>&1; then
+          echo "mirrord-operator:custom not in docker - building it..."
+          task -t {{.ROOT_DIR}}/Taskfile.legacy.yml build:operator:multicluster
+        fi
+
+        task op:agent TOPO="$TOPO"
+
+        if [ "$TOPO" = "single" ]; then
+          echo "Deploying your build to the single cluster..."
+          task -t {{.ROOT_DIR}}/Taskfile.legacy.yml operator:install:nobuild
+        else
+          echo "Deploying your build to $TOPO clusters..."
+          task multicluster:operator:use VERSION=custom MC_NUM_CLUSTERS="$TOPO"
+          # The e2e suites only trust a unique e2e-* image tag: a mutable :custom tag can
+          # hide a stale image in a cluster's cache, so the helm install above is followed
+          # by the same tar-based unique-tag swap the suites use. After this, the preview
+          # suite runs without DEPLOY_OPERATOR=1.
+          echo "Swapping in a uniquely tagged build (e2e-*) so test suites trust the image..."
+          task multicluster:operator:deploy
+        fi
+      - task: _verify
+      - task: _followup
+
+  released:
+    desc: "Deploy a RELEASED operator to the running clusters. VERSION=latest|x.y.z|pick."
+    cmds:
+      - |
+        set -euo pipefail
+        TOPO=$({{.DETECT_TOPOLOGY}})
+        [ -n "$TOPO" ] || { echo "No clusters found - run 'task op:clusters N=1' (or N=2/N=3) first."; exit 1; }
+
+        task op:agent TOPO="$TOPO"
+
+        if [ "$TOPO" = "single" ]; then
+          echo "Deploying released operator {{.VERSION}} to the single cluster..."
+          task operator:use VERSION={{.VERSION}}
+        else
+          echo "Deploying released operator {{.VERSION}} to $TOPO clusters..."
+          task multicluster:operator:use VERSION={{.VERSION}} MC_NUM_CLUSTERS="$TOPO"
+        fi
+      - task: _verify
+      - task: _followup
+
+  agent:
+    desc: "Ensure the agent image is built and loaded into every running cluster (builds if missing)."
+    cmds:
+      - |
+        set -euo pipefail
+        TOPO="{{.TOPO}}"
+        [ -n "$TOPO" ] || TOPO=$({{.DETECT_TOPOLOGY}})
+        [ -n "$TOPO" ] || { echo "No clusters found - nothing to load the agent into."; exit 0; }
+
+        if ! {{.CONTAINER_RUNTIME}} image inspect {{.AGENT_IMAGE}} >/dev/null 2>&1; then
+          echo "Agent image '{{.AGENT_IMAGE}}' not in docker - building from {{.MIRRORD_DIR}}..."
+          cd {{.MIRRORD_DIR}} && {{.CONTAINER_RUNTIME}} build -f mirrord/agent/Dockerfile -t {{.AGENT_IMAGE}} .
+          cd {{.ROOT_DIR}}
+        fi
+
+        for P in $({{.PROFILES_FOR}}); do
+          echo "Loading agent '{{.AGENT_IMAGE}}' into $P..."
+          minikube -p "$P" ssh "{{.CONTAINER_RUNTIME}} rmi {{.AGENT_IMAGE}} --force" 2>/dev/null || true
+          minikube -p "$P" image load {{.AGENT_IMAGE}}
+        done
+
+  agent:rebuild:
+    desc: "Force-rebuild the agent image from ../mirrord and reload it into every running cluster."
+    cmds:
+      - |
+        set -euo pipefail
+        echo "Rebuilding agent image '{{.AGENT_IMAGE}}' from {{.MIRRORD_DIR}}..."
+        cd {{.MIRRORD_DIR}} && {{.CONTAINER_RUNTIME}} build -f mirrord/agent/Dockerfile -t {{.AGENT_IMAGE}} .
+      - task: op:agent
+
+  clean:
+    desc: "Delete ALL sandbox clusters (bearkube + the multicluster profiles). Destructive."
+    cmds:
+      - |
+        set -uo pipefail
+        echo "Deleting all sandbox minikube profiles - this destroys the clusters."
+        for P in bearkube mirrord-primary mirrord-remote-1 mirrord-remote-2; do
+          if minikube profile list -o json 2>/dev/null | grep -q "\"Name\":\"$P\""; then
+            echo "  deleting $P..."
+            minikube delete -p "$P" || true
+          else
+            echo "  $P not present, skipping"
+          fi
+        done
+        # The cross-cluster docker networks outlive the profiles - remove them too so
+        # a later 'op:clusters N=3' provisions cleanly.
+        for NET in mirrord-primary mirrord-remote-1 mirrord-remote-2; do
+          docker network rm "$NET" >/dev/null 2>&1 || true
+        done
+      - |
+        echo ""
+        echo "All sandbox clusters deleted. Next:"
+        echo "  task op:clusters N=1     create a fresh single cluster"
+        echo "  task op:clusters N=3     create a fresh 3-cluster multicluster"
+
+  status:
+    desc: "Show the running topology, the deployed operator image, and the agent image state."
+    silent: true
+    cmds:
+      - |
+        TOPO=$({{.DETECT_TOPOLOGY}})
+        [ -n "$TOPO" ] || { echo "No known clusters running (bearkube / mirrord-*)."; exit 0; }
+        echo "topology: $([ "$TOPO" = single ] && echo 'single cluster (bearkube)' || echo "$TOPO-cluster multicluster")"
+        echo ""
+        for P in $({{.PROFILES_FOR}}); do
+          IMG=$(kubectl --context "$P" get deploy mirrord-operator -n mirrord -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || echo '(no operator)')
+          AGENT=$(minikube -p "$P" image ls 2>/dev/null | grep -q "library/{{.AGENT_IMAGE}}:" && echo "agent '{{.AGENT_IMAGE}}' loaded" || echo "agent MISSING")
+          echo "  $P: operator=$IMG  $AGENT"
+        done
+
+  preview:e2e:
+    silent: true
+    desc: "One command for the preview / branch-tunnel e2e: reconciles the fleet to N=2|3 clusters (deleting or adding one as needed), deploys YOUR build, sets up SQS, then runs the suite. ONLY=/SKIP=/PICK=1 pick scenarios; SKIP_SETUP=1 goes straight to the tests."
+    vars:
+      N: '{{.N | default "3"}}'
+    cmds:
+      - |
+        set -euo pipefail
+        WANT="{{.N}}"
+        case "$WANT" in 2|3) ;; *) echo "N must be 2 or 3 (got '$WANT')"; exit 1 ;; esac
+
+        running() { minikube status -p "$1" >/dev/null 2>&1; }
+
+        if [ "${SKIP_SETUP:-0}" != 1 ]; then
+          # The fleet is defined by which profiles run: a 2-cluster run must not leave
+          # mirrord-remote-2 around, or the primary keeps its config entry and the suite
+          # derives the wrong default cluster.
+          if [ "$WANT" = 2 ] && running mirrord-remote-2; then
+            echo "==> Fleet is 3 clusters, want 2 - deleting mirrord-remote-2"
+            minikube delete -p mirrord-remote-2
+          fi
+
+          HAVE=0
+          for P in mirrord-primary mirrord-remote-1 mirrord-remote-2; do
+            running "$P" && HAVE=$((HAVE+1)) || true
+          done
+          echo "==> Fleet: $HAVE cluster(s) running, want $WANT"
+
+          # Idempotent: creates what is missing and reinstalls the operators against the
+          # values file for this cluster count, which is what rewrites the primary's
+          # cluster list when the topology changed.
+          task op:clusters N="$WANT"
+
+          echo "==> Deploying your operator build to all $WANT clusters"
+          task op:custom
+
+          # LocalStack belongs on the DEFAULT cluster, which differs per topology
+          # (primary at 2, mirrord-remote-1 at 3) - the count decides.
+          echo "==> Deploying the SQS test environment"
+          MC_NUM_CLUSTERS="$WANT" task multicluster:sqs:deploy
+        else
+          echo "==> SKIP_SETUP=1 - using the fleet as it is"
+        fi
+
+        # pg-source and the probe app are deployed by the suite itself, per scenario.
+        echo "==> Running the preview e2e suite ($WANT clusters)"
+        MC_NUM_CLUSTERS="$WANT" SUITE=1 {{.ROOT_DIR}}/scripts/mc-preview-replica-e2e.sh
+
+  _verify:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        TOPO=$({{.DETECT_TOPOLOGY}})
+        PROFILES=$({{.PROFILES_FOR}})
+        FIRST=${PROFILES%% *}
+        echo ""
+        echo "Deployed operator image on $FIRST:"
+        kubectl --context "$FIRST" get deploy mirrord-operator -n mirrord \
+          -o jsonpath='  {.spec.template.spec.containers[0].image}{"\n"}' 2>/dev/null || echo "  (operator not found yet)"
+
+  _followup:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        TOPO=$({{.DETECT_TOPOLOGY}})
+        echo ""
+        echo "Next:"
+        if [ "$TOPO" = "single" ]; then
+          echo "  task op:status                     topology + operator + agent at a glance"
+          echo "  task lease:test                    lease failover suite"
+          echo "  task copytarget:test               copy-target lifecycle suite"
+          echo "  task operator:logs                 follow operator logs"
+        else
+          echo "  task op:status                     topology + operator + agent at a glance"
+          echo "  CTX=mirrord-primary task lease:test   lease + startup suite on the primary"
+          echo "  task copytarget:test:mc            multicluster copy-target suite"
+          echo "  task multicluster:status           operators + remote connectivity"
+        fi

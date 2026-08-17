@@ -28,6 +28,7 @@ vars:
   MSSQL_DIR: '{{.ROOT_DIR}}/k8s/mssql/modular-tests'
   SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/mssql/modular-tests/scenarios'
   MSSQL_MIRRORD_CONFIG: '{{.MSSQL_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mssql/mirrord.json")}}'
+  MSSQL_MIRRORD_REAL_CONFIG: '{{.MSSQL_MIRRORD_REAL_CONFIG | default (print .ROOT_DIR "/k8s/overlays/mssql/mirrord-real.json")}}'
   # sqlcmd credentials (source uses SA_PASSWORD, branch pods use their own)
   SQLCMD: /opt/mssql-tools18/bin/sqlcmd
   SA_PASSWORD: "TestP@ssw0rd!"
@@ -193,3 +194,78 @@ tasks:
         done
         echo "Branch pod did not come up; check 'task mssql:status'"
         exit 1
+
+  deploy:real:
+    desc: Deploy a realistic source DB — AdventureWorksLT (SalesLT schema; swap the .bak URL in the manifest for the full AdventureWorks2019 and raise limits) — plus its mirrord target pod
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/mssql/real
+      - echo "Waiting for the real source database (downloads and loads the dataset on first start)..."
+      - kubectl wait --for=condition=ready pod mssql-real -n {{.NAMESPACE}} --timeout=600s
+      - kubectl wait --for=condition=ready pod mssql-real-target -n {{.NAMESPACE}} --timeout=120s
+      - echo "Real source ready. Start a subset branch with 'task mssql:run:real:local'."
+
+  run:real:local:
+    desc: Run the app under mirrord with a `subset` branch of the real DB (seed SalesLT.Customer CustomerID = 29847; Ctrl-C to stop)
+    interactive: true
+    dir: apps/mssql-app
+    preconditions:
+      - sh: test -f {{.MSSQL_MIRRORD_REAL_CONFIG}}
+        msg: "mirrord config not found at {{.MSSQL_MIRRORD_REAL_CONFIG}}"
+    cmds:
+      - go build -o /tmp/mssql-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.MSSQL_MIRRORD_REAL_CONFIG}} -- /tmp/mssql-app
+      # Inspect the closure afterwards, e.g.: sqlcmd into the branch pod: SELECT count(*) FROM SalesLT.SalesOrderDetail;
+
+  clean:real:
+    desc: Remove the real-data source DB and its target pod
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/mssql/real --ignore-not-found=true 2>/dev/null || true
+
+  tables:source:
+    desc: 'List tables + exact row counts on the source (auto-detects mssql-test/mssql-real; override with POD=... DB=...)'
+    silent: true
+    vars:
+      POD: '{{.POD | default ""}}'
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD="{{.POD}}"; DB="{{.DB}}"
+        if [ -z "$POD" ]; then
+          if kubectl get pod mssql-test -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=mssql-test
+          elif kubectl get pod mssql-real -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=mssql-real; [ -z "$DB" ] && DB=AdventureWorks
+          else
+            echo "No source pod found (mssql-test or mssql-real). Deploy one first."; exit 1
+          fi
+        fi
+        [ -z "$DB" ] && DB=source_db
+        echo "=== source pod: $POD (db: $DB) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- {{.SQLCMD}} -S localhost -U sa -P '{{.SA_PASSWORD}}' -d "$DB" -C -W -s ' | ' -Q "SET NOCOUNT ON; SELECT s.name + '.' + t.name AS [table], SUM(p.rows) AS [rows] FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0,1) GROUP BY s.name, t.name ORDER BY s.name, t.name;"
+  tables:branch:
+    desc: 'List tables + exact row counts on the newest mssql branch (all user DBs; narrow with DB=...)'
+    silent: true
+    vars:
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | grep mirrord-mssql-branch | tail -1 | cut -d/ -f2)
+        if [ -z "$POD" ]; then echo "No running mssql branch pod found."; exit 1; fi
+        echo "=== branch pod: $POD ==="
+        ONLY="{{.DB}}"
+        for db in $(kubectl exec -n {{.NAMESPACE}} "$POD" -- {{.SQLCMD}} -S localhost -U sa -P '{{.BRANCH_PASSWORD}}' -C -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.databases WHERE name NOT IN ('master','tempdb','model','msdb') ORDER BY name"); do
+          if [ -n "$ONLY" ] && [ "$db" != "$ONLY" ]; then continue; fi
+          echo "--- db: $db ---"
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- {{.SQLCMD}} -S localhost -U sa -P '{{.BRANCH_PASSWORD}}' -d "$db" -C -W -s ' | ' -Q "SET NOCOUNT ON; SELECT s.name + '.' + t.name AS [table], SUM(p.rows) AS [rows] FROM sys.tables t JOIN sys.schemas s ON s.schema_id = t.schema_id JOIN sys.partitions p ON p.object_id = t.object_id AND p.index_id IN (0,1) GROUP BY s.name, t.name ORDER BY s.name, t.name;"
+        done

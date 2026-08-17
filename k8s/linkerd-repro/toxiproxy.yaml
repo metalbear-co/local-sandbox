@@ -1,0 +1,30 @@
+# Fault-injection proxy for the chaos:* tasks. Sits between the operator and
+# the kube-apiserver (via a node-level DNAT scoped to the operator pod IP) so
+# a probabilistic stall toxic can silently hang a fraction of the operator's
+# apiserver connections - the suspected GKE ingredient behind stale watches.
+# Deployed into the mirrord namespace, never meshed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toxiproxy
+  namespace: mirrord
+  labels:
+    app: toxiproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: toxiproxy
+  template:
+    metadata:
+      labels:
+        app: toxiproxy
+      annotations:
+        linkerd.io/inject: disabled
+    spec:
+      containers:
+        - name: toxiproxy
+          image: ghcr.io/shopify/toxiproxy:2.9.0
+          ports:
+            - containerPort: 8474
+            - containerPort: 8443

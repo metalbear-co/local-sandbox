@@ -1,25 +1,26 @@
-apiVersion: apps/v1
-kind: Deployment
+# Target pod for the roles/credentials scenarios: params-style DB env vars carrying the
+# app user's own credentials (seeded by `task postgres:roles:seed`), so full roles mode
+# can leave user/password untouched and the local app connects as its real role.
+apiVersion: v1
+kind: Pod
 metadata:
   name: pg-server-roles
   namespace: test-mirrord
   labels:
     test-scenario: roles
 spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: pg-server-roles
-  template:
-    metadata:
-      labels:
-        app: pg-server-roles
-        test-scenario: roles
-    spec:
-      containers:
-      - name: app
-        image: busybox
-        command: ["sh", "-c", "echo 'Postgres roles scenario target running' && sleep 3600"]
-        env:
-        - name: DATABASE_URL
-          value: "postgresql://postgres:postgres@postgres-roles:5432/roles_db"
+  containers:
+  - name: app
+    image: busybox
+    command: ["sh", "-c", "echo 'Postgres roles scenario running' && sleep 3600"]
+    env:
+    - name: DB_HOST
+      value: "postgres-test"
+    - name: DB_PORT
+      value: "5432"
+    - name: DB_USER
+      value: "app_user"
+    - name: DB_PASSWORD
+      value: "app_pass"
+    - name: DB_NAME
+      value: "source_db"

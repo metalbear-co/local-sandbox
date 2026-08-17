@@ -1,0 +1,39 @@
+{
+  "operator": true,
+  "target": {
+    "path": {
+      "pod": "pg-server-env-val"
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "env": true,
+    "fs": "local",
+    "network": {
+      "incoming": "off",
+      "outgoing": true
+    },
+    "db_branches": [
+      {
+        "id": "pg-migrations-badimage",
+        "name": "migrations_branch",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 600,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "url": "DATABASE_URL"
+        },
+        "copy": {
+          "mode": "empty"
+        },
+        "migrations": {
+          "flavor": "container",
+          "image": "metalbear/this-image-does-not-exist:v1",
+          "command": ["sh", "-c", "echo unreachable"],
+          "env": {}
+        }
+      }
+    ]
+  }
+}

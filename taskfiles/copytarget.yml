@@ -1,0 +1,104 @@
+version: "3"
+
+# Copy-target lifecycle testing (staleness-driven rework: controller-owned
+# deletion, no owner refs, restart adoption; COR-1680).
+#
+# Automated suite (logs every state change with timestamps):
+#   task copytarget:test         all scenarios; prompts you to restart
+#                                operator:dev for the adoption scenario
+#   task copytarget:test:auto    same but skips the interactive restart scenario
+#
+# Manual testing, piece by piece (watch `task copytarget:status` between steps):
+#   task copytarget:session      # A: start a session; Ctrl-C to stop
+#   task copytarget:status       # pods + copytargets + replicas at a glance
+#   task copytarget:watch        # live pod watch
+#   task copytarget:kill-pod     # COR-1680 repro: delete the copy pod mid-session
+#   task copytarget:clean        # delete leftovers, restore the deployment
+#
+# What to expect from the reworked operator after Ctrl-C:
+#   ~35s  session closes (reconnect grace) - staleness clock starts
+#   ~65s  entry disappears from `copytargets`, controller deletes the pod
+#   ~2min entry removed from operator memory; deployment back to 1 replica
+#   restart within ~35-65s may legitimately REUSE the copy (nothing dooms it)
+#   restart after that always builds a fresh copy
+#   operator restart at any point: the new process ADOPTS leftover pods and
+#   reaps them on the same staleness clock (no more invisible orphans)
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  COPYTARGET_CONFIG: '{{.ROOT_DIR}}/apps/echo-app/mirrord-copy-target.json'
+
+tasks:
+  test:
+    desc: "Copy-target lifecycle suite: gc, reuse window, staleness, pod-deletion, restart adoption (interactive)"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-copy-target-restart.sh"
+
+  test:auto:
+    desc: "Copy-target lifecycle suite without the interactive operator-restart scenario"
+    interactive: true
+    cmds:
+      - SKIP_RESTART=1 NO_PAUSE=1 {{.ROOT_DIR}}/scripts/test-copy-target-restart.sh
+
+  test:mc:
+    desc: "Multicluster copy-target suite (MC_NUM_CLUSTERS=2|3, same as multicluster:up)"
+    interactive: true
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_NUM_CLUSTERS | default "2"}} {{.ROOT_DIR}}/scripts/test-copy-target-multicluster.sh
+
+  test:mc:auto:
+    desc: "Multicluster copy-target suite without the interactive operator-restart scenario"
+    interactive: true
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_NUM_CLUSTERS | default "2"}} SKIP_RESTART=1 NO_PAUSE=1 {{.ROOT_DIR}}/scripts/test-copy-target-multicluster.sh
+
+  session:
+    desc: "Start a copy_target+scale_down session against echo-app (Ctrl-C to stop it)"
+    interactive: true
+    preconditions:
+      - sh: kubectl get deploy echo-app -n {{.NAMESPACE}} >/dev/null 2>&1
+        msg: "echo-app missing - run: task preview:deploy"
+    cmds:
+      - "{{.MIRRORD_BIN}} exec -f {{.COPYTARGET_CONFIG}} -- sleep 3600"
+
+  kill-pod:
+    desc: "Delete the newest copy pod out from under its session (COR-1680 repro)"
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.NAMESPACE}} --sort-by=.metadata.creationTimestamp -o name \
+          | grep mirrord-copy | tail -1 | cut -d/ -f2)
+        [ -n "$POD" ] || { echo "no mirrord-copy pod found - start a session first"; exit 1; }
+        kubectl delete pod "$POD" -n {{.NAMESPACE}} --wait=false
+        echo "Deleted $POD. Expected: entry goes Failed, then ages out of"
+        echo "'task copytarget:status' within ~2min - no operator restart needed."
+
+  watch:
+    desc: "Watch copy pods live (reworked operator: stale pods reaped ~65s after their session closes)"
+    interactive: true
+    cmds:
+      - kubectl get pods -n {{.NAMESPACE}} -w
+
+  status:
+    desc: "Show copy pods, copytargets, and echo-app replicas"
+    silent: true
+    cmds:
+      - |
+        echo "── copy pods ──"
+        for p in $(kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep mirrord-copy | cut -d/ -f2); do
+          echo "$p  status=$(kubectl get pod $p -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')"
+        done
+        echo "── copytargets ──"
+        kubectl get copytargets -n {{.NAMESPACE}} 2>/dev/null || echo "(none)"
+        echo "── echo-app ──"
+        echo "replicas: $(kubectl get deploy echo-app -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}' 2>/dev/null)"
+
+  clean:
+    desc: "Delete leftover copy pods and restore the echo-app deployment to 1 replica"
+    cmds:
+      - kubectl get pods -n {{.NAMESPACE}} -o name 2>/dev/null | grep mirrord-copy | xargs -n1 kubectl delete -n {{.NAMESPACE}} --wait=false 2>/dev/null || true
+      - kubectl scale deploy echo-app -n {{.NAMESPACE}} --replicas=1
+      - echo "Cleaned. Copy pods deleted, echo-app back to 1 replica."

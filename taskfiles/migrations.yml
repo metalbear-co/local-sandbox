@@ -1,0 +1,248 @@
+version: "3"
+
+# DB branch schema migrations - all three flavors against the Postgres test env.
+#
+#   task migrations:deploy                  deploy the Postgres source DB + branch target
+#   task migrations:flyway:local:run        flyway with a LOCAL sql dir (uploaded from this repo)
+#   task migrations:image:build             build + load the baked-SQL flyway image into minikube
+#   task migrations:flyway:image:run        flyway with IN-IMAGE sql (locations, nothing uploaded)
+#   task migrations:container:run           container flavor: postgres:17 image runs psql via MIRRORD_DB_* env
+#   task migrations:badimage:run            INT-539 repro: unpullable migration image (old operator hangs, fixed one fails fast)
+#   task migrations:status                  branch CRDs, migration jobs, latest job logs
+#   task migrations:verify                  query the branch for the tables the migrations created
+#   task migrations:clean                   delete the branches these tasks created
+#
+# The mirrord configs live in k8s/overlays/postgres/mirrord-migrations-*.json - they are
+# real client configs, usable as-is outside the sandbox. SQL + Dockerfile: k8s/migrations/.
+#
+# The new flavors need an operator that knows them plus the matching CRDs: either deploy a
+# custom-built operator image and run `task operator:crds`, or keep `task operator:dev`
+# running (the run tasks auto-label for it like postgres:run:local does).
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  FLYWAY_BAKED_IMAGE: '{{.FLYWAY_BAKED_IMAGE | default "mirrord-flyway-baked:local"}}'
+  OVERLAY_DIR: '{{.ROOT_DIR}}/k8s/overlays/postgres'
+  APP_IMAGE: '{{.APP_IMAGE | default "mirrord-demo-app:local"}}'
+  BRANCH_IDS: "pg-migrations-flyway-local pg-migrations-flyway-image pg-migrations-container pg-migrations-badimage mysql-migrations-app"
+
+tasks:
+  deploy:
+    desc: Deploy the Postgres test env used by the migration tasks (source DB + branch target pod)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/postgres
+      - kubectl wait --for=condition=ready pod postgres-test -n {{.NAMESPACE}} --timeout=180s
+      # Only the target pod from the env-val scenario. Its standing legacy PgBranchDatabase
+      # manifest is rejected by the installed legacy CRD's target schema (enum "targetless"),
+      # and the migration flavors go through the unified BranchDatabase CRD anyway.
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/postgres/modular-tests/scenarios/env-val/pod.yaml
+      - kubectl wait --for=condition=ready pod pg-server-env-val -n {{.NAMESPACE}} --timeout=120s
+      - echo "Ready. Run one of - migrations:flyway:local:run | migrations:flyway:image:run | migrations:container:run"
+
+  image:build:
+    desc: Build the baked-SQL flyway image (k8s/migrations/) and load it into minikube
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} build -t {{.FLYWAY_BAKED_IMAGE}} {{.ROOT_DIR}}/k8s/migrations'
+      # `image load` does not overwrite an existing tag; remove the old copy first.
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi {{.FLYWAY_BAKED_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.CLUSTER_NAME}} image load {{.FLYWAY_BAKED_IMAGE}}
+      - echo "Image '{{.FLYWAY_BAKED_IMAGE}}' loaded into minikube."
+
+  flyway:local:run:
+    desc: Branch with flyway migrations from a LOCAL directory (k8s/migrations/sql; Ctrl-C to stop)
+    cmds:
+      - task: _run
+        vars: { CONFIG: "{{.OVERLAY_DIR}}/mirrord-migrations-flyway-local.json" }
+
+  flyway:image:run:
+    desc: Branch with IMAGE-NATIVE flyway migrations (baked SQL, in-image locations; Ctrl-C to stop)
+    preconditions:
+      - sh: minikube -p {{.CLUSTER_NAME}} image ls | grep -q "{{.FLYWAY_BAKED_IMAGE}}"
+        msg: "Baked image not in minikube. Build it first: task migrations:image:build"
+    cmds:
+      - task: _run
+        vars: { CONFIG: "{{.OVERLAY_DIR}}/mirrord-migrations-flyway-image.json" }
+
+  container:run:
+    desc: Branch with CONTAINER-flavor migrations (postgres:17 runs psql via MIRRORD_DB_* env; Ctrl-C to stop)
+    cmds:
+      - task: _run
+        vars: { CONFIG: "{{.OVERLAY_DIR}}/mirrord-migrations-container.json" }
+
+  badimage:run:
+    desc: 'INT-539 repro: migrations with an unpullable image (old operator hangs then bare timeout; fixed one fails fast; Ctrl-C to stop)'
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      CONFIG: '{{.OVERLAY_DIR}}/mirrord-migrations-badimage.json'
+    preconditions:
+      - sh: test -f {{.CONFIG}}
+        msg: "mirrord config not found at {{.CONFIG}}"
+    cmds:
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        echo "The migration image in the config is unpullable on purpose. Expected:"
+        echo "  operator WITHOUT the INT-539 fix -> 'waiting for readiness' hangs the whole creation_timeout_secs (120s), then a bare timeout error"
+        echo "  operator WITH the fix           -> fails within seconds: branch Failed with the ImagePullBackOff reason"
+        echo ""
+        if {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- sh -c 'echo "UNEXPECTED: session started - the branch should have failed"'; then
+          exit 1
+        fi
+        echo ""
+        echo "Session failed as expected. See the branch status.error: task migrations:status"
+        echo "Delete the failed branch before rerunning: task migrations:clean"
+
+  _run:
+    internal: true
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    preconditions:
+      - sh: test -f {{.CONFIG}}
+        msg: "mirrord config not found at {{.CONFIG}}"
+    cmds:
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch -
+        # the deployed operator does not know the new migration flavors yet.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        # Print the branch URL with shell builtins only: external children (env, grep) are
+        # SIP binaries that can run x86_64 under Rosetta, which needs a universal (fat)
+        # layer dylib - the fast `task mirrord:cli:build` embeds an arm64-only one.
+        {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- sh -c \
+          'echo "SESSION READY - migrations applied, branch connection below:"; echo "DATABASE_URL=$DATABASE_URL"; echo "Verify with: task migrations:verify   (Ctrl-C here to end the session)"; sleep 600'
+
+  app:image:build:
+    desc: Build the client-style app image (setup/snapshot scripts + SQL migrations) and load it into minikube
+    cmds:
+      - '{{.CONTAINER_RUNTIME}} build -t {{.APP_IMAGE}} {{.ROOT_DIR}}/k8s/migrations/app-image'
+      - minikube -p {{.CLUSTER_NAME}} ssh "docker rmi {{.APP_IMAGE}} --force" 2>/dev/null || true
+      - minikube -p {{.CLUSTER_NAME}} image load {{.APP_IMAGE}}
+      - echo "Image '{{.APP_IMAGE}}' loaded into minikube."
+
+  app:deploy:
+    desc: Deploy the MySQL test env for the app-image scenario (source DB + target pod)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # Branch pods need the operator's mysql root-password env.
+      - kubectl patch deployment mirrord-operator -n mirrord --patch-file {{.ROOT_DIR}}/k8s/overlays/mysql/operator-patch.yaml --type=strategic || true
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/mysql/modular-tests/base
+      - kubectl wait --for=condition=ready pod -l app=mysql-test -n {{.NAMESPACE}} --timeout=180s
+      # Only the target pod + service; the scenario's standing legacy branch manifest is
+      # rejected by the installed legacy CRD schema (same issue as the pg scenario).
+      - kubectl apply -f {{.ROOT_DIR}}/k8s/mysql/modular-tests/scenarios/env-val/pod.yaml -n {{.NAMESPACE}}
+      - kubectl wait --for=condition=ready pod server-env-val -n {{.NAMESPACE}} --timeout=120s
+      - echo "Ready. Run - task migrations:app:run   (SNAPSHOT_JOB=true for the snapshot path)"
+
+  app:run:
+    desc: 'Client-style migration: app image runs config/db_setup.sh via DATABASE_URL (SNAPSHOT_JOB=true switches the command; Ctrl-C to stop)'
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    vars:
+      CONFIG: '{{.ROOT_DIR}}/k8s/overlays/mysql/mirrord-migrations-app.json'
+    preconditions:
+      - sh: minikube -p {{.CLUSTER_NAME}} image ls | grep -q "{{.APP_IMAGE}}"
+        msg: "App image not in minikube. Build it first: task migrations:app:image:build"
+    cmds:
+      - |
+        # SNAPSHOT_JOB is read at config-render time by the Tera conditional in the config,
+        # mirroring a CI pipeline that picks the command when it templates its values.
+        export SNAPSHOT_JOB="{{.SNAPSHOT_JOB | default "false"}}"
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- sh -c \
+          'echo "SESSION READY - app-image migrations applied (SNAPSHOT_JOB='"$SNAPSHOT_JOB"')"; echo "Verify with: task migrations:app:verify"; sleep 600'
+
+  app:verify:
+    desc: Show what the app-image migration created in the newest MySQL branch
+    silent: true
+    vars:
+      DB: '{{.DB | default "teladoc_eds"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pods -n {{.NAMESPACE}} -o name --sort-by=.metadata.creationTimestamp 2>/dev/null \
+          | grep mirrord-mysql-branch-db-pod | tail -1 | cut -d/ -f2)
+        if [ -z "$POD" ]; then
+          echo "No MySQL branch pod. Start a session first: task migrations:app:run"
+          exit 1
+        fi
+        echo "Branch pod: $POD  (db: {{.DB}})"
+        Q() { kubectl exec -n {{.NAMESPACE}} "$POD" -- sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" '"{{.DB}}"' -e "'"$1"'"' 2>/dev/null; }
+        echo ""; echo "== Tables =="; Q "SHOW TABLES;"
+        echo ""; echo "== schema_migrations (rake-style tracking) =="; Q "SELECT * FROM schema_migrations;"
+        echo ""; echo "== snapshot_info (only after SNAPSHOT_JOB=true) =="
+        Q "SELECT * FROM snapshot_info;" || echo "  absent (expected unless the snapshot path ran)"
+
+  status:
+    desc: Show branch CRDs (incl. migration phase), migration jobs, and the latest job logs
+    silent: true
+    cmds:
+      - |
+        echo "== BranchDatabase CRDs =="
+        kubectl get branchdatabases.dbs.mirrord.metalbear.co -n {{.NAMESPACE}} \
+          -o custom-columns='NAME:.metadata.name,ID:.spec.id,PHASE:.status.phase,MIGRATIONS:.status.migrations.phase,MIG_GEN:.status.migrations.observedGeneration,ERROR:.status.error' \
+          2>/dev/null || echo "  none"
+        echo ""
+        echo "== Migration jobs =="
+        kubectl get jobs -n {{.NAMESPACE}} 2>/dev/null | grep -E "NAME|mirrord-migrations" || echo "  none"
+        echo ""
+        echo "== Latest migration job logs =="
+        JOB=$(kubectl get jobs -n {{.NAMESPACE}} --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | grep mirrord-migrations | tail -1)
+        if [ -n "$JOB" ]; then
+          echo "($JOB)"
+          kubectl logs -n {{.NAMESPACE}} "$JOB" --tail=30 2>/dev/null || echo "  no logs yet"
+        else
+          echo "  none"
+        fi
+
+  verify:
+    desc: Query the newest branch for the tables the migrations created
+    silent: true
+    vars:
+      DB: '{{.DB | default "migrations_branch"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l "db-owner-name" --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod. Start a session first (e.g. task migrations:container:run)."
+          exit 1
+        fi
+        echo "Branch pod: $POD  (db: {{.DB}})"
+        echo ""
+        echo "== Tables =="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d {{.DB}} -c '\dt'
+        echo "== migrated_users (flyway flavors) =="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d {{.DB}} -c 'SELECT * FROM migrated_users;' 2>/dev/null \
+          || echo "  absent (expected if this branch ran the container flavor)"
+        echo "== container_migrated (container flavor) =="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d {{.DB}} -c 'SELECT * FROM container_migrated;' 2>/dev/null \
+          || echo "  absent (expected if this branch ran a flyway flavor)"
+
+  clean:
+    desc: Delete the branches created by the migration tasks (their jobs/pods GC with them)
+    silent: true
+    cmds:
+      - |
+        for id in {{.BRANCH_IDS}}; do
+          NAMES=$(kubectl get branchdatabases.dbs.mirrord.metalbear.co -n {{.NAMESPACE}} -o json 2>/dev/null \
+            | jq -r --arg id "$id" '.items[] | select(.spec.id == $id) | .metadata.name')
+          for name in $NAMES; do
+            echo "deleting branch $name (id=$id)"
+            kubectl delete branchdatabases.dbs.mirrord.metalbear.co -n {{.NAMESPACE}} "$name"
+          done
+        done
+        echo "done"

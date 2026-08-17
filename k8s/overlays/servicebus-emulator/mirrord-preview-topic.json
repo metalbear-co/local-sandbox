@@ -10,7 +10,7 @@
       "creation_timeout_secs": 300
     },
     "split_queues": {
-      "test-topic-sub": {
+      "*": {
         "queue_type": "AzureServiceBus",
         "message_filter": {
           "tenant": "^test"

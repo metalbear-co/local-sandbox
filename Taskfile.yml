@@ -36,16 +36,22 @@ vars:
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
 
 includes:
+  lint:
+    taskfile: ./taskfiles/lint.yml
   cluster:
     taskfile: ./taskfiles/cluster.yml
   operator:
     taskfile: ./taskfiles/operator.yml
   mirrord:
     taskfile: ./taskfiles/mirrord.yml
+  ipv6:
+    taskfile: ./taskfiles/ipv6.yml
   sqs:
     taskfile: ./taskfiles/sqs.yml
   kafka:
     taskfile: ./taskfiles/kafka.yml
+  kafkajs:
+    taskfile: ./taskfiles/kafkajs.yml
   rmq:
     taskfile: ./taskfiles/rmq.yml
   pubsub:
@@ -60,6 +66,8 @@ includes:
     taskfile: ./taskfiles/bullmq.yml
   postgres:
     taskfile: ./taskfiles/postgres.yml
+  migrations:
+    taskfile: ./taskfiles/migrations.yml
   mysql:
     taskfile: ./taskfiles/mysql.yml
   mongodb:
@@ -72,10 +80,22 @@ includes:
     taskfile: ./taskfiles/redis.yml
   generic:
     taskfile: ./taskfiles/generic.yml
+  cockroachdb-tls:
+    taskfile: ./taskfiles/cockroachdb-tls.yml
   multicluster:
     taskfile: ./taskfiles/multicluster.yml
   preview:
     taskfile: ./taskfiles/preview.yml
+  kafka-demo:
+    taskfile: ./taskfiles/kafka-demo.yml
+  copytarget:
+    taskfile: ./taskfiles/copytarget.yml
+  lease:
+    taskfile: ./taskfiles/lease.yml
+  op:
+    taskfile: ./taskfiles/op.yml
+  linkerd-repro:
+    taskfile: ./taskfiles/linkerd-repro.yml
 
 tasks:
   default:
@@ -110,6 +130,14 @@ tasks:
           task postgres:query:branch QUERY="SELECT count(*) FROM users;"
           task postgres:shell:branch        interactive shell into the branch
           task postgres:branches / logs / status / clean
+
+        postgres roles & credentials (dbPod.roles empty/full):
+
+          task postgres:roles:deploy        source DB + seeded roles + params target
+          task postgres:roles:full          switch local operator to full role fidelity
+          task postgres:run:local:roles     app connects as its real role (watch "Session identity")
+          task postgres:roles:login         log into the branch as app_user (real password)
+          task postgres:roles:probe         grant/denial/SET ROLE probes on the branch
 
         multicluster (2 local clusters + real Azure Service Bus topics):
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
 	"net/http"
@@ -20,11 +21,31 @@ func main() {
 		redisAddr = "redis-main:6379"
 	}
 
-	log.Printf("Connecting to Redis at %s", redisAddr)
+	var opts *redis.Options
+	if redisURL := os.Getenv("REDIS_URL"); redisURL != "" {
+		parsed, err := redis.ParseURL(redisURL)
+		if err != nil {
+			log.Fatalf("invalid REDIS_URL %q: %v", redisURL, err)
+		}
+		opts = parsed
+		log.Printf("Connecting to Redis via REDIS_URL: %s", redisURL)
+	} else {
+		opts = &redis.Options{Addr: redisAddr}
+		log.Printf("Connecting to Redis at %s", redisAddr)
+	}
 
-	rdb = redis.NewClient(&redis.Options{
-		Addr: redisAddr,
-	})
+	// Mimics an app with TLS hardcoded on (like TAS's `ssl: true`): REDIS_TLS=1 forces TLS
+	// even when the URL scheme doesn't ask for it. The sandbox branch serves a self-signed
+	// certificate, so verification is off whenever TLS is used.
+	if os.Getenv("REDIS_TLS") != "" && opts.TLSConfig == nil {
+		opts.TLSConfig = &tls.Config{}
+	}
+	if opts.TLSConfig != nil {
+		opts.TLSConfig.InsecureSkipVerify = true
+		log.Printf("Redis connection uses TLS (verification off: sandbox self-signed cert)")
+	}
+
+	rdb = redis.NewClient(opts)
 
 	// Test connection
 	if err := rdb.Ping(ctx).Err(); err != nil {

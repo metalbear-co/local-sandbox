@@ -7,6 +7,10 @@ version: "3"
 #   task postgres:query:source   query the source (cluster) database
 #   task postgres:query:branch   query the branch database
 #
+# Roles & credentials scenarios (dbPod.roles empty/full, source-user login):
+#   task postgres:roles:deploy, roles:full / roles:empty, run:local:roles,
+#   roles:login, roles:probe, roles:clean - see the section at the bottom.
+#
 # The branch config lives in k8s/overlays/postgres/mirrord.json
 # (feature.db_branches, type "pg" — branch is created when run:local starts).
 #
@@ -26,6 +30,7 @@ vars:
   POSTGRES_DIR: '{{.ROOT_DIR}}/k8s/postgres'
   SCENARIOS_DIR: '{{.ROOT_DIR}}/k8s/postgres/modular-tests/scenarios'
   POSTGRES_MIRRORD_CONFIG: '{{.POSTGRES_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres/mirrord.json")}}'
+  POSTGRES_MIRRORD_REAL_CONFIG: '{{.POSTGRES_MIRRORD_REAL_CONFIG | default (print .ROOT_DIR "/k8s/overlays/postgres/mirrord-real.json")}}'
 
 tasks:
   deploy:
@@ -58,6 +63,37 @@ tasks:
           echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
         fi
         {{.MIRRORD_BIN}} exec -f {{.POSTGRES_MIRRORD_CONFIG}} -- /tmp/postgres-app
+
+  deploy:cronjob:
+    desc: Deploy the Postgres source DB plus a CronJob branch target (for CronJob branching)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.POSTGRES_DIR}}
+      - task: _wait:source
+      - kubectl apply -k {{.SCENARIOS_DIR}}/cronjob
+      - echo "CronJob target 'pg-server-cronjob' deployed. Run 'task postgres:run:local:cronjob'."
+
+  run:local:cronjob:
+    desc: Run the app under mirrord against a CronJob target with a branch DB (Ctrl-C to stop)
+    interactive: true
+    dir: apps/postgres-app
+    vars:
+      CONFIG: '{{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-cronjob.json'
+    preconditions:
+      - sh: test -f {{.CONFIG}}
+        msg: "mirrord config not found at {{.CONFIG}}"
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - |
+        # Branching a CronJob needs the operator carrying the fix. When
+        # 'task operator:dev' is running locally, label our resources with its
+        # isolation marker so the LOCAL operator reconciles the branch; the
+        # released cluster operator would reject a CronJob branch target.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- /tmp/postgres-app
 
   query:source:
     desc: 'Query the source database (QUERY="SELECT * FROM users;")'
@@ -173,3 +209,292 @@ tasks:
         done
         echo "Branch pod did not come up; check 'task postgres:status'"
         exit 1
+
+  deploy:real:
+    desc: Deploy a realistic source DB — Pagila (DVD rental, ~20 FK-linked tables) — plus its mirrord target pod
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/postgres/real
+      - echo "Waiting for the real source database (downloads and loads the dataset on first start)..."
+      - kubectl wait --for=condition=ready pod postgres-real -n {{.NAMESPACE}} --timeout=600s
+      - kubectl wait --for=condition=ready pod pg-real-target -n {{.NAMESPACE}} --timeout=120s
+      - echo "Real source ready. Start a subset branch with 'task postgres:run:real:local'."
+
+  run:real:local:
+    desc: Run the app under mirrord with a `subset` branch of the real DB (seed customer_id = 1; Ctrl-C to stop)
+    interactive: true
+    dir: apps/postgres-app
+    preconditions:
+      - sh: test -f {{.POSTGRES_MIRRORD_REAL_CONFIG}}
+        msg: "mirrord config not found at {{.POSTGRES_MIRRORD_REAL_CONFIG}}"
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - |
+        # If operator:dev is running on this machine, label our resources with
+        # its isolation marker so the LOCAL operator reconciles the branch —
+        # unlabeled resources go to the deployed operator, which may not know
+        # this branch type. An explicit OPERATOR_ISOLATION_MARKER always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} exec -f {{.POSTGRES_MIRRORD_REAL_CONFIG}} -- /tmp/postgres-app
+      # Inspect the closure afterwards, e.g.: task postgres:query:branch DB=pagila QUERY="SELECT count(*) FROM rental;"
+
+  clean:real:
+    desc: Remove the real-data source DB and its target pod
+    cmds:
+      - kubectl delete -k {{.ROOT_DIR}}/k8s/postgres/real --ignore-not-found=true 2>/dev/null || true
+
+  tables:source:
+    desc: 'List tables + exact row counts on the source (auto-detects postgres-test/postgres-real; override with POD=... DB=...)'
+    silent: true
+    vars:
+      POD: '{{.POD | default ""}}'
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD="{{.POD}}"; DB="{{.DB}}"
+        if [ -z "$POD" ]; then
+          if kubectl get pod postgres-test -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=postgres-test
+          elif kubectl get pod postgres-real -n {{.NAMESPACE}} >/dev/null 2>&1; then
+            POD=postgres-real; [ -z "$DB" ] && DB=pagila
+          else
+            echo "No source pod found (postgres-test or postgres-real). Deploy one first."; exit 1
+          fi
+        fi
+        [ -z "$DB" ] && DB=source_db
+        echo "=== source pod: $POD (db: $DB) ==="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d "$DB" -c "SELECT table_schema AS schema, table_name AS table, (xpath('/row/cnt/text()', query_to_xml(format('SELECT count(*) AS cnt FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS rows FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema, table_name;"
+  tables:branch:
+    desc: 'List tables + exact row counts on the newest postgres branch (all user DBs; narrow with DB=...)'
+    silent: true
+    vars:
+      DB: '{{.DB | default ""}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o name 2>/dev/null | grep mirrord-postgres-branch | tail -1 | cut -d/ -f2)
+        if [ -z "$POD" ]; then echo "No running postgres branch pod found."; exit 1; fi
+        echo "=== branch pod: $POD ==="
+        ONLY="{{.DB}}"
+        for db in $(kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -At -c "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres' ORDER BY datname"); do
+          if [ -n "$ONLY" ] && [ "$db" != "$ONLY" ]; then continue; fi
+          echo "--- db: $db ---"
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d "$db" -c "SELECT table_schema AS schema, table_name AS table, (xpath('/row/cnt/text()', query_to_xml(format('SELECT count(*) AS cnt FROM %I.%I', table_schema, table_name), false, true, '')))[1]::text::bigint AS rows FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog','information_schema') ORDER BY table_schema, table_name;"
+        done
+
+  # ── Roles & credentials scenarios ────────────────────────────────────────────
+  #
+  # Demonstrates the dbPod.roles modes and the source-user login end to end:
+  #
+  #   task postgres:roles:deploy      source DB + seed roles/grants + params target pod
+  #   task postgres:roles:empty       operator config -> roles "empty" (the default)
+  #   task postgres:roles:full        operator config -> roles "full"
+  #   task postgres:run:local:roles   run the app under mirrord against the roles target
+  #   task postgres:roles:login       connect to the branch as app_user (real password)
+  #   task postgres:roles:probe       permission probes on the branch (grants, SET ROLE)
+  #
+  # What to look for in the app output ("Session identity: ..."):
+  #   roles empty -> user=postgres superuser=true   (env overrides, branch password)
+  #   roles full  -> user=app_user superuser=false  (own creds pass through, enforced)
+  #
+  # The config swap is hot-reloaded by operator:dev, but it only affects branches
+  # created afterwards - run 'task postgres:roles:clean' between mode switches.
+  #
+  # Full mode needs the roles-aware operator: run 'task operator:image:push' (branch
+  # pods copy pg-branch-init out of OPERATOR_IMAGE) and 'task operator:dev' (reads
+  # configs/pg-branch-config.yaml). The deployed released operator serves empty mode.
+
+  roles:deploy:
+    desc: Deploy the roles scenario (source DB + seeded roles/grants + params target pod)
+    cmds:
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.POSTGRES_DIR}}
+      - task: _wait:source
+      - task: roles:seed
+      - kubectl apply -k {{.SCENARIOS_DIR}}/roles
+      - |
+        echo ""
+        echo "Roles scenario deployed. Next:"
+        echo "  task postgres:roles:full        # or postgres:roles:empty (default)"
+        echo "  task postgres:run:local:roles"
+
+  roles:seed:
+    desc: Seed the source DB with the multi-role setup (app_user, readonly group, writer)
+    cmds:
+      - |
+        kubectl exec -i -n {{.NAMESPACE}} postgres-test -- psql -U postgres -d source_db <<'SQL'
+        -- Roles: the app's own login, a read-only group, and a separate table owner.
+        DO $$ BEGIN
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_user') THEN
+            CREATE ROLE app_user LOGIN PASSWORD 'app_pass';
+          END IF;
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'readonly_grp') THEN
+            CREATE ROLE readonly_grp NOLOGIN;
+          END IF;
+          IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'writer_user') THEN
+            CREATE ROLE writer_user NOLOGIN;
+          END IF;
+        END $$;
+        GRANT readonly_grp TO app_user;
+
+        -- The app creates its own table on the branch, so it needs schema rights
+        -- (PostgreSQL 15+ removed public CREATE for everyone).
+        GRANT ALL ON SCHEMA public TO app_user;
+
+        -- The app's table must not pre-exist on the source: the summary table shows
+        -- isolation by contrasting "no app_users on the source" with the rows the app
+        -- wrote on the branch.
+        DROP TABLE IF EXISTS app_users;
+
+        -- A table the app user owns outright.
+        DROP TABLE IF EXISTS roles_mine;
+        CREATE TABLE roles_mine (id SERIAL PRIMARY KEY, body TEXT);
+        INSERT INTO roles_mine (body) VALUES ('owned by app_user');
+        ALTER TABLE roles_mine OWNER TO app_user;
+
+        -- A table owned by someone else; the group may only read it. The SERIAL
+        -- sequence follows the owner and pg_dump reads sequence state, so the
+        -- group needs SELECT on it too.
+        DROP TABLE IF EXISTS roles_report;
+        CREATE TABLE roles_report (id SERIAL PRIMARY KEY, body TEXT);
+        INSERT INTO roles_report (body) VALUES ('shared, read-only via group');
+        ALTER TABLE roles_report OWNER TO writer_user;
+        GRANT SELECT ON roles_report TO readonly_grp;
+        GRANT SELECT ON SEQUENCE roles_report_id_seq TO readonly_grp;
+
+        -- The branch copy dumps as app_user, so everything in the database must be
+        -- readable by it. Granting the group (not the user) keeps the demo honest:
+        -- app_user reads the pre-existing tables (users, orders, ...) through its
+        -- membership, and still cannot write roles_report.
+        GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly_grp;
+        GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO readonly_grp;
+        SQL
+      - echo "Seeded roles + tables on the source database."
+
+  roles:empty:
+    desc: Switch the pg branch config to roles "empty" (local file + deployed operator)
+    cmds:
+      - task: _roles:mode
+        vars: { MODE: empty }
+
+  roles:full:
+    desc: Switch the pg branch config to roles "full" (local file + deployed operator)
+    cmds:
+      - task: _roles:mode
+        vars: { MODE: full }
+
+  _roles:mode:
+    internal: true
+    cmds:
+      # operator:dev reads the local file (hot-reload); a deployed operator reads the
+      # chart's mirrord-configmap, so patch that too and restart for a deterministic pickup.
+      - cp {{.ROOT_DIR}}/configs/pg-branch-config.{{.MODE}}.yaml {{.ROOT_DIR}}/configs/pg-branch-config.yaml
+      - |
+        if kubectl get deploy mirrord-operator -n mirrord >/dev/null 2>&1; then
+          kubectl patch configmap mirrord-configmap -n mirrord --type merge \
+            -p '{"data":{"pg-branch-config.yaml":"dbPod:\n  roles: \"{{.MODE}}\"\n"}}'
+          kubectl rollout restart deploy/mirrord-operator -n mirrord
+          kubectl rollout status deploy/mirrord-operator -n mirrord --timeout=120s
+          # The replaced operator drains for up to its termination grace with the OLD
+          # config; a session started in that window can get a branch built with the
+          # previous mode. Wait until only the new instance remains.
+          for i in $(seq 1 30); do
+            PODS=$(kubectl get pods -n mirrord --no-headers 2>/dev/null | grep -c "^mirrord-operator" || true)
+            [ "$PODS" -le 1 ] && break
+            sleep 2
+          done
+          echo "Deployed operator now uses roles \"{{.MODE}}\"."
+        else
+          echo "No deployed operator found; local file updated (operator:dev hot-reloads within ~60s)."
+        fi
+        echo "Only new branches pick this up:"
+        echo "  task postgres:roles:clean && task postgres:run:local:roles"
+
+  run:local:roles:
+    desc: 'Run the app under mirrord against the roles target (params mode; KEY=x to reuse a branch; Ctrl-C to stop)'
+    interactive: true
+    dir: apps/postgres-app
+    vars:
+      CONFIG: '{{.ROOT_DIR}}/k8s/overlays/postgres/mirrord-roles.json'
+      KEY: '{{.KEY | default ""}}'
+    preconditions:
+      - sh: test -f {{.CONFIG}}
+        msg: "mirrord config not found at {{.CONFIG}}"
+    cmds:
+      - go build -o /tmp/postgres-app main.go
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        # The branch id embeds {{"{{ key }}"}}: each run gets a fresh branch (a failed id
+        # stays pinned to its cached error for the TTL). Pass KEY=something to keep the
+        # id stable across runs and demo branch sharing/reuse instead.
+        # env -u: a DATABASE_URL exported in the shell would shadow the DB_* vars and
+        # silently point the app at the SOURCE database instead of the branch.
+        env -u DATABASE_URL {{.MIRRORD_BIN}} exec -f {{.CONFIG}} {{if .KEY}}--key {{.KEY}}{{end}} -- /tmp/postgres-app
+
+  roles:login:
+    desc: Connect to the roles branch as app_user with its real password (full roles proof)
+    silent: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod. Start one with 'task postgres:run:local:roles'."
+          exit 1
+        fi
+        echo "Logging into $POD as app_user (real source password):"
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- \
+          env PGPASSWORD=app_pass psql -U app_user -d source_db \
+          -c "SELECT current_user, rolsuper AS superuser FROM pg_roles WHERE rolname = current_user;"
+
+  roles:probe:
+    desc: Permission probes on the roles branch (group grant, denial, SET ROLE)
+    silent: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l db-owner-name --field-selector=status.phase=Running \
+          --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "No running branch pod. Start one with 'task postgres:run:local:roles'."
+          exit 1
+        fi
+        run_as_app() {
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- env PGPASSWORD=app_pass psql -U app_user -d source_db -c "$1"
+        }
+        echo "== as app_user: SELECT on roles_report (group grant; empty mode: superuser reads anything) =="
+        run_as_app "SELECT * FROM roles_report;" || true
+        echo ""
+        echo "== as app_user: INSERT into roles_report (full mode: denied - only SELECT is granted) =="
+        run_as_app "INSERT INTO roles_report (body) VALUES ('probe');" || true
+        echo ""
+        echo "== as branch superuser: SET ROLE writer_user, INSERT (owner rights survive) =="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d source_db \
+          -c "SET ROLE writer_user; INSERT INTO roles_report (body) VALUES ('from writer'); SELECT count(*) FROM roles_report;" || true
+        echo ""
+        echo "== role attributes and membership on the branch =="
+        kubectl exec -n {{.NAMESPACE}} "$POD" -- psql -U postgres -d source_db \
+          -c "SELECT rolname, rolcanlogin, rolsuper FROM pg_roles WHERE rolname IN ('app_user','readonly_grp','writer_user') ORDER BY rolname;" \
+          -c "SELECT granted.rolname AS grouprole, member.rolname AS member FROM pg_auth_members am JOIN pg_roles granted ON granted.oid = am.roleid JOIN pg_roles member ON member.oid = am.member WHERE granted.rolname = 'readonly_grp';"
+
+  roles:walkthrough:
+    desc: Interactive walkthrough of every roles/credentials case (Enter advances; logged)
+    interactive: true
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/pg-roles-walkthrough.sh {{.CLI_ARGS}}'
+
+  roles:clean:
+    desc: Delete roles-scenario branches so the next run picks up the current mode
+    cmds:
+      # Both CRDs: the CLI creates unified `branchdatabases`; the standing env-val
+      # scenario uses legacy `pgbranchdatabases`. Deleting only one leaves CRs whose
+      # pods the operator recreates.
+      - kubectl delete branchdatabases -n {{.NAMESPACE}} --all --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete pgbranchdatabases -n {{.NAMESPACE}} --all --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete pod -n {{.NAMESPACE}} -l db-owner-name --ignore-not-found=true 2>/dev/null || true
+      - echo "Branches cleared. Next branch uses the currently configured roles mode."
