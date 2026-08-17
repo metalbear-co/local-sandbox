@@ -1,0 +1,17 @@
+# Same connection as property-list.yaml plus mirrord.temporary_group_id: the
+# split repoints the KafkaJS workload to a generated temporary group, leaving
+# the original group to the operator's forwarder alone. Applied by
+# `task kafkajs:fix:on`.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: kafkajs-kafka-connection
+  namespace: test-mirrord
+spec:
+  properties:
+    - name: bootstrap.servers
+      value: kafka-cluster.test-mirrord.svc.cluster.local:9092
+    - name: security.protocol
+      value: PLAINTEXT
+    - name: mirrord.temporary_group_id
+      value: "true"

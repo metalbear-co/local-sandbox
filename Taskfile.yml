@@ -50,6 +50,8 @@ includes:
     taskfile: ./taskfiles/sqs.yml
   kafka:
     taskfile: ./taskfiles/kafka.yml
+  kafkajs:
+    taskfile: ./taskfiles/kafkajs.yml
   rmq:
     taskfile: ./taskfiles/rmq.yml
   pubsub:

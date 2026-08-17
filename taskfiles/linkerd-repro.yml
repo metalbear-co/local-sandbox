@@ -36,7 +36,7 @@ vars:
   # linkerd edge requires the Gateway API CRDs to exist before install; this is
   # the version its own error message asks for.
   GATEWAY_API_VERSION: '{{.GATEWAY_API_VERSION | default "v1.2.1"}}'
-  CONFIG: '{{.ROOT_DIR}}/configs/linkerd-repro.mirrord.json'
+  LINKERD_REPRO_CONFIG: '{{.ROOT_DIR}}/configs/linkerd-repro.mirrord.json'
 
 tasks:
   ui:
@@ -171,7 +171,7 @@ tasks:
     interactive: true
     cmds:
       - |
-        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- \
+        MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.LINKERD_REPRO_CONFIG}} -- \
           sh -c 'echo "BACKEND_URL=$BACKEND_URL PUBSUB_PAUSE_SUBSCRIBER=$PUBSUB_PAUSE_SUBSCRIBER"; curl -sf --max-time 10 "$BACKEND_URL" >/dev/null && echo "outgoing OK"'
 
   repro:
@@ -184,12 +184,12 @@ tasks:
       - |
         set -uo pipefail
         PASS=0; FAIL=0
-        echo "config: {{.CONFIG}}"
+        echo "config: {{.LINKERD_REPRO_CONFIG}}"
         echo "cli:    $({{.MIRRORD_BIN}} --version 2>/dev/null || echo unknown)"
         echo ""
         for i in $(seq 1 {{.ATTEMPTS}}); do
           START=$(date +%s)
-          if MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.CONFIG}} -- \
+          if MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f {{.LINKERD_REPRO_CONFIG}} -- \
                sh -c 'curl -sf --max-time 10 "$BACKEND_URL" >/dev/null && echo "outgoing OK"'; then
             RESULT=SUCCESS; PASS=$((PASS+1))
           else

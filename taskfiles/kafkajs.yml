@@ -1,0 +1,192 @@
+version: "3"
+
+# Kafka queue splitting with a KafkaJS consumer - reproduces the
+# INCONSISTENT_GROUP_PROTOCOL clash and proves the mirrord.temporary_group_id fix.
+#
+#   task kafkajs:deploy         deploy the Kafka broker + KafkaJS consumer (fix OFF)
+#   task kafkajs:fix:on         set mirrord.temporary_group_id on the client config
+#   task kafkajs:fix:off        remove it again
+#   task kafkajs:run:local      run the consumer locally under mirrord (starts the split)
+#   task kafkajs:send:match     message with header user_id=test-user -> your local session
+#   task kafkajs:send:nomatch   message without headers              -> cluster consumer
+#
+# End-to-end proofs (spawn cluster + env, run the flow, assert the outcome):
+#   scripts/test-kafkajs-old.sh   released operator: silent starvation bug
+#   scripts/test-kafkajs-new.sh   local operator: loud error without the flag, working split with it
+#
+# The broker manifest is a copy of the kafka overlay's (same names), so both
+# overlays converge on one shared broker in test-mirrord.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/kafkajs-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/kafkajs'
+  TOPIC: '{{.KAFKAJS_TOPIC | default "test-topic"}}'
+  MATCH_USER_ID: '{{.KAFKAJS_MATCH_USER_ID | default "test-user"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the KafkaJS test env (broker + consumer, fix OFF)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t kafkajs-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load kafkajs-consumer:local
+      # A fresh cluster has no broker image, and Docker Hub may be unreachable
+      # from this machine - feed it from the host daemon instead of pulling.
+      - |
+        if ! minikube -p {{.CLUSTER_NAME}} image ls | grep -q "apache/kafka:4.1.0"; then
+          echo "Loading apache/kafka:4.1.0 into minikube from the host daemon..."
+          minikube -p {{.CLUSTER_NAME}} image load apache/kafka:4.1.0
+        fi
+      - kubectl apply -k {{.OVERLAY}}
+      - task: _wait:kafka
+      - task: _wait:dns
+      - task: _ensure:topic
+      # The image tag never changes, so running pods keep the old build unless
+      # they are recycled.
+      - kubectl rollout restart deployment/kafkajs-consumer -n {{.NAMESPACE}}
+      - task: _wait:consumer
+
+  fix:on:
+    desc: Enable mirrord.temporary_group_id on the kafkajs client config
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list-fix.yaml
+      - 'echo "mirrord.temporary_group_id: true - new splits repoint the app to a temporary group"'
+
+  fix:off:
+    desc: Disable mirrord.temporary_group_id again
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+      - 'echo "mirrord.temporary_group_id removed - new splits share the app group again"'
+
+  run:local:
+    desc: Run the KafkaJS consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/kafkajs-consumer
+    cmds:
+      - test -d node_modules || npm install --omit=dev
+      - "{{.MIRRORD_BIN}} exec -f {{.OVERLAY}}/mirrord.json -- node consumer.js"
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          USER_ID: "{{.MATCH_USER_ID}}"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          USER_ID: ""
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Send a message with explicit routing (USER_ID=... MESSAGE=...; empty USER_ID sends no header)'
+    silent: true
+    vars:
+      USER_ID: '{{.USER_ID | default ""}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        if [ -n "{{.USER_ID}}" ]; then
+          printf 'user_id:{{.USER_ID}}|{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}} --property 'parse.headers=true' --property 'headers.delimiter=|'
+        else
+          printf '{{.MESSAGE}}' | kubectl exec -i -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server localhost:9092 --topic {{.TOPIC}}
+        fi
+        echo "sent '{{.MESSAGE}}'"
+
+  logs:
+    desc: Tail the cluster KafkaJS consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=kafkajs-consumer --tail=100 -f
+
+  status:
+    desc: Show consumer, split sessions, patched env and temporary groups
+    silent: true
+    cmds:
+      - echo "=== consumer pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=kafkajs-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A -o wide 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== workload patches (group/topic env rewrites) ==="
+      - |
+        kubectl get mirrordclusterworkloadpatchrequest -o jsonpath='{range .items[*]}{.metadata.name}{" -> "}{.spec.envVars}{"\n"}{end}' 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== consumer groups on the broker ==="
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-consumer-groups.sh --list --bootstrap-server localhost:9092
+        else
+          echo "broker not reachable"
+        fi
+
+  clean:
+    desc: Remove the KafkaJS test env from the cluster
+    cmds:
+      - kubectl delete -k {{.OVERLAY}} --ignore-not-found=true
+
+  _wait:kafka:
+    internal: true
+    cmds:
+      - echo "Waiting for Kafka broker..."
+      - kubectl wait --for=condition=ready pod -l app=kafka-cluster -n {{.NAMESPACE}} --timeout=300s
+
+  # After a cluster restart CoreDNS can lag behind pods becoming Ready, and the
+  # broker's advertised listener is a service FQDN - nothing Kafka works until
+  # it resolves in-cluster.
+  _wait:dns:
+    internal: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        echo "Waiting for in-cluster DNS..."
+        for i in $(seq 1 30); do
+          if kubectl exec -n {{.NAMESPACE}} "$POD" -- nslookup kafka-cluster.{{.NAMESPACE}}.svc.cluster.local >/dev/null 2>&1; then
+            echo "DNS is up."
+            exit 0
+          fi
+          sleep 3
+        done
+        echo "in-cluster DNS did not come up within 90s (check: kubectl get pods -n kube-system)"
+        exit 1
+
+  # The broker has no persistent storage, so topics vanish on restarts; create
+  # the test topic explicitly instead of leaning on producer auto-creation.
+  # Retried because the broker can briefly reject admin calls right after
+  # coming up; the noisy WARN spam is only shown on the final failure.
+  _ensure:topic:
+    internal: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}')
+        create() {
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-topics.sh --create --if-not-exists --topic {{.TOPIC}} --partitions 3 --bootstrap-server localhost:9092
+        }
+        for i in 1 2 3; do
+          if OUTPUT=$(create 2>&1); then
+            echo "$OUTPUT" | tail -1
+            exit 0
+          fi
+          echo "topic creation attempt $i failed, retrying in 10s..."
+          sleep 10
+        done
+        create
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for KafkaJS consumer..."
+      # rollout status (not `kubectl wait` on the label) so the old pod left
+      # Terminating by the rollout restart does not hold the wait hostage.
+      - kubectl rollout status deployment/kafkajs-consumer -n {{.NAMESPACE}} --timeout=120s

@@ -1,0 +1,19 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: kafkajs-consumer
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: kafkajs-consumer
+  queues:
+    - id: test-topic
+      kind: kafka
+      clientConfig: kafkajs-kafka-connection
+      appConfig:
+        topic:
+          - env: KAFKA_TOPIC_NAME
+        groupId:
+          - env: KAFKA_GROUP_ID

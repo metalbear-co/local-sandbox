@@ -1,0 +1,15 @@
+# Kafka connection for the kafkajs split, WITHOUT mirrord.temporary_group_id.
+# On this variant the split cannot work: the forwarder and the KafkaJS pods
+# share a group but have no common group protocol name. `task kafkajs:fix:on`
+# swaps in property-list-fix.yaml.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: kafkajs-kafka-connection
+  namespace: test-mirrord
+spec:
+  properties:
+    - name: bootstrap.servers
+      value: kafka-cluster.test-mirrord.svc.cluster.local:9092
+    - name: security.protocol
+      value: PLAINTEXT
