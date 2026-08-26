@@ -1,0 +1,17 @@
+{
+  "target": {
+    "path": "deployment/nats-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "*": {
+        "queue_type": "NATS",
+        "message_filter": {
+          "tenant": "^acme$"
+        }
+      }
+    }
+  }
+}

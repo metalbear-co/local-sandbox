@@ -54,6 +54,16 @@ feature:
     override:
       RUST_LOG: "operator_service=info,mirrord=info,operator_pod_mutator=debug,operator_queue_splitting=debug,operator_preview_env=debug"
 
+      # The sandbox offline license (scripts/generate-license.sh output, copied into
+      # configs/ so the fs `local` pattern serves it from this repo). The inherited
+      # OPERATOR_LICENSE_KEY is an online key that expired in Aug 2026; a file path
+      # outranks the key, so the local operator runs on this instead. Requires a
+      # binary that trusts the sandbox issuer - run
+      #   SANDBOX_LICENSE=1 OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat scripts/license-issuer.pem)" task operator:dev
+      # so cargo bakes the issuer in at build time (plain `task operator:dev` exports
+      # it only after the build, which is too late for option_env!).
+      OPERATOR_LICENSE_PATH: "../local-sandbox/configs/company-license.pem"
+
       # Feature flags for the LOCAL operator. The base env is inherited from
       # the deployed operator pod, so a flag the deployed chart doesn't render
       # (e.g. a feature you're developing that isn't released yet) is missing
@@ -90,5 +100,10 @@ feature:
       # (alternative without a registry push: `task redis:tls:build:init-image`
       # builds an init-binaries-only image and loads it into minikube — set
       # OPERATOR_IMAGE to "mirrord-branch-init:local" / pull policy "Never"):
-      OPERATOR_IMAGE: "vrrashkov/operator:local"
-      OPERATOR_IMAGE_PULL_POLICY: "Always"
+      # The registry image predates the pg-branch-init `--roles` flag, so branch pods
+      # use the init-binaries-only image built from local source
+      # (`task redis:tls:build:init-image`, loaded straight into minikube).
+      OPERATOR_IMAGE: "mirrord-branch-init:local"
+      OPERATOR_IMAGE_PULL_POLICY: "Never"
+      # OPERATOR_IMAGE: "vrrashkov/operator:local"
+      # OPERATOR_IMAGE_PULL_POLICY: "Always"

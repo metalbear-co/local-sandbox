@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats-consumer
+  template:
+    metadata:
+      labels:
+        app: nats-consumer
+    spec:
+      initContainers:
+      - name: wait-for-nats
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for NATS to be ready..."
+          until nc -z nats.nats-sandbox.svc.cluster.local 4222 2>/dev/null; do
+            echo "NATS not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "NATS is ready!"
+      containers:
+      - name: consumer
+        image: nats-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: NATS_URL
+          value: "nats://nats.nats-sandbox.svc.cluster.local:4222"
+        - name: NATS_STREAM
+          value: "ORDERS"
+        - name: NATS_CONSUMER
+          value: "orders-app"

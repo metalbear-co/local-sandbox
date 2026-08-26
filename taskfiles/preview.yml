@@ -7,6 +7,7 @@ version: "3"
 #   task preview:mounts:start         start a preview with a config_mount + a secret_mount
 #   task preview:mounts:verify        show where each mount landed (CR ref, ConfigMap, Secret, pod)
 #   task preview:test:mounts          end-to-end: mounts:start then mounts:verify
+#   task preview:test:cm-override     end-to-end: versioned-CM directory-mount target; repro the broken overlay + prove the env-override workaround
 #   task preview:pattern:deploy       deploy a target that reads one combined DATABASE_URL (Teladoc shape)
 #   task preview:pattern:start        start a preview with a value_pattern DB branch on that target
 #   task preview:pattern:verify       show the whole chain: runtime value -> env-overrides Secret -> secretKeyRef -> preview pod env
@@ -193,6 +194,11 @@ tasks:
       - |
         echo
         echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  test:cm-override:
+    desc: End-to-end - repro config_mount over a directory-mounted ConfigMap failing, then verify the env-override workaround (Cashfree shape)
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-preview-configmap-override.sh
 
   pattern:deploy:
     desc: Deploy a target that reads one combined DATABASE_URL (pattern overrides are its only branch option)

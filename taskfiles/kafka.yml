@@ -6,10 +6,24 @@ version: "3"
 #   task kafka:run:local      run the consumer locally under mirrord (starts the split)
 #   task kafka:send:match     message with header user_id=test-user -> your local session
 #   task kafka:send:nomatch   message without headers             -> cluster consumer
+#   task kafka:policy:test    e2e the splitQueues mirrord policy verdicts
+#                             (needs 'task operator:crds' + 'task operator:dev'
+#                              from the queue-filter-policy branch)
 #
 # The split filter lives in k8s/overlays/kafka/mirrord.json
 # (Kafka header `user_id` matching test-user on topic test-topic). Messages are
 # produced by kubectl exec-ing kafka-console-producer.sh inside the broker pod.
+#
+# Filter debug (jq filter + per-message evaluation events, mirrord-debug.json):
+#
+#   task kafka:debug:run           run the consumer with a jq filter and debug on
+#   task kafka:debug:watch         stream filter evaluations (another terminal)
+#   task kafka:debug:send:match    JSON message the filter matches
+#   task kafka:debug:send:nomatch  JSON message it rejects
+#   task kafka:send:nomatch        plain-text message -> jq error verdict
+#
+# Needs a locally built mirrord CLI and operator (MIRRORD_BIN=.../target/debug/mirrord,
+# task operator:dev) until both releases carry the feature.
 
 vars:
   ROOT_DIR:
@@ -82,6 +96,43 @@ tasks:
           *)                    echo "sent '{{.MESSAGE}}' (user_id={{.USER_ID}} -> stays in cluster)";;
         esac
 
+  debug:run:
+    desc: Run the consumer under mirrord with a jq filter and filter debug enabled (Ctrl-C to stop)
+    interactive: true
+    dir: apps/kafka-consumer
+    cmds:
+      - go build -o /tmp/kafka-consumer main.go
+      - |
+        echo "Filter debug is on for topic {{.TOPIC}} (config: k8s/overlays/kafka/mirrord-debug.json)."
+        echo "In another terminal:"
+        echo "  task kafka:debug:watch          stream the filter evaluations"
+        echo "  task kafka:debug:send:match     JSON message the jq filter matches"
+        echo "  task kafka:debug:send:nomatch   JSON message it rejects"
+        echo "  task kafka:send:nomatch         plain-text message -> jq error verdict"
+      - "{{.MIRRORD_BIN}} exec -f {{.OVERLAY}}/mirrord-debug.json -- /tmp/kafka-consumer"
+
+  debug:watch:
+    desc: Stream filter debug events for the kafka-debug session (pipe to a file to hand to an LLM)
+    interactive: true
+    cmds:
+      - "{{.MIRRORD_BIN}} subscribe -k kafka-debug --pretty"
+
+  debug:send:match:
+    desc: Send a JSON message the debug jq filter matches -> local session, verdict "matched"
+    cmds:
+      - task: send
+        vars:
+          USER_ID: ""
+          MESSAGE: '{"cohortId":434,"runId":1}'
+
+  debug:send:nomatch:
+    desc: Send a JSON message the debug jq filter rejects -> cluster consumer, verdict "not_matched"
+    cmds:
+      - task: send
+        vars:
+          USER_ID: ""
+          MESSAGE: '{"cohortId":42,"runId":2}'
+
   logs:
     desc: Tail the cluster consumer logs
     cmds:
@@ -113,6 +164,13 @@ tasks:
         else
           echo "broker not reachable"
         fi
+
+  policy:test:
+    desc: "E2E the splitQueues mirrord policy (deny/allow verdicts) against the kafka overlay"
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-queue-filter-policy.sh
+      - echo ""
+      - echo "Policy removed again - 'task kafka:run:local' works unrestricted now."
 
   clean:
     desc: Remove the Kafka test env from the cluster

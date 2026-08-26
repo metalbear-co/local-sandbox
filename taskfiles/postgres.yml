@@ -498,3 +498,16 @@ tasks:
       - kubectl delete pgbranchdatabases -n {{.NAMESPACE}} --all --ignore-not-found=true 2>/dev/null || true
       - kubectl delete pod -n {{.NAMESPACE}} -l db-owner-name --ignore-not-found=true 2>/dev/null || true
       - echo "Branches cleared. Next branch uses the currently configured roles mode."
+
+  # ── AWS Secrets Manager connection sources (LocalStack, no real AWS) ─────
+
+  asm:test:
+    desc: "E2E: branch connection values fetched from AWS Secrets Manager via LocalStack (needs operator:dev with the ASM support)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-asm-pg-branch.sh'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-asm-pg-branch.sh   keep LocalStack + branches for poking"
+        echo "  scripts/test-asm-pg-branch.sh param    only the params-mode case"
+        echo "  scripts/test-asm-pg-branch.sh url      only the URL-mode case"

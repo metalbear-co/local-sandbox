@@ -102,7 +102,25 @@ tasks:
         if [ -n "$MC" ]; then
           echo "$MC" | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
         fi
-      - echo "CRDs from the local chart applied{{if .CLUSTER}} to {{.CLUSTER}}{{end}}."
+      # The local operator runs with the DEPLOYED operator's ServiceAccount
+      # (mirrord makes it use the target pod's token), so a branch that adds
+      # RBAC rules gets 403s until the local chart's ClusterRole is applied
+      # on top of the released one.
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} -s templates/cluster-role.yaml | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
+      - echo "CRDs and RBAC from the local chart applied{{if .CLUSTER}} to {{.CLUSTER}}{{end}}."
+
+  whitelist:
+    desc: "Create the whitelist e2e user (customer RBAC only, same as CI) and a kubeconfig for it. CLUSTER=<kube-context> targets another cluster."
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+      WHITELIST_KUBECONFIG: "{{.VERSIONS_DIR}}/whitelist-user.kubeconfig"
+    cmds:
+      - "{{.OPERATOR_DIR}}/scripts/e2e_whitelist_user.sh {{.WHITELIST_KUBECONFIG}} {{.CLUSTER}}"
+      - |
+        echo ""
+        echo "Act as a customer (mirrord CLI and tests read MIRRORD_KUBECONFIG, kubectl reads KUBECONFIG):"
+        echo "  export MIRRORD_KUBECONFIG={{.WHITELIST_KUBECONFIG}}"
+        echo "  KUBECONFIG={{.WHITELIST_KUBECONFIG}} kubectl auth whoami"
 
   dev:
     desc: "Run the local operator under mirrord (steals from the deployed operator). Applies local CRDs first. CLUSTER=<kube-context> picks the cluster and its .mirrord/operator-dev.<cluster>.yaml config if present; CONFIG=<path> overrides; SANDBOX_LICENSE=1 to trust the sandbox license issuer."
@@ -137,11 +155,14 @@ tasks:
       # before dynamic vars like ROOT_DIR, which mangles the path.
       #
       # A released cluster operator runs on a production license, which a local
-      # source build validates with its default issuer key. Only when the
-      # cluster runs the sandbox-built operator (legacy flow, self-signed
-      # license) does the local binary need the sandbox issuer key too.
+      # source build validates with its default issuer key. The sandbox issuer is
+      # additionally baked in at BUILD time (issuer trust is compile-time via
+      # option_env!, a runtime export does nothing), so the local binary also
+      # accepts the sandbox PEM license that .mirrord/operator-dev.yaml points
+      # OPERATOR_LICENSE_PATH at - needed since the deployed license.key expired.
       - |
         cd {{.OPERATOR_DIR}}
+        export OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)"
         cargo build -p operator-service
         codesign -f -s - ./target/debug/operator-service
         rm -rf /tmp/mirrord

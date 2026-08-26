@@ -11,6 +11,7 @@
     "network": {
       "incoming": {
         "mode": "steal",
+        "ports": [8080],
         "http_filter": {
           "header_filter": "X-Preview: {{ key }}"
         }

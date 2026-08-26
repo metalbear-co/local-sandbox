@@ -164,13 +164,16 @@ tasks:
           -v {{.ROOT_DIR}}/..:/w \
           -v mirrord-branch-cargo:/usr/local/cargo/registry \
           -w /w/operator rust:1-bookworm \
-          bash -c "apt-get update -qq && apt-get install -y -qq cmake perl >/dev/null && \
+          bash -c "apt-get update -qq && apt-get install -y -qq cmake perl protobuf-compiler >/dev/null && \
                    cargo build -p operator-db-branching --bins --release --target-dir /w/local-sandbox/.build/operator-target"
       - |
         STAGE={{.ROOT_DIR}}/.build/branch-init-image
         mkdir -p "$STAGE"
         cp {{.ROOT_DIR}}/.build/operator-target/release/*-branch-init "$STAGE/"
-        printf 'FROM debian:bookworm-slim\nRUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*\nCOPY ./*-branch-init /usr/local/bin/\n' > "$STAGE/Dockerfile"
+        # The branch pod's copy-binary container also stages cloud-sql-proxy and the CA
+        # bundle out of this image (see the pg initializer), so ship both like the real
+        # operator image does - version pinned to operator/public/operator/Dockerfile.
+        printf 'FROM debian:bookworm-slim\nARG TARGETARCH\nRUN apt-get update && apt-get install -y ca-certificates curl && curl -fsSL "https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.14.1/cloud-sql-proxy.linux.${TARGETARCH}" -o /usr/local/bin/cloud-sql-proxy && chmod +x /usr/local/bin/cloud-sql-proxy && apt-get purge -y curl && rm -rf /var/lib/apt/lists/*\nCOPY ./*-branch-init /usr/local/bin/\n' > "$STAGE/Dockerfile"
         {{.CONTAINER_RUNTIME}} build -t mirrord-branch-init:local "$STAGE"
       - minikube -p {{.CLUSTER_NAME}} image load mirrord-branch-init:local
       - echo "mirrord-branch-init:local loaded into minikube (branch sidecars now have --target-tls support)"
@@ -244,6 +247,18 @@ tasks:
         else
           echo "FAIL: TLS PING did not answer"; exit 1
         fi
+
+  tls:test:profile:
+    desc: "E2E: TLS under a named profile (Teladoc shape) - deploys redis if missing, runs the good + misplaced-key cases (gum UI)"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-redis-tls-profile.sh"
+
+  tls:show:error:
+    desc: "Demo: misplace tls beside the profile's dbPod and show the did-you-mean error as the developer (mirrord CLI) and the admin (CR status) see it; the Failed CR stays ~5 min for kubectl inspection"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-redis-tls-profile.sh misplaced"
 
   tls:query:branch:
     desc: 'Run a redis-cli command against a TLS branch Redis (QUERY="KEYS *")'

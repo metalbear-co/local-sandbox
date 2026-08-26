@@ -1,0 +1,204 @@
+version: "3"
+
+# NATS JetStream queue splitting.
+#
+#   task nats:deploy         deploy NATS + nats-box + consumer + split CRDs into the cluster
+#   task nats:run:local      run the consumer locally under mirrord (starts the split)
+#   task nats:send:match     message with header tenant=acme  -> your local session
+#   task nats:send:nomatch   message with header tenant=other -> cluster consumer
+#   task nats:test:split     scripted non-interactive e2e (scripts/test-nats-split.sh)
+#
+# The split filter lives in k8s/overlays/nats/mirrord.json (message header
+# `tenant` matching ^acme$ on stream ORDERS / durable consumer orders-app).
+# Messages are published by kubectl exec-ing the `nats` CLI inside the
+# nats-box pod. Variants:
+#
+#   task nats:run:local:jq         jq filter on the JSON payload (.payload.type == "premium")
+#   task nats:run:local:mirror     same header filter, queue_mode mirror (both get a copy)
+#   task nats:run:local:wildcard   queue id "*" (split every configured queue)
+#
+# Needs `operator.natsSplitting: true` in the operator values (operator-values.yaml
+# has it) and an operator built from a branch that carries the NATS broker split.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/nats-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/nats'
+  NATS_NAMESPACE: "nats-sandbox"
+  # Overridable via NATS_MIRRORD_CONFIG / NATS_SUBJECT / NATS_MATCH_TENANT in
+  # .env (module-prefixed names so they can't collide with other modules'
+  # globals). The tenant must match the `tenant` filter in mirrord.json.
+  NATS_MIRRORD_CONFIG: '{{.NATS_MIRRORD_CONFIG | default (print .ROOT_DIR "/k8s/overlays/nats/mirrord.json")}}'
+  SUBJECT: '{{.NATS_SUBJECT | default "orders.new"}}'
+  MATCH_TENANT: '{{.NATS_MATCH_TENANT | default "acme"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the NATS test env (NATS + nats-box + consumer)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t nats-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load nats-consumer:local
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl apply -k {{.OVERLAY}}
+      - task: _wait:nats
+      - task: _wait:consumer
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config.yaml
+      - |
+        echo ""
+        echo "NATS test env is up. Next:"
+        echo "  task nats:run:local       run the consumer locally under mirrord"
+        echo "  task nats:send:match      then send a message that routes to it"
+        echo "  task nats:logs            watch the cluster consumer"
+
+  run:local:
+    desc: Run the consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/nats-consumer
+    cmds:
+      - go build -o /tmp/nats-consumer main.go
+      - |
+        echo "In another terminal:"
+        echo "  task nats:send:match      tenant=acme  -> this session"
+        echo "  task nats:send:nomatch    tenant=other -> cluster consumer"
+      - "{{.MIRRORD_BIN}} exec -f {{.NATS_MIRRORD_CONFIG}} -- /tmp/nats-consumer"
+
+  run:local:jq:
+    desc: Run locally with a jq filter on the JSON payload (.payload.type == "premium")
+    interactive: true
+    cmds:
+      - task: run:local
+        vars:
+          NATS_MIRRORD_CONFIG: "{{.OVERLAY}}/mirrord-jq.json"
+
+  run:local:mirror:
+    desc: Run locally in mirror mode (matches are copied, the cluster consumer keeps them too)
+    interactive: true
+    cmds:
+      - task: run:local
+        vars:
+          NATS_MIRRORD_CONFIG: "{{.OVERLAY}}/mirrord-mirror.json"
+
+  run:local:wildcard:
+    desc: Run locally with the wildcard queue id "*"
+    interactive: true
+    cmds:
+      - task: run:local
+        vars:
+          NATS_MIRRORD_CONFIG: "{{.OVERLAY}}/mirrord-wildcard.json"
+
+  send:match:
+    desc: 'Publish a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "{{.MATCH_TENANT}}"
+          TYPE: "premium"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Publish a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: send
+        vars:
+          TENANT: "other"
+          TYPE: "basic"
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  send:
+    desc: 'Publish a message with explicit routing (TENANT=... TYPE=... MESSAGE=... SUBJECT=...)'
+    silent: true
+    vars:
+      TENANT: '{{.TENANT | default "acme"}}'
+      TYPE: '{{.TYPE | default "standard"}}'
+      MESSAGE: '{{.MESSAGE | default "Test message"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.NATS_NAMESPACE}} -l app.kubernetes.io/name=nats-box -o jsonpath='{.items[0].metadata.name}')
+        kubectl exec -n {{.NATS_NAMESPACE}} "$POD" -- \
+          nats --server nats://nats:4222 pub {{.SUBJECT}} \
+            -H "tenant:{{.TENANT}}" -H "type:{{.TYPE}}" \
+            '{"tenant":"{{.TENANT}}","type":"{{.TYPE}}","message":"{{.MESSAGE}}"}' >/dev/null
+        case "{{.TENANT}}" in
+          "{{.MATCH_TENANT}}") echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> local session)";;
+          *)                   echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
+        esac
+
+  logs:
+    desc: Tail the cluster consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=nats-consumer --tail=100 -f
+
+  logs:nats:
+    desc: Tail the NATS server logs
+    cmds:
+      - kubectl logs -n {{.NATS_NAMESPACE}} -l app.kubernetes.io/name=nats --tail=100 -f
+
+  status:
+    desc: Show consumer, NATS and split state
+    silent: true
+    cmds:
+      - echo "=== consumer ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=nats-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== nats ==="
+      - kubectl get pods -n {{.NATS_NAMESPACE}} -l app.kubernetes.io/name=nats 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== split config ==="
+      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== streams (mirrord-tmp-* are per-session) ==="
+      - |
+        POD=$(kubectl get pod -n {{.NATS_NAMESPACE}} -l app.kubernetes.io/name=nats-box -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -z "$POD" ]; then
+          echo "nats-box not reachable"
+        else
+          kubectl exec -n {{.NATS_NAMESPACE}} "$POD" -- nats --server nats://nats:4222 stream ls 2>/dev/null || echo "nats not reachable"
+          echo ""
+          echo "=== consumers on ORDERS ==="
+          kubectl exec -n {{.NATS_NAMESPACE}} "$POD" -- nats --server nats://nats:4222 consumer ls ORDERS 2>/dev/null || echo "stream ORDERS not found"
+        fi
+
+  test:split:
+    desc: "Scripted e2e: deploy assumed done, header-filter split, routing + tmp stream cleanup asserts"
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-nats-split.sh
+      - |
+        echo ""
+        echo "Rerun options:"
+        echo "  DEPLOY=1 scripts/test-nats-split.sh   (re)deploy the overlay first"
+        echo "  KEEP=1   scripts/test-nats-split.sh   leave the session running"
+
+  clean:
+    desc: Remove the NATS test env from the cluster
+    cmds:
+      - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true
+      - kubectl delete namespace {{.NATS_NAMESPACE}} --ignore-not-found=true
+      - echo "NATS env removed. Redeploy with 'task nats:deploy'."
+
+  _wait:nats:
+    internal: true
+    cmds:
+      - echo "Waiting for NATS..."
+      # Wait on the Deployment rollouts, not label-selected pods: right after
+      # `kubectl apply` the ReplicaSet may not have created the pod yet, and
+      # `kubectl wait pod -l ...` fails with "no matching resources found".
+      - kubectl rollout status deployment/nats -n {{.NATS_NAMESPACE}} --timeout=300s
+      - kubectl rollout status deployment/nats-box -n {{.NATS_NAMESPACE}} --timeout=300s
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for NATS consumer..."
+      - kubectl rollout status deployment/nats-consumer -n {{.NAMESPACE}} --timeout=300s

@@ -1,0 +1,66 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  namespace: nats-sandbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nats
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nats
+    spec:
+      containers:
+      - name: nats
+        image: nats:2.12-alpine
+        # -js enables JetStream (streams + durable consumers live here).
+        args: ["-js"]
+        ports:
+        - containerPort: 4222
+          name: client
+        readinessProbe:
+          tcpSocket:
+            port: 4222
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  namespace: nats-sandbox
+spec:
+  selector:
+    app.kubernetes.io/name: nats
+  ports:
+  - port: 4222
+    targetPort: 4222
+    name: client
+---
+# nats-box carries the `nats` CLI; send/status tasks and the e2e script
+# kubectl-exec into it, the same way pubsub execs curl inside the emulator pod.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-box
+  namespace: nats-sandbox
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nats-box
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nats-box
+    spec:
+      containers:
+      - name: nats-box
+        image: natsio/nats-box:latest
+        command: ["sh", "-c", "sleep infinity"]
+        env:
+        - name: NATS_URL
+          value: "nats://nats.nats-sandbox.svc.cluster.local:4222"

@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# property-list.yaml and split-config.yaml are applied by `task nats:deploy`
+# after the consumer is ready (they need the operator CRDs installed).
+resources:
+  - namespace.yaml
+  - nats.yaml
+  - consumer.yaml

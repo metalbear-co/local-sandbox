@@ -118,8 +118,8 @@ print(n)' "$want" 2>/dev/null || echo -1)
 # ---------------------------------------------------------------------------
 # PreviewSession lifecycle
 # ---------------------------------------------------------------------------
-create_preview_session() { # create_preview_session <name> [owner-marker]
-  local name="$1" marker="${2:-}"
+create_preview_session() { # create_preview_session <name> [owner-marker] [user-id-filter-regex]
+  local name="$1" marker="${2:-}" filter="${3:-^test-user$}"
   local labels=""
   if [ -n "$marker" ]; then
     labels=$'\n  labels:\n    operator.metalbear.co/owner: '"$marker"
@@ -147,7 +147,7 @@ spec:
   queueSplitting:
     kafkaQueueFilters:
       $TOPIC:
-        user_id: "^test-user$"
+        user_id: "$filter"
 EOF
   ok "PreviewSession $name created${marker:+ (labeled for operator '$marker')}"
 }
@@ -254,14 +254,17 @@ wait_for_log_line() { # wait_for_log_line <deployment> <needle> <timeout-secs>
 # ---------------------------------------------------------------------------
 # Cleanup
 # ---------------------------------------------------------------------------
-cleanup_scenario() { # cleanup_scenario <session-name>
+cleanup_scenario() { # cleanup_scenario <session-name>...
   if [ "$KEEP" = 1 ]; then
-    warn "KEEP=1: leaving session '$1' and the scaled-down consumer in place"
+    warn "KEEP=1: leaving session(s) '$*' and the scaled-down consumer in place"
     return 0
   fi
-  say "Cleanup: deleting session and restoring $CONSUMER_DEPLOY to $ORIGINAL_REPLICAS replica(s)"
-  kubectl delete previewsession "$1" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
-  wait_for_session_gone "$1" 90 || true
+  say "Cleanup: deleting session(s) and restoring $CONSUMER_DEPLOY to $ORIGINAL_REPLICAS replica(s)"
+  local name
+  for name in "$@"; do
+    kubectl delete previewsession "$name" -n "$NAMESPACE" --ignore-not-found >/dev/null 2>&1
+    wait_for_session_gone "$name" 90 || true
+  done
   wait_for_unpatch 90 || true
   scale_consumer "$ORIGINAL_REPLICAS" || true
 }

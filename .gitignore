@@ -33,3 +33,7 @@ multi-cluster-kubeconfig.yaml# Throwaway TLS material for mTLS test scenarios
 .certs/
 # Local image staging + cross-build target for sandbox tasks
 .build/
+
+# Python worker venvs
+apps/*/.venv/
+__pycache__/

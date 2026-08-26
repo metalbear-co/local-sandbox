@@ -8,6 +8,7 @@ operator:
   redisPubsubSplitting: true
   temporalSplitting: true
   bullmqSplitting: true
+  natsSplitting: true
   mysqlBranching: true
   pgBranching: true
   mongodbBranching: true

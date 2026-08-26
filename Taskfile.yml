@@ -60,6 +60,8 @@ includes:
     taskfile: ./taskfiles/servicebus.yml
   redis-pubsub:
     taskfile: ./taskfiles/redis-pubsub.yml
+  nats:
+    taskfile: ./taskfiles/nats.yml
   temporal:
     taskfile: ./taskfiles/temporal.yml
   bullmq:
@@ -96,6 +98,8 @@ includes:
     taskfile: ./taskfiles/op.yml
   linkerd-repro:
     taskfile: ./taskfiles/linkerd-repro.yml
+  tui:
+    taskfile: ./taskfiles/tui.yml
 
 tasks:
   default:
