@@ -134,6 +134,17 @@ tasks:
       - kubectl rollout status deployment/mirrord-operator -n mirrord --timeout=120s
       - echo "reset complete — start fresh with 'task sqs:run:local'"
 
+  test:filter-shape:
+    desc: "E2E for the composable queue filter (filter with metadata/any_of/all_of) against the SQS overlay"
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} SQS_REGION={{.REGION}} SQS_QUEUE_URL={{.QUEUE_URL}} {{.ROOT_DIR}}/scripts/test-queue-filter-shape.sh
+      - |
+        echo ""
+        echo "next - compat run against a released operator:"
+        echo "  task operator:use VERSION=latest"
+        echo "  EXPECT_UNSUPPORTED=1 task sqs:test:filter-shape"
+        echo "  task operator:dev   (switch back)"
+
   clean:
     desc: Remove the SQS test env from the cluster
     cmds:
