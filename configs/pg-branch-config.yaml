@@ -2,3 +2,12 @@
 # copy, and the session leaves the app's own user/password env vars untouched.
 dbPod:
   roles: "full"
+
+# Profile used by scripts/test-pg-configmap-param.sh (case 3): the target's config file
+# is set once here, so the session's params carry only their selectors.
+profiles:
+  app-config:
+    dbPod:
+      sourceConfigMap:
+        volume: app-config
+        key: config.yml

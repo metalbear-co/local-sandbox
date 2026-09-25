@@ -8,6 +8,10 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: nats-consumer
+  # Bounds the post-session linger: a killed session can leave unconsumed
+  # messages in the main output, and without a cap the split waits on that
+  # backlog forever and leaks its tmp streams.
+  drainTimeout: 60
   clientConfigs:
     nats: nats-sandbox-config
   queues:

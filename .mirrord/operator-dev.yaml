@@ -71,11 +71,28 @@ feature:
       # operator/crates/operator-proxy/src/config.rs
       OPERATOR_GENERIC_BRANCHING: "true"
       OPERATOR_PG_BRANCHING: "true"
+      # S3 bucket branching (task s3:test). No branch pod and no init binaries,
+      # so no image concerns - the operator clones buckets itself against the
+      # LocalStack endpoint it inherits from the deployed pod's AWS env.
+      OPERATOR_S3_BRANCHING: "true"
+      # Shrink the external-resources GC poll from 60s so the cleanup phase of
+      # branching tests finishes in seconds instead of minutes.
+      OPERATOR_DYNAMIC_OWNER_CHECK_SECONDS: "10"
+      # Close sessions whose client is gone after 15s instead of the default 30s
+      # (real config knob, clamped to a 6s floor). Speeds up the cleanup phase
+      # of branching tests; harmless for dev sessions on a local cluster.
+      OPERATOR_SESSION_UNUSED_TTL_SECONDS: "15"
       OPERATOR_KAFKA_SPLITTING: "true"
+      OPERATOR_NATS_SPLITTING: "true"
+      OPERATOR_NATS_PUBSUB_SPLITTING: "true"
       # Share hosts for preview sessions (task preview:test:share). The domain doesn't
       # need to resolve: minting and the baggage-arm steal are what the sandbox verifies,
       # no mirrord-share-ingress deployment involved.
       OPERATOR_SHARE_INGRESS_SHARE_DOMAIN: "preview.sandbox.local"
+      # Hosts are minted as <key>.<domain> with no random suffix (task
+      # preview:test:stable-slugs); preview:share:verify only checks a host exists, so
+      # it passes either way.
+      OPERATOR_SHARE_INGRESS_STABLE_SLUGS: "true"
       # Branch pod config for generic branches (resources: JVM services like OpenSearch OOM
       # on the 512Mi default). This is a LOCAL file - the fs `local` pattern above makes the
       # operator read it from this repo instead of the deployed pod, so it's versioned here
@@ -94,16 +111,16 @@ feature:
       # OPERATOR_CLICKHOUSE_BRANCHING: "true"
 
       # Branch pods copy their init binaries (pg-branch-init & co.) out of
-      # OPERATOR_IMAGE. The value inherited from the deployed pod is the RELEASED
-      # image, so init binaries with unreleased flags (e.g. --target-tls) are missing
-      # there. Build and push a dev image with `task operator:image:push`
-      # (alternative without a registry push: `task redis:tls:build:init-image`
-      # builds an init-binaries-only image and loads it into minikube — set
-      # OPERATOR_IMAGE to "mirrord-branch-init:local" / pull policy "Never"):
-      # The registry image predates the pg-branch-init `--roles` flag, so branch pods
-      # use the init-binaries-only image built from local source
-      # (`task redis:tls:build:init-image`, loaded straight into minikube).
-      OPERATOR_IMAGE: "mirrord-branch-init:local"
-      OPERATOR_IMAGE_PULL_POLICY: "Never"
+      # OPERATOR_IMAGE. Left unset, the session inherits the deployed pod's value, the
+      # RELEASED image that `task operator:use` installed - already on the node, no build.
+      # That is right whenever the local branch does not touch the init binaries
+      # (crates/operator-db-branching/src/bin/*-branch-init.rs). When it does, the
+      # released binaries lack the new flags, so point branch pods at a local build:
+      # `task redis:tls:build:init-image` builds an init-binaries-only image and loads it
+      # into minikube (no registry), or `task operator:image:push` builds the full image.
+      # A local image goes stale silently: check its `docker images` date against the
+      # last commit on the init binaries before trusting it.
+      # OPERATOR_IMAGE: "mirrord-branch-init:local"
+      # OPERATOR_IMAGE_PULL_POLICY: "Never"
       # OPERATOR_IMAGE: "vrrashkov/operator:local"
       # OPERATOR_IMAGE_PULL_POLICY: "Always"

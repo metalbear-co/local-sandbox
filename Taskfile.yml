@@ -38,6 +38,8 @@ vars:
 includes:
   lint:
     taskfile: ./taskfiles/lint.yml
+  disk:
+    taskfile: ./taskfiles/disk.yml
   cluster:
     taskfile: ./taskfiles/cluster.yml
   operator:
@@ -52,6 +54,8 @@ includes:
     taskfile: ./taskfiles/kafka.yml
   kafkajs:
     taskfile: ./taskfiles/kafkajs.yml
+  confluent:
+    taskfile: ./taskfiles/confluent.yml
   rmq:
     taskfile: ./taskfiles/rmq.yml
   pubsub:
@@ -66,6 +70,8 @@ includes:
     taskfile: ./taskfiles/temporal.yml
   bullmq:
     taskfile: ./taskfiles/bullmq.yml
+  crm:
+    taskfile: ./taskfiles/crm.yml
   postgres:
     taskfile: ./taskfiles/postgres.yml
   migrations:
@@ -88,6 +94,8 @@ includes:
     taskfile: ./taskfiles/multicluster.yml
   preview:
     taskfile: ./taskfiles/preview.yml
+  istio:
+    taskfile: ./taskfiles/istio.yml
   kafka-demo:
     taskfile: ./taskfiles/kafka-demo.yml
   copytarget:
@@ -100,6 +108,10 @@ includes:
     taskfile: ./taskfiles/linkerd-repro.yml
   tui:
     taskfile: ./taskfiles/tui.yml
+  queue-apps:
+    taskfile: ./taskfiles/queue-apps.yml
+  s3:
+    taskfile: ./taskfiles/s3.yml
 
 tasks:
   default:

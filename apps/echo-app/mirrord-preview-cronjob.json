@@ -1,0 +1,15 @@
+{
+  "target": {
+    "path": "cronjob/echo-cron",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300,
+      "cronjob": {
+        "schedule": "*/1 * * * *"
+      }
+    }
+  }
+}

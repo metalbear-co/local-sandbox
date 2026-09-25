@@ -1,0 +1,38 @@
+{
+  "target": {
+    "path": "deploy/echo-app-podless",
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "network": {
+      "incoming": {
+        "mode": "off"
+      }
+    },
+    "db_branches": [
+      {
+        "id": "pg-preview-podless-{{ key }}",
+        "name": "preview_podless_db",
+        "type": "pg",
+        "version": "17",
+        "ttl_secs": 1800,
+        "creation_timeout_secs": 120,
+        "connection": {
+          "type": "env",
+          "params": {
+            "host": "DB_HOST",
+            "port": "DB_PORT",
+            "database": "DB_NAME",
+            "user": "DB_USER",
+            "password": "DB_PASSWORD"
+          }
+        },
+        "copy": { "mode": "empty" }
+      }
+    ]
+  }
+}

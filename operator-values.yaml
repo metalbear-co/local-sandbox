@@ -10,12 +10,17 @@ operator:
   bullmqSplitting: true
   natsSplitting: true
   mysqlBranching: true
+  mariadbBranching: true
   pgBranching: true
   mongodbBranching: true
   mssqlBranching: true
   spannerBranching: true
   genericBranching: true
   cockroachdbBranching: true
+  redisBranching: true
+  dynamodbBranching: true
+  clickhouseBranching: true
+  s3Branching: true
   # Generic branch pods default to a 512Mi limit - too small for JVM services like
   # OpenSearch. This admin config applies to ALL generic branch pods in this sandbox.
   genericBranchConfig:

@@ -1,0 +1,146 @@
+version: "3"
+
+# Kafka queue splitting with a librdkafka (confluent-kafka) consumer that joins
+# its group with partition.assignment.strategy=cooperative-sticky - the shape
+# of quix-streams apps. Reproduces INCONSISTENT_GROUP_PROTOCOL against the
+# operator's range,roundrobin forwarder and proves the two ways out.
+#
+#   task confluent:deploy         deploy the Kafka broker + consumer (plain client config)
+#   task confluent:strategy:on    set partition.assignment.strategy=cooperative-sticky on the client config
+#   task confluent:strategy:off   remove it again
+#   task confluent:fix:on         set mirrord.temporary_group_id on the client config
+#   task confluent:fix:off        remove it again
+#   task confluent:run:local      run the consumer locally under mirrord (starts the split)
+#   task confluent:send:match     message with header user_id=test-user -> your local session
+#   task confluent:send:nomatch   message without headers              -> cluster consumer
+#
+# End-to-end proof (spawn env, run the three cases, assert):
+#   scripts/test-confluent-cooperative.sh   (task confluent:test:cooperative)
+#
+# Shares the broker, topic and producer tasks with the kafkajs module.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
+  CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
+  MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
+  APP_DIR: '{{.ROOT_DIR}}/apps/confluent-consumer'
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/confluent'
+  MATCH_USER_ID: '{{.KAFKAJS_MATCH_USER_ID | default "test-user"}}'
+
+tasks:
+  deploy:
+    desc: Deploy the confluent test env (broker + cooperative-sticky consumer, plain client config)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t confluent-consumer:local {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} image load confluent-consumer:local
+      - |
+        if ! minikube -p {{.CLUSTER_NAME}} image ls | grep -q "apache/kafka:4.1.0"; then
+          echo "Loading apache/kafka:4.1.0 into minikube from the host daemon..."
+          minikube -p {{.CLUSTER_NAME}} image load apache/kafka:4.1.0
+        fi
+      - kubectl apply -k {{.OVERLAY}}
+      - task: :kafkajs:_wait:kafka
+      - task: :kafkajs:_wait:dns
+      - task: :kafkajs:_ensure:topic
+      # The image tag never changes, so running pods keep the old build unless
+      # they are recycled.
+      - kubectl rollout restart deployment/confluent-consumer -n {{.NAMESPACE}}
+      - task: _wait:consumer
+
+  strategy:on:
+    desc: Make the forwarder speak cooperative-sticky (partition.assignment.strategy on the client config)
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list-strategy.yaml
+      - 'echo "partition.assignment.strategy=cooperative-sticky - the forwarder can share the app group directly"'
+
+  strategy:off:
+    desc: Back to the forwarder's default range,roundrobin
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+
+  fix:on:
+    desc: Enable mirrord.temporary_group_id on the confluent client config
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list-fix.yaml
+      - 'echo "mirrord.temporary_group_id: true - new splits repoint the app to a temporary group"'
+
+  fix:off:
+    desc: Disable mirrord.temporary_group_id again
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/property-list.yaml
+
+  run:local:
+    desc: Run the confluent consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
+    interactive: true
+    dir: apps/confluent-consumer
+    cmds:
+      - test -d .venv || python3 -m venv .venv
+      - .venv/bin/pip install -q -r requirements.txt
+      - "{{.MIRRORD_BIN}} exec -f {{.OVERLAY}}/mirrord.json -- .venv/bin/python consumer.py"
+
+  send:match:
+    desc: 'Send a message matching the split filter -> local session (MESSAGE=...)'
+    cmds:
+      - task: :kafkajs:send
+        vars:
+          USER_ID: "{{.MATCH_USER_ID}}"
+          MESSAGE: '{{.MESSAGE | default "match: hello local session"}}'
+
+  send:nomatch:
+    desc: 'Send a message NOT matching the filter -> cluster consumer (MESSAGE=...)'
+    cmds:
+      - task: :kafkajs:send
+        vars:
+          USER_ID: ""
+          MESSAGE: '{{.MESSAGE | default "nomatch: hello cluster consumer"}}'
+
+  logs:
+    desc: Tail the cluster confluent consumer logs
+    cmds:
+      - kubectl logs -n {{.NAMESPACE}} -l app=confluent-consumer --tail=100 -f
+
+  status:
+    desc: Show consumer, split sessions, patched env and consumer groups
+    silent: true
+    cmds:
+      - echo "=== consumer pods ==="
+      - kubectl get pods -n {{.NAMESPACE}} -l app=confluent-consumer 2>/dev/null || echo "not deployed"
+      - echo ""
+      - echo "=== client config ==="
+      - kubectl get mirrordpropertylist confluent-kafka-connection -n {{.NAMESPACE}} -o jsonpath='{range .spec.properties[*]}{.name}={.value}{"\n"}{end}' 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== split sessions ==="
+      - kubectl get mirrordclustersplitsession -A -o wide 2>/dev/null || echo "none"
+      - echo ""
+      - echo "=== consumer groups on the broker ==="
+      - |
+        POD=$(kubectl get pod -n {{.NAMESPACE}} -l app=kafka-cluster -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        if [ -n "$POD" ]; then
+          kubectl exec -n {{.NAMESPACE}} "$POD" -- /opt/kafka/bin/kafka-consumer-groups.sh --describe --all-groups --bootstrap-server localhost:9092 2>/dev/null | grep -v "^$" | head -20
+        else
+          echo "broker not reachable"
+        fi
+
+  test:cooperative:
+    desc: Run the three cooperative-sticky cases (plain fails, strategy shares the group, temporary group works)
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-confluent-cooperative.sh"
+      - echo ""
+      - echo "Next steps:"
+      - 'echo "  task confluent:status        # client config, sessions, consumer groups"'
+      - 'echo "  task confluent:clean         # remove the test env"'
+
+  clean:
+    desc: Remove the confluent test env from the cluster
+    cmds:
+      - kubectl delete -k {{.OVERLAY}} --ignore-not-found=true
+
+  _wait:consumer:
+    internal: true
+    cmds:
+      - echo "Waiting for confluent consumer..."
+      - kubectl rollout status deployment/confluent-consumer -n {{.NAMESPACE}} --timeout=120s

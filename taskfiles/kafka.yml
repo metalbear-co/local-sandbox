@@ -9,6 +9,10 @@ version: "3"
 #   task kafka:policy:test    e2e the splitQueues mirrord policy verdicts
 #                             (needs 'task operator:crds' + 'task operator:dev'
 #                              from the queue-filter-policy branch)
+#   task kafka:vault:test     e2e splitting with topic+group injected by REAL
+#                             HashiCorp Vault (podFile sources; needs vault
+#                             installed in dev mode + 'task operator:dev' from
+#                             a branch with podFile support)
 #
 # The split filter lives in k8s/overlays/kafka/mirrord.json
 # (Kafka header `user_id` matching test-user on topic test-topic). Messages are
@@ -171,6 +175,13 @@ tasks:
       - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-queue-filter-policy.sh
       - echo ""
       - echo "Policy removed again - 'task kafka:run:local' works unrestricted now."
+
+  vault:test:
+    desc: "E2E kafka splitting with topic+group injected by real HashiCorp Vault (podFile sources). DEPLOY=1 redeploys the kafka overlay, VAULT_SETUP=1 reconfigures vault auth, KEEP=1 leaves the session up."
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-kafka-vault-split.sh
+      - echo ""
+      - echo "Rerun any time - the vault secret, consumer and split config are reused."
 
   clean:
     desc: Remove the Kafka test env from the cluster

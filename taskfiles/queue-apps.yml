@@ -1,0 +1,17 @@
+version: "3"
+
+# Local rehearsal of the staging queue-apps playground: deploys the exact
+# manifests Argo CD syncs to staging (../operator/argocd/services/queue-apps/)
+# with a locally built apps image, then smoke-tests brokers end to end.
+# See scripts/queue-apps-rehearsal.sh for the details and env overrides.
+
+tasks:
+  rehearsal:
+    desc: "Deploy + smoke-test staging queue-apps brokers one at a time on minikube (BROKER=sqs|kafka|rmq|gcp-pubsub|redis-pubsub|bullmq|temporal|azure-servicebus for non-interactive, SKIP_BUILD=1 to reuse the image)"
+    cmds:
+      - CLUSTER_NAME={{.CLUSTER_NAME}} MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/queue-apps-rehearsal.sh
+
+  clean:
+    desc: "Remove everything the rehearsal deployed (queue-apps manifests, localstack, strimzi)"
+    cmds:
+      - CLUSTER_NAME={{.CLUSTER_NAME}} {{.ROOT_DIR}}/scripts/queue-apps-rehearsal.sh clean

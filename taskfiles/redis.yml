@@ -164,7 +164,7 @@ tasks:
           -v {{.ROOT_DIR}}/..:/w \
           -v mirrord-branch-cargo:/usr/local/cargo/registry \
           -w /w/operator rust:1-bookworm \
-          bash -c "apt-get update -qq && apt-get install -y -qq cmake perl protobuf-compiler >/dev/null && \
+          bash -c "apt-get update -qq && apt-get install -y -qq cmake perl protobuf-compiler clang libclang-dev >/dev/null && \
                    cargo build -p operator-db-branching --bins --release --target-dir /w/local-sandbox/.build/operator-target"
       - |
         STAGE={{.ROOT_DIR}}/.build/branch-init-image
@@ -253,6 +253,18 @@ tasks:
     interactive: true
     cmds:
       - "{{.ROOT_DIR}}/scripts/test-redis-tls-profile.sh"
+
+  tls:test:source:
+    desc: "E2E: copy.mode all from a TLS-only source via the redis-source-tls property list, against the DEPLOYED operator (deploy one with op:custom first; refuses to run under operator:dev)"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-redis-source-tls.sh"
+
+  tls:test:source:repro:
+    desc: "Demo: same test with EXPECT=bug - reproduces the 0600 /source-tls Permission denied on operators <= 3.202.x (deploy one with op:released VERSION=3.202.0)"
+    interactive: true
+    cmds:
+      - "EXPECT=bug {{.ROOT_DIR}}/scripts/test-redis-source-tls.sh"
 
   tls:show:error:
     desc: "Demo: misplace tls beside the profile's dbPod and show the did-you-mean error as the developer (mirrord CLI) and the admin (CR status) see it; the Failed CR stays ~5 min for kubectl inspection"

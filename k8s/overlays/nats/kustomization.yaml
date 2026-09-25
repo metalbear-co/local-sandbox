@@ -7,3 +7,6 @@ resources:
   - namespace.yaml
   - nats.yaml
   - consumer.yaml
+  - file-config.yaml
+  - file-consumer.yaml
+  - pubsub-consumer.yaml

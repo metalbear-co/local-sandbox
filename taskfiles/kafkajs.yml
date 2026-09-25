@@ -13,6 +13,14 @@ version: "3"
 # End-to-end proofs (spawn cluster + env, run the flow, assert the outcome):
 #   scripts/test-kafkajs-old.sh   released operator: silent starvation bug
 #   scripts/test-kafkajs-new.sh   local operator: loud error without the flag, working split with it
+#   scripts/test-kafkajs-slow-rollout.sh
+#                                 operator >= 3.204.0: a rollout slower than mirrord.group_join_timeout
+#                                 fails with a message naming the property, and passes once it
+#                                 is raised (task kafkajs:test:slow-rollout)
+#   scripts/test-kafkajs-patch-ignored.sh
+#                                 operator >= 3.204.0: a workload that keeps its original group
+#                                 after the patch fails with a message saying so
+#                                 (task kafkajs:test:patch-ignored)
 #
 # The broker manifest is a copy of the kafka overlay's (same names), so both
 # overlays converge on one shared broker in test-mirrord.
@@ -62,6 +70,17 @@ tasks:
     cmds:
       - kubectl apply -f {{.OVERLAY}}/property-list.yaml
       - 'echo "mirrord.temporary_group_id removed - new splits share the app group again"'
+
+  ignored-env:on:
+    desc: Point the split's groupId at an env var the app never reads (patch-ignored repro)
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/split-config-ignored-env.yaml
+      - 'echo "groupId now sourced from KAFKA_GROUP_ID_UNUSED - the app keeps kafkajs-consumer-group whatever the operator patches"'
+
+  ignored-env:off:
+    desc: Restore the split config's groupId to the env var the app reads
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/split-config.yaml
 
   run:local:
     desc: Run the KafkaJS consumer locally under mirrord (starts queue splitting; Ctrl-C to stop)
@@ -130,6 +149,26 @@ tasks:
         else
           echo "broker not reachable"
         fi
+
+  test:slow-rollout:
+    desc: Prove mirrord.group_join_timeout lets a temporary-group split outlast a slow rollout (operator >= 3.204.0)
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-kafkajs-slow-rollout.sh"
+      - echo ""
+      - echo "Next steps:"
+      - 'echo "  task kafkajs:status          # sessions, patches, consumer groups"'
+      - 'echo "  task kafkajs:clean           # remove the test env"'
+
+  test:patch-ignored:
+    desc: Prove a workload that ignores the patched group env var fails with a message saying so (operator >= 3.204.0)
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-kafkajs-patch-ignored.sh"
+      - echo ""
+      - echo "Next steps:"
+      - 'echo "  task kafkajs:status          # sessions, patches, consumer groups"'
+      - 'echo "  task kafkajs:clean           # remove the test env"'
 
   clean:
     desc: Remove the KafkaJS test env from the cluster

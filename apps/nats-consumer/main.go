@@ -17,11 +17,13 @@ import (
 	"github.com/nats-io/nats.go/jetstream"
 )
 
-// Subject space the sandbox stream captures. Only used when this app has to
-// create the stream itself; a stream that already exists (including the
-// operator-made mirrord-tmp-* streams a split session points us at) is left
-// untouched.
-const streamSubjects = "orders.>"
+// Subject space the sandbox stream captures, overridable with NATS_SUBJECTS
+// so a second sandbox stream (the config-file scenario's) does not overlap
+// this one - JetStream rejects two streams capturing the same subjects. Only
+// used when this app has to create the stream itself; a stream that already
+// exists (including the operator-made mirrord-tmp-* streams a split session
+// points us at) is left untouched.
+var streamSubjects = getEnv("NATS_SUBJECTS", "orders.>")
 
 var messageCount atomic.Int64
 
@@ -31,9 +33,23 @@ func main() {
 	consumerName := getEnv("NATS_CONSUMER", "orders-app")
 	appName := getEnv("APP_NAME", "nats-consumer")
 
+	// The config-file mode of real apps: names come from a mounted YAML file
+	// instead of env vars. Under mirrord the read goes through the operator's
+	// file-content override, so a split session sees its temporary names here.
+	namesSource := "env"
+	if cfgPath := os.Getenv("NATS_CONFIG_FILE"); cfgPath != "" {
+		fileStream, fileConsumer, err := readNamesFromFile(cfgPath)
+		if err != nil {
+			log.Fatalf("Failed to read NATS_CONFIG_FILE %s: %v", cfgPath, err)
+		}
+		streamName, consumerName = fileStream, fileConsumer
+		namesSource = cfgPath
+	}
+
 	log.Println("NATS consumer starting...")
 	log.Printf("  App:      %s", appName)
 	log.Printf("  URL:      %s", url)
+	log.Printf("  Names:    from %s", namesSource)
 	log.Printf("  Stream:   %s", streamName)
 	log.Printf("  Consumer: %s", consumerName)
 
@@ -53,6 +69,14 @@ func main() {
 		log.Fatalf("Failed to connect to NATS at %s: %v", url, err)
 	}
 	defer nc.Close()
+
+	// Core pub/sub mode: NATS_SUBJECT switches the app from JetStream to a
+	// plain subject subscription (the shape NATS pub/sub splitting rewrites).
+	if subject := os.Getenv("NATS_SUBJECT"); subject != "" {
+		log.Printf("  Subject:  %s (core pub/sub mode)", subject)
+		consumePubsub(ctx, nc, subject)
+		return
+	}
 
 	js, err := jetstream.New(nc)
 	if err != nil {
@@ -85,6 +109,32 @@ func main() {
 		}
 		if err := batch.Error(); err != nil && ctx.Err() == nil {
 			log.Printf("Batch error: %v", err)
+		}
+	}
+}
+
+// consumePubsub subscribes to a plain (non-JetStream) subject and logs each
+// message in the same format as the JetStream loop, so the test scripts grep
+// both modes identically.
+func consumePubsub(ctx context.Context, nc *nats.Conn, subject string) {
+	messages := make(chan *nats.Msg, 64)
+	sub, err := nc.ChanSubscribe(subject, messages)
+	if err != nil {
+		log.Fatalf("Failed to subscribe to %s: %v", subject, err)
+	}
+	defer func() {
+		_ = sub.Unsubscribe()
+	}()
+
+	log.Println("Listening for messages...")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-messages:
+			count := messageCount.Add(1)
+			log.Printf("received: %s (subject=%s headers={%s}) [#%d]",
+				string(msg.Data), msg.Subject, formatHeaders(msg.Header), count)
 		}
 	}
 }
@@ -162,4 +212,26 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// Parses the two `stream:` / `consumer:` lines out of the mounted YAML file.
+// Deliberately not a YAML parser: the sandbox file is flat, and hand-matching
+// keeps the app dependency-free.
+func readNamesFromFile(path string) (string, string, error) {
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", err
+	}
+	var stream, consumer string
+	for _, line := range strings.Split(string(content), "\n") {
+		if value, found := strings.CutPrefix(strings.TrimSpace(line), "stream:"); found {
+			stream = strings.TrimSpace(value)
+		} else if value, found := strings.CutPrefix(strings.TrimSpace(line), "consumer:"); found {
+			consumer = strings.TrimSpace(value)
+		}
+	}
+	if stream == "" || consumer == "" {
+		return "", "", fmt.Errorf("missing stream/consumer in %s: %q", path, string(content))
+	}
+	return stream, consumer, nil
 }

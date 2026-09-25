@@ -1,0 +1,42 @@
+version: "3"
+
+# Istio service mesh for testing mirrord against injected workloads.
+#
+#   task istio:install     install istiod (helm, minimal - no gateways) into istio-system
+#   task istio:status      show istiod health and which namespaces have injection enabled
+#   task istio:uninstall   remove istio and the istio-system namespace
+#
+# Only sidecar injection + mTLS are needed for the preview tests, so the plain
+# base + istiod charts suffice; there is no ingress gateway.
+
+vars:
+  ISTIO_VERSION: '{{.ISTIO_VERSION | default "1.24.3"}}'
+
+tasks:
+  install:
+    desc: Install istiod via helm (idempotent; ~1-2 min for images on first run)
+    cmds:
+      - helm repo add istio https://istio-release.storage.googleapis.com/charts
+      - helm repo update istio
+      - helm upgrade --install istio-base istio/base -n istio-system --create-namespace --version {{.ISTIO_VERSION}}
+      - helm upgrade --install istiod istio/istiod -n istio-system --version {{.ISTIO_VERSION}} --wait --timeout 5m
+      - |
+        echo
+        echo "istiod is up. Label a namespace with istio-injection=enabled to inject sidecars."
+        echo "Preview test: task preview:test:istio EXPECT=broken (pre-fix operator)"
+
+  status:
+    desc: Show istiod health and injection-enabled namespaces
+    silent: true
+    cmds:
+      - kubectl get deploy istiod -n istio-system 2>/dev/null || echo "istiod not installed - run 'task istio:install'"
+      - echo
+      - echo "namespaces with injection enabled:"
+      - kubectl get ns -l istio-injection=enabled -o name 2>/dev/null || true
+
+  uninstall:
+    desc: Remove istio (charts + namespace)
+    cmds:
+      - helm uninstall istiod -n istio-system || true
+      - helm uninstall istio-base -n istio-system || true
+      - kubectl delete ns istio-system --ignore-not-found=true

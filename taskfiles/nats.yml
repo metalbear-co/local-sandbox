@@ -6,6 +6,7 @@ version: "3"
 #   task nats:run:local      run the consumer locally under mirrord (starts the split)
 #   task nats:send:match     message with header tenant=acme  -> your local session
 #   task nats:send:nomatch   message with header tenant=other -> cluster consumer
+#   task nats:test           interactive gum-guided check (deploys if missing, runs all scenarios)
 #   task nats:test:split     scripted non-interactive e2e (scripts/test-nats-split.sh)
 #
 # The split filter lives in k8s/overlays/nats/mirrord.json (message header
@@ -42,13 +43,17 @@ tasks:
     desc: Deploy the NATS test env (NATS + nats-box + consumer)
     cmds:
       - "{{.CONTAINER_RUNTIME}} build -t nats-consumer:local {{.APP_DIR}}"
-      - minikube -p {{.CLUSTER_NAME}} image load nats-consumer:local
+      # --overwrite replaces a stale cached tag in the node; a tag still used by a
+      # running pod resists replacement, so restart the consumers after a rebuild.
+      - minikube -p {{.CLUSTER_NAME}} image load nats-consumer:local --overwrite=true
       - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl apply -k {{.OVERLAY}}
       - task: _wait:nats
       - task: _wait:consumer
       - kubectl apply -f {{.OVERLAY}}/property-list.yaml
       - kubectl apply -f {{.OVERLAY}}/split-config.yaml
+      - kubectl apply -f {{.OVERLAY}}/file-split-config.yaml
+      - kubectl apply -f {{.OVERLAY}}/pubsub-split-config.yaml
       - |
         echo ""
         echo "NATS test env is up. Next:"
@@ -167,6 +172,16 @@ tasks:
           kubectl exec -n {{.NATS_NAMESPACE}} "$POD" -- nats --server nats://nats:4222 consumer ls ORDERS 2>/dev/null || echo "stream ORDERS not found"
         fi
 
+  test:
+    desc: "Interactive gum-guided check: preflight with auto-deploy, then steal/jq/mirror scenarios with routing asserts"
+    interactive: true
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-nats-interactive.sh
+      - |
+        echo ""
+        echo "Non-interactive variant:  task nats:test:split"
+        echo "Prompt-free full run:     YES=1 scripts/test-nats-interactive.sh"
+
   test:split:
     desc: "Scripted e2e: deploy assumed done, header-filter split, routing + tmp stream cleanup asserts"
     cmds:
@@ -181,6 +196,8 @@ tasks:
     desc: Remove the NATS test env from the cluster
     cmds:
       - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/pubsub-split-config.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/file-split-config.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true
