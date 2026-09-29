@@ -3,6 +3,7 @@ version: "3"
 # PREVIEW environments (single-cluster).
 #
 #   task preview:deploy               build + deploy the echo-app target into the cluster
+#   task preview:test:resources       end-to-end script: previews from manifest files (--resource) and preview diff; copies, cleanup, rejections, parse errors
 #   task preview:start                start a basic preview (no mounts)
 #   task preview:mounts:start         start a preview with a config_mount + a secret_mount
 #   task preview:mounts:verify        show where each mount landed (CR ref, ConfigMap, Secret, pod)
@@ -885,3 +886,16 @@ tasks:
         echo "  - e2e: preview_idles_after_inactivity, preview_starts_idle_and_wakes_on_first_request,"
         echo "         preview_idle_sqs_wakes_on_matching_message_only"
         echo "Cleanup leftovers with: task preview:stop PREVIEW_KEY=test-idle && task preview:clean"
+
+  test:resources:
+    desc: End-to-end - previews built from manifest files (--resource) and preview diff; env var and ConfigMap changes reach the preview only, copies go with it, rejected specs create nothing (needs task operator:crds + operator:dev + CLI from the feature branch)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-resources"}}'
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} PREVIEW_KEY={{.PREVIEW_KEY}} {{.ROOT_DIR}}/scripts/test-preview-resources.sh
+      - |
+        echo
+        echo "Next:"
+        echo "  KEEP=1 task preview:test:resources   # keep the workload + last preview for inspection"
+        echo "  task preview:status                  # list preview sessions"
+        echo "  task preview:clean                   # remove leftovers"
