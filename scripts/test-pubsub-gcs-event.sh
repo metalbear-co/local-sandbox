@@ -20,6 +20,9 @@
 #        -> cluster consumer (no gcsMetadata, the jq filter is false)
 #   6. message on the same topic that is not a Cloud Storage notification
 #        -> cluster consumer
+#   7. NONE notification for an object uploaded through a V4 signed URL
+#      (XML API PUT with x-goog-meta-env in the signed headers), env=dev
+#        -> local session (metadata set by the signed upload is read the same way)
 #
 # Prerequisites:
 #   - minikube (bearkube) running, Pub/Sub env deployed (`task pubsub:deploy`)
@@ -150,12 +153,15 @@ OBJ_PAYLOAD_PROD="gcs-e2e/$RUN_ID/payload-prod.csv"
 OBJ_FETCH_DEV="gcs-e2e/$RUN_ID/fetch-dev.csv"
 OBJ_FETCH_PROD="gcs-e2e/$RUN_ID/fetch-prod.csv"
 OBJ_MISSING="gcs-e2e/$RUN_ID/missing.csv"
+OBJ_SIGNED_DEV="gcs-e2e/$RUN_ID/signed-dev.csv"
 PLAIN_TENANT="gcs-plain-$RUN_ID"
 
 for pair in "$OBJ_PAYLOAD_DEV:dev" "$OBJ_PAYLOAD_PROD:prod" "$OBJ_FETCH_DEV:dev" "$OBJ_FETCH_PROD:prod"; do
   sandbox_task pubsub:gcs:upload OBJECT="${pair%%:*}" ENV="${pair##*:}" \
     || { fail "upload of ${pair%%:*} failed - is fake-gcs-server healthy? ('kubectl logs -n $EMULATOR_NAMESPACE deploy/fake-gcs-server')"; exit 1; }
 done
+sandbox_task pubsub:gcs:upload:signed OBJECT="$OBJ_SIGNED_DEV" ENV=dev \
+  || { fail "signed-URL upload of $OBJ_SIGNED_DEV failed - fake-gcs-server serves the XML API only for Host storage.googleapis.com"; exit 1; }
 
 # ---------------------------------------------------------------------------
 # Session
@@ -238,29 +244,33 @@ expect_route() {
   fi
 }
 
-header "1/6 JSON_API_V1, env=dev -> local"
+header "1/7 JSON_API_V1, env=dev -> local"
 sandbox_task pubsub:gcs:send OBJECT="$OBJ_PAYLOAD_DEV" FORMAT=JSON_API_V1
 expect_route "1 JSON_API_V1 env=dev" "objectId=$OBJ_PAYLOAD_DEV" local
 
-header "2/6 JSON_API_V1, env=prod -> cluster"
+header "2/7 JSON_API_V1, env=prod -> cluster"
 sandbox_task pubsub:gcs:send OBJECT="$OBJ_PAYLOAD_PROD" FORMAT=JSON_API_V1
 expect_route "2 JSON_API_V1 env=prod" "objectId=$OBJ_PAYLOAD_PROD" cluster
 
-header "3/6 NONE, env=dev (metadata read from fake-gcs-server) -> local"
+header "3/7 NONE, env=dev (metadata read from fake-gcs-server) -> local"
 sandbox_task pubsub:gcs:send OBJECT="$OBJ_FETCH_DEV" FORMAT=NONE
 expect_route "3 NONE env=dev" "objectId=$OBJ_FETCH_DEV" local
 
-header "4/6 NONE, env=prod (metadata read from fake-gcs-server) -> cluster"
+header "4/7 NONE, env=prod (metadata read from fake-gcs-server) -> cluster"
 sandbox_task pubsub:gcs:send OBJECT="$OBJ_FETCH_PROD" FORMAT=NONE
 expect_route "4 NONE env=prod" "objectId=$OBJ_FETCH_PROD" cluster
 
-header "5/6 NONE, object does not exist -> cluster"
+header "5/7 NONE, object does not exist -> cluster"
 sandbox_task pubsub:gcs:send OBJECT="$OBJ_MISSING" FORMAT=NONE
 expect_route "5 NONE missing object" "objectId=$OBJ_MISSING" cluster
 
-header "6/6 not a Cloud Storage notification -> cluster"
+header "6/7 not a Cloud Storage notification -> cluster"
 sandbox_task pubsub:gcs:send:plain TENANT="$PLAIN_TENANT"
 expect_route "6 plain message" "tenant=$PLAIN_TENANT" cluster
+
+header "7/7 NONE, object uploaded through a signed URL, env=dev -> local"
+sandbox_task pubsub:gcs:send OBJECT="$OBJ_SIGNED_DEV" FORMAT=NONE
+expect_route "7 signed upload env=dev" "objectId=$OBJ_SIGNED_DEV" local
 
 # ---------------------------------------------------------------------------
 # Verdict

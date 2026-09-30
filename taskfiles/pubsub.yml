@@ -11,6 +11,7 @@ version: "3"
 #
 #   task pubsub:gcs:deploy                          fake-gcs-server + gcs-notifications queue
 #   task pubsub:gcs:upload OBJECT=a.csv ENV=dev     object with custom metadata env=dev
+#   task pubsub:gcs:upload:signed OBJECT=a.csv ENV=dev  same through a V4 signed URL PUT
 #   task pubsub:gcs:send OBJECT=a.csv [FORMAT=NONE] notification for it (JSON_API_V1 default)
 #   task pubsub:gcs:run:local                       local consumer, claims env=dev objects
 #   task pubsub:test:gcs-event                      end-to-end gum script
@@ -156,6 +157,33 @@ tasks:
               -H 'Content-Type: multipart/related; boundary=b' --data-binary @- >/dev/null
         SH
         echo "uploaded gs://{{.GCS_BUCKET}}/{{.OBJECT}} (metadata env={{.ENV}})"
+
+  gcs:upload:signed:
+    desc: 'Upload an object the signed-URL way: XML API PUT with x-goog-meta-env and V4 query params (OBJECT=... ENV=...)'
+    silent: true
+    vars:
+      OBJECT: '{{.OBJECT | default "upload.csv"}}'
+      ENV: '{{.ENV | default "dev"}}'
+    cmds:
+      # A real client gets this URL from its app server, which signs it with a service
+      # account key. fake-gcs-server does not verify the signature, so the sandbox
+      # sends the exact V4 parameters with a placeholder signature. The Host header
+      # is the one a real signed URL carries; fake-gcs-server serves the XML API only
+      # for that host.
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        OBJECT_PATH=$(jq -rn --arg object '{{.OBJECT}}' '$object | split("/") | map(@uri) | join("/")')
+        NOW=$(date -u +%Y%m%dT%H%M%SZ)
+        CREDENTIAL=$(jq -rn --arg day "${NOW%%T*}" '"uploads-signer@{{.PROJECT_ID}}.iam.gserviceaccount.com/\($day)/auto/storage/goog4_request" | @uri')
+        SIGNATURE=$(printf 'sandbox-placeholder-signature-%s' "$NOW" | od -An -tx1 | tr -d ' \n')
+        URL="{{.GCS_ENDPOINT}}/{{.GCS_BUCKET}}/$OBJECT_PATH?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=$CREDENTIAL&X-Goog-Date=$NOW&X-Goog-Expires=600&X-Goog-SignedHeaders=host%3Bx-goog-meta-env&X-Goog-Signature=$SIGNATURE"
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} "$POD" -- \
+          curl -sf -X PUT "$URL" \
+            -H 'Host: storage.googleapis.com' \
+            -H 'x-goog-meta-env: {{.ENV}}' \
+            -H 'Content-Type: text/plain' \
+            --data-binary 'uploaded by the sandbox through a signed URL' >/dev/null
+        echo "uploaded gs://{{.GCS_BUCKET}}/{{.OBJECT}} through a signed URL (x-goog-meta-env={{.ENV}})"
 
   gcs:send:
     desc: 'Publish the Cloud Storage notification for an object (OBJECT=... FORMAT=JSON_API_V1|NONE)'
