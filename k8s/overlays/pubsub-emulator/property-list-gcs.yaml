@@ -1,0 +1,16 @@
+# Client config for the gcs-notifications queue. storage_endpoint points the
+# operator's Cloud Storage reads at fake-gcs-server; without credentials_json
+# it calls it without credentials, like the Pub/Sub emulator endpoint.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: pubsub-gcs-config
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: endpoint
+    value: "http://pubsub-emulator.pubsub-emulator.svc.cluster.local:8085"
+  - name: project_id
+    value: "test-project"
+  - name: storage_endpoint
+    value: "http://fake-gcs-server.pubsub-emulator.svc.cluster.local:4443"

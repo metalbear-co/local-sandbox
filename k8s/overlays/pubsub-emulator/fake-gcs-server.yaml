@@ -1,0 +1,44 @@
+# Cloud Storage emulator for `gcs_event` queue splitting: the operator reads
+# object metadata from it for notifications with payloadFormat NONE. The
+# Pub/Sub emulator cannot receive notifications from it, so the sandbox
+# publishes notifications itself (task pubsub:gcs:send).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fake-gcs-server
+  namespace: pubsub-emulator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fake-gcs-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fake-gcs-server
+    spec:
+      containers:
+      - name: fake-gcs-server
+        image: fsouza/fake-gcs-server:1.52.2
+        args: ["-scheme", "http", "-port", "4443", "-backend", "memory"]
+        ports:
+        - containerPort: 4443
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /storage/v1/b
+            port: 4443
+          periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fake-gcs-server
+  namespace: pubsub-emulator
+spec:
+  selector:
+    app.kubernetes.io/name: fake-gcs-server
+  ports:
+  - port: 4443
+    targetPort: 4443
+    name: http

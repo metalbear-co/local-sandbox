@@ -1,0 +1,15 @@
+{
+  "target": {
+    "path": "deployment/pubsub-gcs-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "gcs-notifications": {
+        "queue_type": "GCPPubSub",
+        "jq_filter": ".gcsMetadata.env == \"dev\""
+      }
+    }
+  }
+}
