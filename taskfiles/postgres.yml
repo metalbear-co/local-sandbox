@@ -6,6 +6,7 @@ version: "3"
 #   task postgres:run:local      run the app locally under mirrord (creates a branch DB)
 #   task postgres:query:source   query the source (cluster) database
 #   task postgres:query:branch   query the branch database
+#   task postgres:test:multi-db  e2e: one branch pod holding several source databases
 #
 # Roles & credentials scenarios (dbPod.roles empty/full, source-user login):
 #   task postgres:roles:deploy, roles:full / roles:empty, run:local:roles,
@@ -498,3 +499,18 @@ tasks:
       - kubectl delete pgbranchdatabases -n {{.NAMESPACE}} --all --ignore-not-found=true 2>/dev/null || true
       - kubectl delete pod -n {{.NAMESPACE}} -l db-owner-name --ignore-not-found=true 2>/dev/null || true
       - echo "Branches cleared. Next branch uses the currently configured roles mode."
+
+  # ── Several databases in one branch (additional_databases, INT-790) ──────
+
+  test:multi-db:
+    desc: "E2E: one pg branch pod holding several source databases (needs operator:dev + init image + CLI from the feature branch)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-pg-multi-db.sh {{.CLI_ARGS}}'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-pg-multi-db.sh         keep the namespace + branches for poking"
+        echo "  scripts/test-pg-multi-db.sh two-dbs        only the one-pod, two-URLs case"
+        echo "  scripts/test-pg-multi-db.sh copy-modes     only the per-database copy mode case"
+        echo "  scripts/test-pg-multi-db.sh duplicate      only the duplicate-name refusal"
+        echo "  task operator:use VERSION=<released> && task postgres:test:multi-db   old-operator refusal (case 4)"
