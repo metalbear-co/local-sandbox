@@ -7,6 +7,15 @@ version: "3"
 #   task pubsub:send:match     message with tenant=test-user -> your local session
 #   task pubsub:send:nomatch   message with tenant=other     -> cluster consumer
 #
+# Cloud Storage notifications (`gcs_event` queueConfig, jq on .gcsMetadata):
+#
+#   task pubsub:gcs:deploy                          fake-gcs-server + gcs-notifications queue
+#   task pubsub:gcs:upload OBJECT=a.csv ENV=dev     object with custom metadata env=dev
+#   task pubsub:gcs:upload:signed OBJECT=a.csv ENV=dev  same through a V4 signed URL PUT
+#   task pubsub:gcs:send OBJECT=a.csv [FORMAT=NONE] notification for it (JSON_API_V1 default)
+#   task pubsub:gcs:run:local                       local consumer, claims env=dev objects
+#   task pubsub:test:gcs-event                      end-to-end gum script
+#
 # The split filter lives in k8s/overlays/pubsub-emulator/mirrord.json
 # (message attribute `tenant` matching ^test). Topic/subscription are created
 # in the emulator at deploy time so the consumer and split config agree.
@@ -14,7 +23,9 @@ version: "3"
 vars:
   ROOT_DIR:
     sh: git rev-parse --show-toplevel
-  NAMESPACE: '{{.NAMESPACE | default "test-mirrord"}}'
+  # Module-prefixed: other taskfiles define a global NAMESPACE and Task merges
+  # included globals, so a bare NAMESPACE can resolve to another module's value.
+  PUBSUB_NAMESPACE: '{{.PUBSUB_NAMESPACE | default "test-mirrord"}}'
   CLUSTER_NAME: '{{.CLUSTER_NAME | default "bearkube"}}'
   CONTAINER_RUNTIME: '{{.CONTAINER_RUNTIME | default "docker"}}'
   MIRRORD_BIN: '{{.MIRRORD_BIN | default "mirrord"}}'
@@ -28,6 +39,13 @@ vars:
   PROJECT_ID: '{{.PUBSUB_PROJECT_ID | default "test-project"}}'
   TOPIC: '{{.PUBSUB_TOPIC | default "test-topic"}}'
   SUBSCRIPTION: '{{.PUBSUB_SUBSCRIPTION | default "test-subscription"}}'
+  # Cloud Storage notification queue (gcs_event). fake-gcs-server lives next to
+  # the Pub/Sub emulator; the operator reaches it through storage_endpoint in
+  # property-list-gcs.yaml.
+  GCS_TOPIC: "gcs-notifications"
+  GCS_SUBSCRIPTION: "gcs-notifications-sub"
+  GCS_BUCKET: "uploads"
+  GCS_ENDPOINT: "http://fake-gcs-server.{{.EMULATOR_NAMESPACE}}.svc.cluster.local:4443"
 
 tasks:
   deploy:
@@ -35,7 +53,7 @@ tasks:
     cmds:
       - "{{.CONTAINER_RUNTIME}} build -t pubsub-consumer:local {{.APP_DIR}}"
       - minikube -p {{.CLUSTER_NAME}} image load pubsub-consumer:local
-      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      - kubectl create namespace {{.PUBSUB_NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
       - kubectl apply -f {{.OVERLAY}}/namespace.yaml
       - kubectl apply -f {{.OVERLAY}}/pubsub-emulator.yaml
       - task: _wait:emulator
@@ -99,10 +117,153 @@ tasks:
           *)     echo "sent '{{.MESSAGE}}' (tenant={{.TENANT}} -> stays in cluster)";;
         esac
 
+  gcs:deploy:
+    desc: Deploy fake-gcs-server and the gcs-notifications queue with gcs_event (run pubsub:deploy first)
+    cmds:
+      - kubectl apply -f {{.OVERLAY}}/fake-gcs-server.yaml
+      - kubectl rollout status deployment/fake-gcs-server -n {{.EMULATOR_NAMESPACE}} --timeout=180s
+      - task: _setup:topic
+        vars:
+          TOPIC: "{{.GCS_TOPIC}}"
+          SUBSCRIPTION: "{{.GCS_SUBSCRIPTION}}"
+      - task: _setup:bucket
+      - kubectl apply -f {{.OVERLAY}}/consumer-gcs.yaml
+      - kubectl rollout status deployment/pubsub-gcs-consumer -n {{.PUBSUB_NAMESPACE}} --timeout=120s
+      - kubectl apply -f {{.OVERLAY}}/property-list-gcs.yaml
+      - kubectl apply -f {{.OVERLAY}}/queue-config-gcs.yaml
+      - kubectl apply -f {{.OVERLAY}}/split-config-gcs.yaml
+      - |
+        echo
+        echo "Next:"
+        echo "  task pubsub:test:gcs-event                       # end-to-end check of gcs_event routing"
+        echo "  task pubsub:gcs:run:local                        # local consumer claiming env=dev objects"
+        echo "  task pubsub:gcs:upload OBJECT=a.csv ENV=dev && task pubsub:gcs:send OBJECT=a.csv"
+
+  gcs:upload:
+    desc: 'Upload an object with custom metadata env=ENV to fake-gcs-server (OBJECT=... ENV=...)'
+    silent: true
+    vars:
+      OBJECT: '{{.OBJECT | default "upload.csv"}}'
+      ENV: '{{.ENV | default "dev"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        RESOURCE=$(jq -nc --arg name '{{.OBJECT}}' --arg env '{{.ENV}}' '{name: $name, metadata: {env: $env}}')
+        kubectl exec -i -n {{.EMULATOR_NAMESPACE}} "$POD" -- \
+          env RESOURCE="$RESOURCE" GCS='{{.GCS_ENDPOINT}}' BUCKET='{{.GCS_BUCKET}}' sh -s <<'SH'
+        printf '%s\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n%s\r\n%s\r\nContent-Type: text/plain\r\n\r\nuploaded by the sandbox\r\n%s--\r\n' \
+          --b "$RESOURCE" --b --b \
+          | curl -sf -X POST "$GCS/upload/storage/v1/b/$BUCKET/o?uploadType=multipart" \
+              -H 'Content-Type: multipart/related; boundary=b' --data-binary @- >/dev/null
+        SH
+        echo "uploaded gs://{{.GCS_BUCKET}}/{{.OBJECT}} (metadata env={{.ENV}})"
+
+  gcs:upload:signed:
+    desc: 'Upload an object the signed-URL way: XML API PUT with x-goog-meta-env and V4 query params (OBJECT=... ENV=...)'
+    silent: true
+    vars:
+      OBJECT: '{{.OBJECT | default "upload.csv"}}'
+      ENV: '{{.ENV | default "dev"}}'
+    cmds:
+      # A real client gets this URL from its app server, which signs it with a service
+      # account key. fake-gcs-server does not verify the signature, so the sandbox
+      # sends the exact V4 parameters with a placeholder signature. The Host header
+      # is the one a real signed URL carries; fake-gcs-server serves the XML API only
+      # for that host.
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        OBJECT_PATH=$(jq -rn --arg object '{{.OBJECT}}' '$object | split("/") | map(@uri) | join("/")')
+        NOW=$(date -u +%Y%m%dT%H%M%SZ)
+        CREDENTIAL=$(jq -rn --arg day "${NOW%%T*}" '"uploads-signer@{{.PROJECT_ID}}.iam.gserviceaccount.com/\($day)/auto/storage/goog4_request" | @uri')
+        SIGNATURE=$(printf 'sandbox-placeholder-signature-%s' "$NOW" | od -An -tx1 | tr -d ' \n')
+        URL="{{.GCS_ENDPOINT}}/{{.GCS_BUCKET}}/$OBJECT_PATH?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=$CREDENTIAL&X-Goog-Date=$NOW&X-Goog-Expires=600&X-Goog-SignedHeaders=host%3Bx-goog-meta-env&X-Goog-Signature=$SIGNATURE"
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} "$POD" -- \
+          curl -sf -X PUT "$URL" \
+            -H 'Host: storage.googleapis.com' \
+            -H 'x-goog-meta-env: {{.ENV}}' \
+            -H 'Content-Type: text/plain' \
+            --data-binary 'uploaded by the sandbox through a signed URL' >/dev/null
+        echo "uploaded gs://{{.GCS_BUCKET}}/{{.OBJECT}} through a signed URL (x-goog-meta-env={{.ENV}})"
+
+  gcs:send:
+    desc: 'Publish the Cloud Storage notification for an object (OBJECT=... FORMAT=JSON_API_V1|NONE)'
+    silent: true
+    vars:
+      OBJECT: '{{.OBJECT | default "upload.csv"}}'
+      FORMAT: '{{.FORMAT | default "JSON_API_V1"}}'
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        ENCODED=$(jq -rn --arg object '{{.OBJECT}}' '$object | @uri')
+        RESOURCE=$(kubectl exec -n {{.EMULATOR_NAMESPACE}} "$POD" -- \
+          curl -sf "{{.GCS_ENDPOINT}}/storage/v1/b/{{.GCS_BUCKET}}/o/$ENCODED" 2>/dev/null || true)
+        GENERATION=$(printf '%s' "$RESOURCE" | jq -r '.generation // "1"' 2>/dev/null || echo 1)
+        DATA=""
+        if [ "{{.FORMAT}}" = "JSON_API_V1" ]; then
+          if [ -z "$RESOURCE" ]; then
+            echo "gs://{{.GCS_BUCKET}}/{{.OBJECT}} not found - upload it first (task pubsub:gcs:upload) or use FORMAT=NONE"
+            exit 1
+          fi
+          DATA=$(printf '%s' "$RESOURCE" | base64 | tr -d '\n')
+        fi
+        BODY=$(jq -nc \
+          --arg data "$DATA" --arg bucket '{{.GCS_BUCKET}}' --arg object '{{.OBJECT}}' \
+          --arg generation "$GENERATION" --arg format '{{.FORMAT}}' '
+          {messages: [(
+            {attributes: {
+              bucketId: $bucket, objectId: $object, objectGeneration: $generation,
+              eventType: "OBJECT_FINALIZE", eventTime: (now | todate), payloadFormat: $format,
+              notificationConfig: ("projects/_/buckets/" + $bucket + "/notificationConfigs/1")
+            }}
+            + (if $data == "" then {} else {data: $data} end)
+          )]}')
+        kubectl exec -n {{.EMULATOR_NAMESPACE}} "$POD" -- \
+          curl -sf -X POST "http://localhost:8085/v1/projects/{{.PROJECT_ID}}/topics/{{.GCS_TOPIC}}:publish" \
+            -H "Content-Type: application/json" -d "$BODY" >/dev/null
+        echo "sent {{.FORMAT}} notification for gs://{{.GCS_BUCKET}}/{{.OBJECT}} (generation $GENERATION)"
+
+  gcs:send:plain:
+    desc: 'Publish a message that is not a Cloud Storage notification to the gcs-notifications topic (TENANT=...)'
+    cmds:
+      - task: send
+        vars:
+          TOPIC: "{{.GCS_TOPIC}}"
+          TENANT: '{{.TENANT | default "plain"}}'
+          TYPE: "basic"
+          MESSAGE: "not a Cloud Storage notification"
+
+  gcs:run:local:
+    desc: Run the consumer locally against pubsub-gcs-consumer, claiming notifications for objects with env=dev (Ctrl-C to stop)
+    interactive: true
+    dir: apps/pubsub-consumer
+    cmds:
+      - go build -o /tmp/pubsub-consumer main.go
+      - "{{.MIRRORD_BIN}} exec -f {{.OVERLAY}}/mirrord-gcs-event.json -- /tmp/pubsub-consumer"
+
+  test:gcs-event:
+    desc: End-to-end - gcs_event routes Cloud Storage notifications by object metadata (JSON_API_V1 payload and NONE fetched from fake-gcs-server); needs pubsub:deploy + operator:dev from the feature branch
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.PUBSUB_NAMESPACE}} {{.ROOT_DIR}}/scripts/test-pubsub-gcs-event.sh
+      - |
+        echo
+        echo "Next:"
+        echo "  task pubsub:gcs:run:local                        # try it by hand with the local consumer"
+        echo "  task pubsub:gcs:upload OBJECT=a.csv ENV=dev && task pubsub:gcs:send OBJECT=a.csv FORMAT=NONE"
+        echo "  task pubsub:gcs:clean                            # remove the gcs_event queue + fake-gcs-server"
+
+  gcs:clean:
+    desc: Remove fake-gcs-server and the gcs-notifications queue
+    cmds:
+      - kubectl delete -f {{.OVERLAY}}/split-config-gcs.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/queue-config-gcs.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/property-list-gcs.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/consumer-gcs.yaml --ignore-not-found=true 2>/dev/null || true
+      - kubectl delete -f {{.OVERLAY}}/fake-gcs-server.yaml --ignore-not-found=true 2>/dev/null || true
+
   logs:
     desc: Tail the cluster consumer logs
     cmds:
-      - kubectl logs -n {{.NAMESPACE}} -l app=pubsub-consumer --tail=100 -f
+      - kubectl logs -n {{.PUBSUB_NAMESPACE}} -l app=pubsub-consumer --tail=100 -f
 
   logs:emulator:
     desc: Tail the Pub/Sub emulator logs
@@ -114,13 +275,13 @@ tasks:
     silent: true
     cmds:
       - echo "=== consumer ==="
-      - kubectl get pods -n {{.NAMESPACE}} -l app=pubsub-consumer 2>/dev/null || echo "not deployed"
+      - kubectl get pods -n {{.PUBSUB_NAMESPACE}} -l app=pubsub-consumer 2>/dev/null || echo "not deployed"
       - echo ""
       - echo "=== emulator ==="
       - kubectl get pods -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator 2>/dev/null || echo "not deployed"
       - echo ""
       - echo "=== split config ==="
-      - kubectl get mirrordsplitconfigs -n {{.NAMESPACE}} 2>/dev/null || echo "none"
+      - kubectl get mirrordsplitconfigs -n {{.PUBSUB_NAMESPACE}} 2>/dev/null || echo "none"
       - echo ""
       - echo "=== split sessions ==="
       - kubectl get mirrordclustersplitsession -A 2>/dev/null || echo "none"
@@ -135,6 +296,7 @@ tasks:
     desc: Remove the Pub/Sub test env from the cluster
     cmds:
       - kubectl delete mirrordclustersplitsessions --all -A 2>/dev/null || true
+      - task: gcs:clean
       - kubectl delete -f {{.OVERLAY}}/split-config.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/property-list.yaml --ignore-not-found=true 2>/dev/null || true
       - kubectl delete -f {{.OVERLAY}}/consumer.yaml --ignore-not-found=true 2>/dev/null || true
@@ -159,6 +321,26 @@ tasks:
         echo ""
         echo "Topic and subscription created."
 
+  _setup:bucket:
+    internal: true
+    cmds:
+      - |
+        POD=$(kubectl get pod -n {{.EMULATOR_NAMESPACE}} -l app.kubernetes.io/name=pubsub-emulator -o jsonpath='{.items[0].metadata.name}')
+        echo "Creating bucket {{.GCS_BUCKET}} in fake-gcs-server..."
+        # fake-gcs-server can refuse connections for a moment after its rollout
+        # reports ready, so retry; 409 means the bucket already exists.
+        for attempt in $(seq 1 15); do
+          CODE=$(kubectl exec -n {{.EMULATOR_NAMESPACE}} "$POD" -- \
+            curl -s -o /dev/null -w '%{http_code}' -X POST "{{.GCS_ENDPOINT}}/storage/v1/b" \
+              -H "Content-Type: application/json" -d '{"name": "{{.GCS_BUCKET}}"}') || CODE=000
+          case "$CODE" in
+            200|409) echo "Bucket ready."; exit 0;;
+          esac
+          sleep 2
+        done
+        echo "Could not create bucket {{.GCS_BUCKET}} (last HTTP status $CODE) - check 'kubectl logs -n {{.EMULATOR_NAMESPACE}} deploy/fake-gcs-server'" >&2
+        exit 1
+
   _wait:emulator:
     internal: true
     cmds:
@@ -172,4 +354,4 @@ tasks:
     internal: true
     cmds:
       - echo "Waiting for Pub/Sub consumer..."
-      - kubectl wait --for=condition=ready pod -l app=pubsub-consumer -n {{.NAMESPACE}} --timeout=120s
+      - kubectl wait --for=condition=ready pod -l app=pubsub-consumer -n {{.PUBSUB_NAMESPACE}} --timeout=120s

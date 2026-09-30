@@ -1,0 +1,11 @@
+# queueConfig for the gcs-notifications queue: read each message as a Cloud
+# Storage notification and expose the object's metadata to jq as gcsMetadata.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: pubsub-gcs-event-queue-config
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: gcs_event
+    value: "true"
