@@ -169,6 +169,11 @@ tasks:
           export MIRRORD_KUBE_CONTEXT="{{.CLUSTER}}"
           echo "kube context:   {{.CLUSTER}}"
         fi
+        # The debug operator-service overflows tokio's default 2 MiB worker stack on the
+        # db-branching session path (resolve_branches -> Api<BranchDatabase>::get), since
+        # unoptimized futures keep far larger frames than release builds. Tokio sizes its
+        # workers from RUST_MIN_STACK when the runtime sets no stack size.
+        export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
         MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f "$CONFIG" -- \
           ./target/debug/operator-service
 

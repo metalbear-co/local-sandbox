@@ -499,8 +499,9 @@ if should_run duplicate; then
       check "the CLI refuses a duplicate additional database" 1
     else
       check "the CLI refuses a duplicate additional database" 0
+      # The CLI wraps error text at 80 columns, so the phrase can span lines.
       check "the error names the duplicate" \
-        "$(grep -q '`analytics` more than once' "$WORKDIR/duplicate.log" && echo 0 || echo 1)"
+        "$(tr -s '[:space:]' ' ' <"$WORKDIR/duplicate.log" | grep -q '`analytics` more than once' && echo 0 || echo 1)"
     fi
     check "no branch CR was created for id $id" \
       "$([ -z "$(branch_refs_by_id "$id")" ] && echo 0 || echo 1)"
