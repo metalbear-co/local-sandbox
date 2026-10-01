@@ -1,0 +1,21 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: pubsub-gcs-split-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: pubsub-gcs-consumer
+  clientConfigs:
+    googlePubSub: pubsub-gcs-config
+  queues:
+  - id: gcs-notifications
+    kind: googlePubSub
+    queueConfig: pubsub-gcs-event-queue-config
+    appConfig:
+      subscription:
+      - env: PUBSUB_SUBSCRIPTION
+      projectId:
+      - env: PUBSUB_PROJECT_ID

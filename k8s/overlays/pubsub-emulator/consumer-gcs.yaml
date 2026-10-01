@@ -1,0 +1,29 @@
+# Consumer of the Cloud Storage notification subscription (gcs-notifications-sub).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pubsub-gcs-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: pubsub-gcs-consumer
+  template:
+    metadata:
+      labels:
+        app: pubsub-gcs-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: pubsub-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: APP_NAME
+          value: "pubsub-gcs-consumer"
+        - name: PUBSUB_PROJECT_ID
+          value: "test-project"
+        - name: PUBSUB_SUBSCRIPTION
+          value: "gcs-notifications-sub"
+        - name: PUBSUB_EMULATOR_HOST
+          value: "pubsub-emulator.pubsub-emulator.svc.cluster.local:8085"
