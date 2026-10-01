@@ -68,7 +68,13 @@ tasks:
         #    is set.
         cargo xtask build-layer --platform macos-aarch64 {{.RELEASE_FLAG}}
 
-        LAYER="$PWD/target/aarch64-apple-darwin/{{.MODE}}/libmirrord_layer.dylib"
+        # mirrord's xtask builds the host architecture without `--target` since 2026-09-29, so
+        # the artifacts land in target/{{.MODE}}/; older checkouts put them under
+        # target/aarch64-apple-darwin/{{.MODE}}/. Take whichever layer this build just wrote.
+        LAYER=$(ls -t "$PWD/target/{{.MODE}}/libmirrord_layer.dylib" \
+          "$PWD/target/aarch64-apple-darwin/{{.MODE}}/libmirrord_layer.dylib" 2>/dev/null | head -1)
+        [ -n "$LAYER" ] || { echo "build-layer produced no libmirrord_layer.dylib" >&2; exit 1; }
+        OUT_DIR=$(dirname "$LAYER")
         # Re-sign ad-hoc like scripts/build_layer_mac.sh does (cheap, avoids any
         # invalid-signature injection surprises after incremental rebuilds).
         codesign -f -s - "$LAYER"
@@ -84,6 +90,6 @@ tasks:
           cargo xtask build-cli --platform macos-aarch64 {{.RELEASE_FLAG}} $UI_FLAG
 
         echo ""
-        echo "Built: {{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"
+        echo "Built: $OUT_DIR/mirrord"
         echo "Use it with sandbox tasks:"
-        echo "  task generic:run:local MIRRORD_BIN={{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"
+        echo "  task generic:run:local MIRRORD_BIN=$OUT_DIR/mirrord"
