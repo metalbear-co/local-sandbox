@@ -893,6 +893,15 @@ tasks:
         echo "Next: task preview:test:share    (random-or-stable minting + baggage routing on a custom filter)"
         echo "      task preview:status"
 
+  test:share-not-found:
+    desc: End-to-end script - share-ingress not-found page (INT-783) - chart renders/refuses per shareIngress.notFound.redirect, the real share-ingress binary serves the redirect page or a plain 404 for an unknown host (needs the operator checkout on the INT-783 branch + PreviewSession CRD)
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-share-ingress-not-found.sh'
+      - |
+        echo
+        echo "Next: task preview:test:share          (share host minting + baggage routing)"
+        echo "      task preview:test:stable-slugs   (stable <key>.<domain> hosts)"
+
   idle:start:
     desc: Start a preview that scales to zero after 30s without traffic (wake it with preview:idle:wake)
     vars:
