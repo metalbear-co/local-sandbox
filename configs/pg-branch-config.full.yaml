@@ -2,3 +2,10 @@
 # copy, and the session leaves the app's own user/password env vars untouched.
 dbPod:
   roles: "full"
+  # Admin pod metadata, carried by the branch database pod and its migration/copy Job pods
+  # (task op:test:pod-annotations). The Karpenter annotation is the customer case; harmless
+  # on minikube.
+  labels:
+    sandbox.mirrord.metalbear.co/admin-pod-metadata: "db-branch"
+  annotations:
+    karpenter.sh/do-not-disrupt: "true"

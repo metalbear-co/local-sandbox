@@ -270,6 +270,21 @@ tasks:
         kubectl --context "$FIRST" get deploy mirrord-operator -n mirrord \
           -o jsonpath='  {.spec.template.spec.containers[0].image}{"\n"}' 2>/dev/null || echo "  (operator not found yet)"
 
+  test:pod-annotations:
+    desc: "E2E: admin labels/annotations land on DB branch pods, their migration Job pods, and preview pods (INT-815 Karpenter case); needs migrations:deploy + preview:deploy + operator:dev"
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      # MIRRORD_BIN is left to the script: it prefers the local debug build and falls back
+      # to PATH, and an exported MIRRORD_BIN still wins.
+      - NAMESPACE={{.NAMESPACE | default "test-mirrord"}} {{.ROOT_DIR}}/scripts/test-pod-annotations.sh
+      - |
+        echo ""
+        echo "Next:"
+        echo "  task migrations:status             branch CRDs + migration jobs left behind, if any"
+        echo "  task preview:status                preview sessions"
+        echo "  kubectl get pods -n test-mirrord -l sandbox.mirrord.metalbear.co/admin-pod-metadata -o yaml | grep -B2 do-not-disrupt"
+
   _followup:
     internal: true
     silent: true

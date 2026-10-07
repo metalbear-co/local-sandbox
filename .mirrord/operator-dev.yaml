@@ -107,6 +107,9 @@ feature:
       # PostgreSQL branch pod config for the roles demo. Swapped between the empty and
       # full variants by task postgres:roles:full / postgres:roles:empty (hot-reloaded).
       OPERATOR_PG_BRANCH_CONFIG: "../local-sandbox/configs/pg-branch-config.yaml"
+      # Preview pod config (labels/annotations on every preview pod). Read ONCE at operator
+      # start, unlike the branch configs above, so edits need an operator:dev restart.
+      OPERATOR_PREVIEW_CONFIG: "../local-sandbox/configs/preview-config.yaml"
       # # OPERATOR_DYNAMODB_BRANCHING: "true"
       # OPERATOR_CLICKHOUSE_BRANCHING: "true"
 
