@@ -512,6 +512,18 @@ tasks:
         echo "  scripts/test-pg-configmap-param.sh resolve   only the happy-path case"
         echo "  scripts/test-pg-configmap-param.sh miss      only the selector-miss case"
 
+  test:split-config:
+    desc: "E2E: db_branches \"*\" / ids resolve from the target's MirrordSplitConfig dbBranches and are shared per key (INT-796/INT-801); needs migrations:deploy + operator:dev from INT-796 + a CLI from INT-801"
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-split-config-db-branches.sh
+      - |
+        echo ""
+        echo "Next:"
+        echo "  task postgres:branches             branch CRDs left behind, if any"
+        echo "  kubectl get mirrordsplitconfigs -n {{.NAMESPACE}}"
+
   test:reuse:
     desc: "E2E: a session joining an existing branch says so - sequential reuse + concurrent start (needs postgres:deploy)"
     cmds:
