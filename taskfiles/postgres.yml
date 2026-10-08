@@ -524,6 +524,16 @@ tasks:
         echo "  task postgres:branches             branch CRDs left behind, if any"
         echo "  kubectl get mirrordsplitconfigs -n {{.NAMESPACE}}"
 
+  test:pod-recovery:
+    desc: "E2E: a branch survives its pod being deleted - new pod on the same volumes, same Service IP, row kept (needs postgres:deploy)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-branch-pod-recovery.sh'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-branch-pod-recovery.sh       keep the branch for poking"
+        echo "  task postgres:query:branch QUERY='SELECT * FROM survivors'   read the row on the new pod"
+
   test:reuse:
     desc: "E2E: a session joining an existing branch says so - sequential reuse + concurrent start (needs postgres:deploy)"
     cmds:
