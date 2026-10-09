@@ -186,11 +186,29 @@ tasks:
       # pod's /tmp (fs mode `read`). The real operator image writes it there
       # at startup; the busybox anchor does not, so write it ourselves from
       # the same kube-system ConfigMap the operator would fetch it from.
+      #
+      # Target the sleeper pod by name, not `deploy/`: right after the patch the
+      # deployment still has the old image's pod for a moment and `kubectl exec
+      # deploy/` may pick it, leaving the sleeper without the file and the local
+      # operator failing with "unable to open certificate". So wait for the
+      # rollout to settle, pick the one Running busybox pod and verify the write.
       - |
-        kubectl {{.KCTX}} get configmap -n kube-system extension-apiserver-authentication \
-          -o jsonpath='{.data.requestheader-client-ca-file}' \
-          | kubectl {{.KCTX}} exec -i -n mirrord deploy/mirrord-operator -- \
-              sh -c 'cat > /tmp/requestheader-client-ca-file.crt'
+        kubectl {{.KCTX}} rollout status deployment/mirrord-operator -n mirrord --timeout=120s >/dev/null || true
+        CA=$(kubectl {{.KCTX}} get configmap -n kube-system extension-apiserver-authentication \
+          -o jsonpath='{.data.requestheader-client-ca-file}')
+        for attempt in $(seq 1 12); do
+          POD=$(kubectl {{.KCTX}} get pods -n mirrord -l app.kubernetes.io/name=mirrord-operator \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[?(@.spec.containers[0].image=="busybox")]}{.metadata.name}{"\n"}{end}' | head -1)
+          if [ -n "$POD" ] && printf '%s' "$CA" | kubectl {{.KCTX}} exec -i -n mirrord "$POD" -- \
+               sh -c 'cat > /tmp/requestheader-client-ca-file.crt' \
+             && kubectl {{.KCTX}} exec -n mirrord "$POD" -- test -s /tmp/requestheader-client-ca-file.crt; then
+            echo "client CA written into $POD"
+            break
+          fi
+          [ "$attempt" = 12 ] && { echo "could not write the client CA into the sleeper pod"; exit 1; }
+          sleep 5
+        done
       # cd in the shell rather than task-level `dir:` — dir templates resolve
       # before dynamic vars like ROOT_DIR, which mangles the path.
       #
