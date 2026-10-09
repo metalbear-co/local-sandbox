@@ -58,8 +58,10 @@ start_one() {
     info "$ctx: dev operator starting (pid $(cat "$pidf")), waiting for it"
   else
     : > "$log"
-    # Own process group, so `stop` can take down task + mirrord + operator-service together.
-    perl -e 'setpgrp(0, 0); exec @ARGV' -- task -d "$SANDBOX_DIR" "$(task_for "$ctx")" < /dev/null >> "$log" 2>&1 &
+    # Own session and process group (pgid = pid), so `stop` can take down task + mirrord +
+    # operator-service together, and a hangup or timeout of the shell that started them
+    # (a backgrounded command, a closed terminal) never reaches them.
+    nohup perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' -- task -d "$SANDBOX_DIR" "$(task_for "$ctx")" < /dev/null >> "$log" 2>&1 &
     echo $! > "$pidf"
     info "$ctx: started $(task_for "$ctx") (pid $!) -> $log"
   fi
