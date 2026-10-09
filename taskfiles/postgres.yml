@@ -498,3 +498,62 @@ tasks:
       - kubectl delete pgbranchdatabases -n {{.NAMESPACE}} --all --ignore-not-found=true 2>/dev/null || true
       - kubectl delete pod -n {{.NAMESPACE}} -l db-owner-name --ignore-not-found=true 2>/dev/null || true
       - echo "Branches cleared. Next branch uses the currently configured roles mode."
+
+  # ── ConfigMap connection sources (values read from a mounted config file) ─
+
+  configmap:test:
+    desc: "E2E: branch connection values read from a ConfigMap-mounted config.yml (needs operator:dev + CLI with the configmap source)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-pg-configmap-param.sh'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-pg-configmap-param.sh    keep the target + branches for poking"
+        echo "  scripts/test-pg-configmap-param.sh resolve   only the happy-path case"
+        echo "  scripts/test-pg-configmap-param.sh miss      only the selector-miss case"
+
+  test:split-config:
+    desc: "E2E: db_branches \"*\" / ids resolve from the target's MirrordSplitConfig dbBranches and are shared per key (INT-796/INT-801); needs migrations:deploy + operator:dev from INT-796 + a CLI from INT-801"
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      - NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-split-config-db-branches.sh
+      - |
+        echo ""
+        echo "Next:"
+        echo "  task postgres:branches             branch CRDs left behind, if any"
+        echo "  kubectl get mirrordsplitconfigs -n {{.NAMESPACE}}"
+
+  test:pod-recovery:
+    desc: "E2E: a branch survives its pod being deleted - new pod on the same volumes, same Service IP, row kept (needs postgres:deploy)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-branch-pod-recovery.sh'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-branch-pod-recovery.sh       keep the branch for poking"
+        echo "  task postgres:query:branch QUERY='SELECT * FROM survivors'   read the row on the new pod"
+
+  test:reuse:
+    desc: "E2E: a session joining an existing branch says so - sequential reuse + concurrent start (needs postgres:deploy)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-db-branch-reuse.sh'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-db-branch-reuse.sh            keep the branches for poking"
+        echo "  scripts/test-db-branch-reuse.sh sequential        only the second-session-joins case"
+        echo "  scripts/test-db-branch-reuse.sh concurrent        only the two-start-at-once case"
+
+  # ── AWS Secrets Manager connection sources (LocalStack, no real AWS) ─────
+
+  asm:test:
+    desc: "E2E: branch connection values fetched from AWS Secrets Manager via LocalStack (needs operator:dev with the ASM support)"
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-asm-pg-branch.sh'
+      - |
+        echo ""
+        echo "Variants:"
+        echo "  KEEP=1 scripts/test-asm-pg-branch.sh   keep LocalStack + branches for poking"
+        echo "  scripts/test-asm-pg-branch.sh param    only the params-mode case"
+        echo "  scripts/test-asm-pg-branch.sh url      only the URL-mode case"

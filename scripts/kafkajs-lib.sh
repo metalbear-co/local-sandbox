@@ -1,7 +1,8 @@
 #!/bin/bash
 #
-# Shared helpers for the KafkaJS split proof scripts
-# (test-kafkajs-old.sh / test-kafkajs-new.sh).
+# Shared helpers for the Kafka split proof scripts (test-kafkajs-*.sh,
+# test-confluent-*.sh). Defaults drive the kafkajs module; a script for another
+# module sets MODULE / APP_LABEL / LOCAL_* before sourcing this file.
 
 set -euo pipefail
 
@@ -9,8 +10,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SANDBOX_DIR="$(dirname "$SCRIPT_DIR")"
 NAMESPACE="test-mirrord"
 MIRRORD_BIN="${MIRRORD_BIN:-mirrord}"
-MIRRORD_CONFIG="$SANDBOX_DIR/k8s/overlays/kafkajs/mirrord.json"
-LOCAL_LOG="/tmp/kafkajs-local-consumer.log"
+# Taskfile namespace (task <MODULE>:deploy, :fix:on, :send:match, ...) and the
+# consumer Deployment's `app` label.
+MODULE="${MODULE:-kafkajs}"
+APP_LABEL="${APP_LABEL:-kafkajs-consumer}"
+MIRRORD_CONFIG="${MIRRORD_CONFIG:-$SANDBOX_DIR/k8s/overlays/$MODULE/mirrord.json}"
+# Where and how the consumer runs locally under mirrord.
+LOCAL_APP_DIR="${LOCAL_APP_DIR:-$SANDBOX_DIR/apps/$APP_LABEL}"
+LOCAL_PREPARE="${LOCAL_PREPARE:-test -d node_modules || npm install --omit=dev}"
+LOCAL_CMD="${LOCAL_CMD:-node consumer.js}"
+LOCAL_LOG="/tmp/$MODULE-local-consumer.log"
 LOCAL_PID=""
 
 HAVE_GUM=0
@@ -66,15 +75,15 @@ wait_for_operator_api() {
 }
 
 deploy_env() {
-    say "Deploying the KafkaJS test env (broker + consumer)"
-    (cd "$SANDBOX_DIR" && task kafkajs:deploy)
+    say "Deploying the $MODULE test env (broker + consumer)"
+    (cd "$SANDBOX_DIR" && task "$MODULE:deploy")
 }
 
-fix_on()  { (cd "$SANDBOX_DIR" && task kafkajs:fix:on); }
-fix_off() { (cd "$SANDBOX_DIR" && task kafkajs:fix:off); }
+fix_on()  { (cd "$SANDBOX_DIR" && task "$MODULE:fix:on"); }
+fix_off() { (cd "$SANDBOX_DIR" && task "$MODULE:fix:off"); }
 
-send_match()   { (cd "$SANDBOX_DIR" && task kafkajs:send:match MESSAGE="$1"); }
-send_nomatch() { (cd "$SANDBOX_DIR" && task kafkajs:send:nomatch MESSAGE="$1"); }
+send_match()   { (cd "$SANDBOX_DIR" && task "$MODULE:send:match" MESSAGE="$1"); }
+send_nomatch() { (cd "$SANDBOX_DIR" && task "$MODULE:send:nomatch" MESSAGE="$1"); }
 
 require_mirrord() {
     if command -v "$MIRRORD_BIN" >/dev/null 2>&1; then
@@ -108,16 +117,27 @@ local_consumer_alive() {
 
 start_local_consumer() {
     require_mirrord
-    say "Starting the local KafkaJS consumer under mirrord (log: $LOCAL_LOG)"
-    (cd "$SANDBOX_DIR/apps/kafkajs-consumer" && { test -d node_modules || npm install --omit=dev; })
+    say "Starting the local $APP_LABEL under mirrord (log: $LOCAL_LOG)"
+    (cd "$LOCAL_APP_DIR" && eval "$LOCAL_PREPARE")
     : > "$LOCAL_LOG"
     (
-        cd "$SANDBOX_DIR/apps/kafkajs-consumer" &&
-        exec "$MIRRORD_BIN" exec -f "$MIRRORD_CONFIG" -- node consumer.js
+        cd "$LOCAL_APP_DIR" &&
+        eval "exec \"\$MIRRORD_BIN\" exec -f \"\$MIRRORD_CONFIG\" -- $LOCAL_CMD"
     ) > "$LOCAL_LOG" 2>&1 &
     LOCAL_PID=$!
+    # mirrord SIGKILLs the app when the session dies; disowning keeps bash from
+    # printing a "Killed: 9" job notice in the middle of the case output.
+    disown "$LOCAL_PID" 2>/dev/null || true
     sleep 3
     if ! local_consumer_alive; then
+        # A case that expects the session to be refused at start (the operator
+        # rejects the split before the CLI gets going) sets LOCAL_MAY_FAIL_FAST;
+        # the caller then reads the error from the log. Anything else dying
+        # this early is a broken setup.
+        if [ "${LOCAL_MAY_FAIL_FAST:-0}" = 1 ]; then
+            info "local mirrord run exited right away; the case reads its error from the log"
+            return 0
+        fi
         bad "the local mirrord run died right after starting:"
         tail -15 "$LOCAL_LOG" || true
         exit 1
@@ -128,9 +148,36 @@ start_local_consumer() {
 stop_local_consumer() {
     if [ -n "$LOCAL_PID" ] && kill -0 "$LOCAL_PID" 2>/dev/null; then
         kill "$LOCAL_PID" 2>/dev/null || true
-        wait "$LOCAL_PID" 2>/dev/null || true
+        # Disowned, so `wait` cannot reap it; poll instead.
+        local waited=0
+        while kill -0 "$LOCAL_PID" 2>/dev/null && [ "$waited" -lt 15 ]; do
+            sleep 1
+            waited=$((waited + 1))
+        done
     fi
     LOCAL_PID=""
+}
+
+# Prints the human-readable error out of collected error text: the `error`
+# field of an operator JSON log line, or the lines around `needle` otherwise.
+show_error_excerpt() {
+    local text="$1" needle="$2"
+    echo ""
+    echo "--- the error, as the user sees it ---"
+    if echo "$text" | grep -q '^{"timestamp"'; then
+        echo "$text" | grep '^{"timestamp"' | grep -F "$needle" | tail -1 | python3 -c '
+import json, sys, textwrap
+for line in sys.stdin:
+    try:
+        error = json.loads(line).get("fields", {}).get("error", "")
+    except Exception:
+        continue
+    print(textwrap.fill(error, 100))
+'
+    else
+        echo "$text" | grep -B1 -A8 -F "$needle" | head -14
+    fi
+    echo "--------------------------------------"
 }
 
 sessions_json() {
@@ -185,6 +232,33 @@ wait_for_session_settled() {
     return 1
 }
 
+# Waits for a session that is expected to fail AFTER going Ready (the operator
+# reports Ready before its forwarder joined the group). Prints the error text
+# found on the session, in the local log, or in the operator log since
+# `since` (the CLI exits on the failure and the session is cleaned up, so the
+# operator log is often the only place the cause survives). Fails on timeout.
+wait_for_session_failure() {
+    local timeout="${1:-180}" since="$2" waited=0 error
+    while [ "$waited" -lt "$timeout" ]; do
+        error=$(session_error_message)
+        if [ -n "$error" ]; then
+            echo "$error"
+            return 0
+        fi
+        if ! local_consumer_alive; then
+            error=$(operator_logs_since "$since" | grep -F "Split runtime error" | tail -1)
+            if [ -z "$error" ]; then
+                error=$(cat "$LOCAL_LOG" 2>/dev/null)
+            fi
+            echo "$error"
+            return 0
+        fi
+        sleep 3
+        waited=$((waited + 3))
+    done
+    return 1
+}
+
 wait_for_sessions_gone() {
     local timeout="${1:-120}" waited=0
     while [ "$waited" -lt "$timeout" ]; do
@@ -209,12 +283,21 @@ wait_for_local_message() {
 }
 
 cluster_consumer_logs() {
-    kubectl logs -n "$NAMESPACE" -l app=kafkajs-consumer --tail=200 2>/dev/null || true
+    kubectl logs -n "$NAMESPACE" -l "app=$APP_LABEL" --tail=200 2>/dev/null || true
 }
 
 operator_logs() {
     kubectl logs -n mirrord -l app=mirrord-operator --tail=500 2>/dev/null || true
 }
+
+# Operator log lines written since an RFC3339 UTC timestamp (see now_utc).
+# With a label selector kubectl silently keeps only the last 10 lines per pod
+# unless told otherwise, hence --tail=-1.
+operator_logs_since() {
+    kubectl logs -n mirrord -l app=mirrord-operator --since-time="$1" --tail=-1 2>/dev/null || true
+}
+
+now_utc() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
 # The env value the workload patch sets for KAFKA_GROUP_ID, empty when unpatched.
 patched_group_value() {
@@ -234,7 +317,7 @@ for item in doc.get("items", []):
 
 cleanup_env() {
     stop_local_consumer
-    (cd "$SANDBOX_DIR" && task kafkajs:clean) || true
+    (cd "$SANDBOX_DIR" && task "$MODULE:clean") || true
 }
 
 # Dumps everything needed to debug an inconclusive run. The test env is left
@@ -253,5 +336,5 @@ print_diagnostics() {
     echo "--- cluster consumer log (tail) ---"
     cluster_consumer_logs | tail -20 || true
     echo ""
-    info "the env is left deployed for inspection; clean with: task kafkajs:clean"
+    info "the env is left deployed for inspection; clean with: task $MODULE:clean"
 }

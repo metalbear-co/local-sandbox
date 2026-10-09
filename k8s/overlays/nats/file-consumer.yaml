@@ -1,0 +1,52 @@
+# Consumer for the config-file scenario: identical app, but the stream and
+# consumer names come from the mounted /config/nats.yaml instead of env vars.
+# Its stream uses the filecfg.> subject space so it cannot overlap ORDERS.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-file-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats-file-consumer
+  template:
+    metadata:
+      labels:
+        app: nats-file-consumer
+    spec:
+      initContainers:
+      - name: wait-for-nats
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for NATS to be ready..."
+          until nc -z nats.nats-sandbox.svc.cluster.local 4222 2>/dev/null; do
+            echo "NATS not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "NATS is ready!"
+      containers:
+      - name: consumer
+        image: nats-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: NATS_URL
+          value: "nats://nats.nats-sandbox.svc.cluster.local:4222"
+        - name: NATS_CONFIG_FILE
+          value: "/config/nats.yaml"
+        - name: NATS_SUBJECTS
+          value: "filecfg.>"
+        - name: APP_NAME
+          value: "nats-file-consumer"
+        volumeMounts:
+        - name: app-config
+          mountPath: /config
+          readOnly: true
+      volumes:
+      - name: app-config
+        configMap:
+          name: nats-file-config

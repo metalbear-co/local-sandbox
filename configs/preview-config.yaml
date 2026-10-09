@@ -1,0 +1,11 @@
+# Preview pod config for operator:dev (OPERATOR_PREVIEW_CONFIG in .mirrord/operator-dev.yaml),
+# the file the chart renders from `operator.preview` into the mirrord-configmap. Unlike the
+# branch configs it is read once at operator start, so a change needs an operator:dev restart.
+#
+# Admin pod metadata, carried by every preview pod on top of the target template's own
+# (task op:test:pod-annotations). The Karpenter annotation is the customer case; harmless on
+# minikube.
+labels:
+  sandbox.mirrord.metalbear.co/admin-pod-metadata: "preview"
+annotations:
+  karpenter.sh/do-not-disrupt: "true"

@@ -24,7 +24,13 @@ vars:
 
 tasks:
   certs:
-    desc: Generate CA, node, and root client certs with cockroach's own tooling
+    desc: Generate CA, node, and root client certs with cockroach's own tooling (skipped while the full set exists; delete .certs to regenerate)
+    # `create-ca --overwrite` still refuses an existing ca.key (key reuse is disabled), so a
+    # rerun of any task depending on this one died here; existing certs are reused instead.
+    status:
+      - test -f {{.CERTS_DIR}}/ca.key
+      - test -f {{.CERTS_DIR}}/node.key
+      - test -f {{.CERTS_DIR}}/client.root.key
     cmds:
       - mkdir -p {{.CERTS_DIR}}
       - docker run --rm -v {{.CERTS_DIR}}:/certs --entrypoint cockroach {{.CRDB_IMAGE}} cert create-ca --certs-dir=/certs --ca-key=/certs/ca.key --overwrite
@@ -60,6 +66,23 @@ tasks:
     cmds:
       - kubectl -n {{.NAMESPACE}} get pods -l db-owner-name
       - kubectl -n {{.NAMESPACE}} logs -l db-owner-name -c cockroachdb-branch-init --tail=20
+
+  portforward:test:
+    desc: "INT-275 regression - value_pattern connection params must appear in db-branches connections and reach the branch (gum UI). Pass MIRRORD_BIN for a fixed build; deploy first."
+    deps: [deploy]
+    cmds:
+      - NAMESPACE={{.NAMESPACE}} MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/crdb-pattern-portforward-e2e.sh
+
+  policy:portforward:test:
+    desc: "INT-732 - a MirrordClusterPolicy excluding DATABASE_URL: flag off hides the var and lists no portforward, allowMirrordOverrides on delivers the rewrite and the portforward (gum UI). Needs operator:dev from a branch with the flag + task operator:crds."
+    deps: [deploy]
+    cmds:
+      - NAMESPACE={{.NAMESPACE}} MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/crdb-policy-portforward-e2e.sh
+
+  multi:portforward:test:
+    desc: "Multi-branch repro: cockroach (value_pattern DATABASE_URL) + redis in one session; both must show in db-branches connections. Self-contained (deploys its own sources). Pass MIRRORD_BIN for a specific build."
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/crdb-redis-multi-portforward-e2e.sh
 
   clean:
     desc: Tear down the namespace and generated certs

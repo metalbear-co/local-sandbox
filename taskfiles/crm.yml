@@ -1,0 +1,40 @@
+version: "3"
+
+# crm-server (operator repo, services/crm-server) Postgres-backed tests, built
+# around the stale-connection fix for GET /api/v1/ci/sessions. Thin wrappers
+# over scripts/crm-db-tests.sh, which starts the throwaway Postgres container
+# itself and streams cargo test output.
+#
+#   task crm                        interactive menu (gum)
+#   task crm:db-tests               run the sql_models::ci suite (incl. #[ignore]d DB tests)
+#   task crm:db-tests:before-after  reproduce the 500 on the pre-fix commit, then verify the fix
+#   task crm:pg:up / crm:pg:down    manage the Postgres container only
+
+vars:
+  SCRIPT: "{{.ROOT_DIR}}/scripts/crm-db-tests.sh"
+
+tasks:
+  default:
+    desc: "Interactive menu for the crm-server DB tests"
+    cmds:
+      - "{{.SCRIPT}}"
+
+  db-tests:
+    desc: "Run crm-server's Postgres-backed CI storage tests (starts Postgres if needed)"
+    cmds:
+      - "{{.SCRIPT}} after"
+
+  db-tests:before-after:
+    desc: "Run the regression tests on the pre-fix commit (worktree), then on the current tree"
+    cmds:
+      - "{{.SCRIPT}} before-after"
+
+  pg:up:
+    desc: "Start (or create) the throwaway Postgres container the crm-server tests use"
+    cmds:
+      - "{{.SCRIPT}} db"
+
+  pg:down:
+    desc: "Remove the throwaway Postgres container"
+    cmds:
+      - "{{.SCRIPT}} clean"

@@ -8,6 +8,7 @@ version: "3"
 #   task preview:mounts:start         start a preview with a config_mount + a secret_mount
 #   task preview:mounts:verify        show where each mount landed (CR ref, ConfigMap, Secret, pod)
 #   task preview:test:mounts          end-to-end: mounts:start then mounts:verify
+#   task preview:test:cm-override     end-to-end: versioned-CM directory-mount target; repro the broken overlay + prove the env-override workaround
 #   task preview:pattern:deploy       deploy a target that reads one combined DATABASE_URL (Teladoc shape)
 #   task preview:pattern:start        start a preview with a value_pattern DB branch on that target
 #   task preview:pattern:verify       show the whole chain: runtime value -> env-overrides Secret -> secretKeyRef -> preview pod env
@@ -16,8 +17,20 @@ version: "3"
 #   task preview:pattern:mixed:start  start a preview mixing pattern params (2 vars, 2 formats) with plain-variable params
 #   task preview:pattern:mixed:verify trace both pattern vars (Secret) and the plain-var overrides (literal env) side by side
 #   task preview:test:pattern:mixed   end-to-end: mixed:start then mixed:verify
+#   task preview:podless:deploy       deploy a ZERO-pod target with plain DB_* connection vars
+#   task preview:podless:start        start a db-branch preview against the zero-pod target (incoming off)
+#   task preview:podless:verify       assert Ready, target still at 0, branch env on the preview pod
+#   task preview:test:podless         end-to-end script: branch-only, start_idle + split_queues, and the two must-fail agent cases
+#   task preview:cronjob:deploy       deploy a SUSPENDED source CronJob (echo-cron) whose pod prints its env and exits
+#   task preview:cronjob:start        start a preview of that CronJob (schedule override */1, triggered once on start)
+#   task preview:cronjob:verify       show the preview CronJob, its trigger job, scheduled jobs, and the trigger pod's logs
+#   task preview:test:cronjob         end-to-end script: inherit, override, stop cleanup, invalid schedule, idle rejected, trigger_on_start off
+#   task preview:test:service-isolation   end-to-end: prove preview pods stay out of the target Service's dataplane even when readiness is ignored (EXPECT=broken asserts the pre-fix leak instead)
+#   task preview:test:label           end-to-end script: one label-target preview takes X-Preview traffic from two workloads sharing the label; stop hands it back; no-match selector fails
+#   task preview:test:istio           end-to-end: preview delivery on an Istio-injected target under STRICT mTLS (EXPECT=broken asserts the pre-fix failure; needs istio:install)
 #   task preview:share:verify         check share-host minting + that the baggage header steals to the preview
 #   task preview:test:share           end-to-end: start a CUSTOM-filter preview, then share:verify
+#   task preview:test:stable-slugs    end-to-end script: stable share hosts (<key>.<domain>), one live session per host, host reuse after stop
 #   task preview:idle:start           start a preview that auto-idles after 30s without traffic
 #   task preview:idle:start-idle      start a preview with ZERO pods from creation (start_idle)
 #   task preview:idle:watch           live phase + replicas view of an idle-capable preview
@@ -195,6 +208,11 @@ tasks:
         echo
         echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
 
+  test:cm-override:
+    desc: End-to-end - repro config_mount over a directory-mounted ConfigMap failing, then verify the env-override workaround (Cashfree shape)
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-preview-configmap-override.sh
+
   pattern:deploy:
     desc: Deploy a target that reads one combined DATABASE_URL (pattern overrides are its only branch option)
     cmds:
@@ -351,6 +369,245 @@ tasks:
     cmds:
       - kubectl delete deploy/echo-app-pattern svc/echo-app-pattern -n {{.NAMESPACE}} --ignore-not-found=true
 
+  podless:deploy:
+    desc: Deploy a ZERO-pod target with plain DB_* connection vars (db branching without a live source pod)
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t echo-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi echo-app:latest --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load echo-app:latest
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # the postgres base provides the postgres-test source the DB_* vars point at
+      - kubectl apply -k {{.ROOT_DIR}}/k8s/postgres
+      # replicas: 0 IS the scenario: the branch controller resolves the source connection
+      # from the deployment's pod template, and the preview injects the branch overrides
+      # into the PREVIEW pod - no source pod ever runs. The params are separate plain
+      # variables on purpose: a value_pattern param reads the runtime value through an
+      # agent, which needs a live pod (see preview:test:podless:pattern).
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: echo-app-podless
+          labels:
+            app: echo-app-podless
+        spec:
+          replicas: 0
+          selector:
+            matchLabels:
+              app: echo-app-podless
+          template:
+            metadata:
+              labels:
+                app: echo-app-podless
+            spec:
+              containers:
+              - name: echo
+                image: echo-app:latest
+                imagePullPolicy: Never
+                ports:
+                - containerPort: 8080
+                env:
+                - name: CLUSTER_ID
+                  value: "bearkube"
+                - name: PORT
+                  value: "8080"
+                - name: DB_HOST
+                  value: "postgres-test"
+                - name: DB_PORT
+                  value: "5432"
+                - name: DB_NAME
+                  value: "source_db"
+                - name: DB_USER
+                  value: "postgres"
+                - name: DB_PASSWORD
+                  value: "postgres"
+        EOF
+      - |
+        echo
+        echo "Target is up with ZERO pods:"
+        kubectl get deploy echo-app-podless -n {{.NAMESPACE}}
+
+  podless:start:
+    desc: Start a preview with a pg db branch against the zero-pod target (incoming off)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-podless"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        # If operator:dev is running on this machine, label the session with its isolation
+        # marker so the LOCAL operator reconciles it - unlabeled sessions go to the deployed
+        # operator, which may not have your changes. An explicit marker always wins.
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-podless.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+
+  podless:verify:
+    desc: Assert the session is Ready, the target still has zero pods, and the preview pod got the branch env
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-podless"}}'
+    cmds:
+      - |
+        set -euo pipefail
+
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} \
+          -o jsonpath='{.items[?(@.spec.key=="{{.PREVIEW_KEY}}")].metadata.name}' | awk '{print $1}')
+        if [ -z "$SESSION" ]; then
+          echo "FAIL: no preview session found for key '{{.PREVIEW_KEY}}' - run 'task preview:podless:start' first"
+          exit 1
+        fi
+        PHASE=$(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')
+        echo "preview session: $SESSION ($PHASE)"
+        if [ "$PHASE" != "Ready" ]; then
+          echo "FAIL: expected phase Ready, got '$PHASE'"
+          kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.failureMessage}{"\n"}'
+          exit 1
+        fi
+        echo
+
+        echo "==> 1. the TARGET never ran a pod (this used to fail with 'no Pod is ready to be a session target'):"
+        REPLICAS=$(kubectl get deploy echo-app-podless -n {{.NAMESPACE}} -o jsonpath='{.spec.replicas}')
+        READY=$(kubectl get deploy echo-app-podless -n {{.NAMESPACE}} -o jsonpath='{.status.readyReplicas}')
+        echo "  spec.replicas=$REPLICAS status.readyReplicas=${READY:-0}"
+        if [ "$REPLICAS" != "0" ] || [ -n "${READY:-}" ]; then
+          echo "FAIL: the target was scaled up - this run proves nothing about podless targets"
+          exit 1
+        fi
+        echo
+
+        echo "==> 2. the branch database provisioned from the pod TEMPLATE (no agent involved):"
+        BRANCH=$(kubectl get branchdatabases -n {{.NAMESPACE}} \
+          -o jsonpath='{range .items[?(@.spec.id=="pg-preview-podless-{{.PREVIEW_KEY}}")]}{.metadata.name}{end}')
+        if [ -z "$BRANCH" ]; then
+          echo "FAIL: no branchdatabase with spec.id=pg-preview-podless-{{.PREVIEW_KEY}}"
+          exit 1
+        fi
+        kubectl get branchdatabase "$BRANCH" -n {{.NAMESPACE}} \
+          -o jsonpath='  {.metadata.name}: {.status.phase}{"\n"}'
+        echo
+
+        echo "==> 3. the PREVIEW pod's runtime env points at the branch, not the source:"
+        DB_HOST=$(kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- sh -c 'echo $DB_HOST')
+        DB_PORT=$(kubectl exec -n {{.NAMESPACE}} deploy/"$SESSION" -- sh -c 'echo $DB_PORT')
+        echo "  DB_HOST=$DB_HOST DB_PORT=$DB_PORT"
+        if [ -z "$DB_HOST" ] || [ "$DB_HOST" = "postgres-test" ]; then
+          echo "FAIL: DB_HOST still points at the source database - the branch override was not injected"
+          exit 1
+        fi
+
+        echo
+        echo "PASS: db branching worked without a single target pod."
+
+  test:podless:
+    desc: End-to-end - db branching without a live source pod (branch-only, start_idle + split_queues, and the two must-fail agent cases)
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-preview-db-branch-podless.sh
+
+  cronjob:deploy:
+    desc: Deploy a suspended source CronJob (echo-cron) for CronJob preview testing
+    cmds:
+      - "{{.CONTAINER_RUNTIME}} build -t echo-app:latest {{.APP_DIR}}"
+      - minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi echo-app:latest --force" || true
+      - minikube -p {{.CLUSTER_NAME}} image load echo-app:latest
+      - kubectl create namespace {{.NAMESPACE}} --dry-run=client -o yaml | kubectl apply -f -
+      # `suspend: true` is deliberate: the preview copy must run regardless, and a suspended
+      # source never races the assertions with runs of its own. The pod runs to completion,
+      # printing the env the preview would rewrite.
+      - |
+        kubectl apply -n {{.NAMESPACE}} -f - <<'EOF'
+        apiVersion: batch/v1
+        kind: CronJob
+        metadata:
+          name: echo-cron
+          labels:
+            app: echo-cron
+        spec:
+          schedule: "0 3 * * *"
+          suspend: true
+          concurrencyPolicy: Forbid
+          successfulJobsHistoryLimit: 3
+          jobTemplate:
+            spec:
+              backoffLimit: 0
+              template:
+                metadata:
+                  labels:
+                    app: echo-cron
+                spec:
+                  restartPolicy: Never
+                  containers:
+                  - name: echo
+                    image: echo-app:latest
+                    imagePullPolicy: Never
+                    command: ["sh", "-c", "echo \"scan run on $(hostname) CLUSTER_ID=$CLUSTER_ID\""]
+                    env:
+                    - name: CLUSTER_ID
+                      value: "bearkube"
+        EOF
+      - echo "Next - task preview:cronjob:start   |   task preview:test:cronjob"
+
+  cronjob:start:
+    desc: Start a preview of the echo-cron CronJob (schedule override */1 * * * *, triggered once on start)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-cronjob"}}'
+      PREVIEW_IMAGE: '{{.PREVIEW_IMAGE | default "echo-app:latest"}}'
+      PREVIEW_TIMEOUT: '{{.PREVIEW_TIMEOUT | default "300"}}'
+    cmds:
+      - |
+        if [ -z "${OPERATOR_ISOLATION_MARKER:-}" ] && pgrep -qf 'target/debug/operator-service'; then
+          export OPERATOR_ISOLATION_MARKER=local-dev
+          echo "operator:dev detected -> OPERATOR_ISOLATION_MARKER=local-dev"
+        fi
+        {{.MIRRORD_BIN}} preview start \
+          -f {{.APP_DIR}}/mirrord-preview-cronjob.json \
+          -i "{{.PREVIEW_IMAGE}}" \
+          -k "{{.PREVIEW_KEY}}" \
+          --timeout {{.PREVIEW_TIMEOUT}}
+      - echo "Next - task preview:cronjob:verify   |   task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  cronjob:verify:
+    desc: Show the preview CronJob, its trigger job, scheduled jobs, and the trigger pod's logs
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-cronjob"}}'
+    cmds:
+      - |
+        SESSION=$(kubectl get previewsessions -n {{.NAMESPACE}} -o json | python3 -c '
+        import json, sys
+        for item in json.load(sys.stdin).get("items", []):
+            if item["spec"].get("key") == sys.argv[1]:
+                print(item["metadata"]["name"]); break
+        ' "{{.PREVIEW_KEY}}")
+        [ -n "$SESSION" ] || { echo "no session with key {{.PREVIEW_KEY}}"; exit 1; }
+        echo "== session $SESSION: phase $(kubectl get previewsession "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.status.phase}')"
+        echo "== preview CronJob (schedule / suspend / image)"
+        kubectl get cronjob "$SESSION" -n {{.NAMESPACE}} -o jsonpath='{.spec.schedule}  suspend={.spec.suspend}  image={.spec.jobTemplate.spec.template.spec.containers[0].image}'; echo
+        echo "== jobs of the preview (the -start one is the immediate trigger)"
+        kubectl get jobs -n {{.NAMESPACE}} | grep -E "^(NAME|$SESSION)"
+        echo "== trigger pod logs"
+        kubectl logs -n {{.NAMESPACE}} -l "job-name=$SESSION-start" --tail=5 2>/dev/null || echo "(no trigger pod yet)"
+
+  test:cronjob:
+    desc: End-to-end - CronJob previews (inherit, override + scheduled run, stop cleanup, invalid schedule, idle rejected, trigger_on_start off)
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-preview-cronjob.sh
+
+  cronjob:clean:
+    desc: Remove the echo-cron source CronJob
+    cmds:
+      - kubectl delete cronjob/echo-cron -n {{.NAMESPACE}} --ignore-not-found=true
+
+  podless:clean:
+    desc: Remove the podless-demo target
+    cmds:
+      - kubectl delete deploy/echo-app-podless -n {{.NAMESPACE}} --ignore-not-found=true
+
   pattern:mixed:deploy:
     desc: Deploy a target with two pattern-shaped vars (combined URL + libpq keyword string) and plain user/password vars
     cmds:
@@ -503,6 +760,33 @@ tasks:
     cmds:
       - kubectl delete deploy/echo-app-pattern-mixed svc/echo-app-pattern-mixed -n {{.NAMESPACE}} --ignore-not-found=true
 
+  test:service-isolation:
+    desc: End-to-end - preview pods must not join the target Service's dataplane even when readiness is ignored (GKE NEG shape); EXPECT=broken asserts the pre-fix leak instead
+    vars:
+      EXPECT: '{{.EXPECT | default "fixed"}}'
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} EXPECT={{.EXPECT}} PREVIEW_KEY={{.PREVIEW_KEY}} {{.ROOT_DIR}}/scripts/test-preview-service-isolation.sh
+
+  test:label:
+    desc: End-to-end - one preview session with a label target takes X-Preview traffic from two separate workloads sharing the label (needs task operator:crds + operator:dev from the feature branch)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-label"}}'
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} PREVIEW_KEY={{.PREVIEW_KEY}} {{.ROOT_DIR}}/scripts/test-preview-label-target.sh
+      - |
+        echo
+        echo "Next:"
+        echo "  KEEP=1 task preview:test:label   # keep the workloads + preview for inspection"
+        echo "  task preview:status              # list preview sessions"
+        echo "  task preview:clean               # remove leftovers"
+
+  test:istio:
+    desc: End-to-end - preview traffic delivery on an Istio-injected target under STRICT mTLS (INT-702); EXPECT=broken asserts the pre-fix failure instead (needs task istio:install)
+    vars:
+      EXPECT: '{{.EXPECT | default "fixed"}}'
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} EXPECT={{.EXPECT}} PREVIEW_KEY={{.PREVIEW_KEY}} {{.ROOT_DIR}}/scripts/test-preview-istio-inbound.sh
+
   share:verify:
     desc: Verify share-host minting and that the injected baggage header steals to the preview, whatever the session's own filter
     vars:
@@ -600,6 +884,24 @@ tasks:
       - |
         echo
         echo "Done. Stop the preview with: task preview:stop PREVIEW_KEY={{.PREVIEW_KEY}}"
+
+  test:stable-slugs:
+    desc: End-to-end script - stable share hosts (INT-722) - host is <key>.<domain>, a second live session on the same host fails naming the holder, the host is reused once the holder is stopped (needs operator:dev with OPERATOR_SHARE_INGRESS_STABLE_SLUGS=true + the target deployed)
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-preview-stable-slugs.sh
+      - |
+        echo
+        echo "Next: task preview:test:share    (random-or-stable minting + baggage routing on a custom filter)"
+        echo "      task preview:status"
+
+  test:share-not-found:
+    desc: End-to-end script - share-ingress not-found page (INT-783) - chart renders/refuses per shareIngress.notFound.redirect, the real share-ingress binary serves the redirect page or a plain 404 for an unknown host (needs the operator checkout on the INT-783 branch + PreviewSession CRD)
+    cmds:
+      - '{{.ROOT_DIR}}/scripts/test-share-ingress-not-found.sh'
+      - |
+        echo
+        echo "Next: task preview:test:share          (share host minting + baggage routing)"
+        echo "      task preview:test:stable-slugs   (stable <key>.<domain> hosts)"
 
   idle:start:
     desc: Start a preview that scales to zero after 30s without traffic (wake it with preview:idle:wake)

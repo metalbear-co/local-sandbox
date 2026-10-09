@@ -68,10 +68,20 @@ tasks:
         #    is set.
         cargo xtask build-layer --platform macos-aarch64 {{.RELEASE_FLAG}}
 
-        LAYER="$PWD/target/aarch64-apple-darwin/{{.MODE}}/libmirrord_layer.dylib"
+        # xtask drops `--target` for the host architecture, so on an arm64 Mac the
+        # layer and CLI land in target/{{.MODE}}/ instead of target/aarch64-apple-darwin/.
+        # The workspace .cargo/config.toml [env] and .env still name the aarch64 paths,
+        # so link them to wherever cargo actually wrote the files.
+        ARCH_DIR="$PWD/target/aarch64-apple-darwin/{{.MODE}}"
+        mkdir -p "$ARCH_DIR"
+        if [ -f "$PWD/target/{{.MODE}}/libmirrord_layer.dylib" ] && [ ! -f "$ARCH_DIR/libmirrord_layer.dylib" -o -L "$ARCH_DIR/libmirrord_layer.dylib" ]; then
+          ln -sf "$PWD/target/{{.MODE}}/libmirrord_layer.dylib" "$ARCH_DIR/libmirrord_layer.dylib"
+        fi
+        LAYER="$ARCH_DIR/libmirrord_layer.dylib"
+        [ -f "$LAYER" ] || { echo "layer not found at $LAYER nor target/{{.MODE}}/"; exit 1; }
         # Re-sign ad-hoc like scripts/build_layer_mac.sh does (cheap, avoids any
         # invalid-signature injection surprises after incremental rebuilds).
-        codesign -f -s - "$LAYER"
+        codesign -f -s - "$(readlink "$LAYER" || echo "$LAYER")"
 
         # 2. Build the CLI with the fresh layer embedded. MIRRORD_LAYER_FILE must be set
         #    EXPLICITLY here: the MetalBear/.cargo/config.toml [env] section otherwise
@@ -82,6 +92,11 @@ tasks:
         [ -d packages/ui/dist ] && UI_FLAG="--no-ui"
         MIRRORD_LAYER_FILE="$LAYER" \
           cargo xtask build-cli --platform macos-aarch64 {{.RELEASE_FLAG}} $UI_FLAG
+
+        if [ -f "$PWD/target/{{.MODE}}/mirrord" ] && [ ! -f "$ARCH_DIR/mirrord" -o -L "$ARCH_DIR/mirrord" ]; then
+          ln -sf "$PWD/target/{{.MODE}}/mirrord" "$ARCH_DIR/mirrord"
+        fi
+        [ -x "$ARCH_DIR/mirrord" ] || { echo "CLI not found at $ARCH_DIR/mirrord nor target/{{.MODE}}/"; exit 1; }
 
         echo ""
         echo "Built: {{.MIRRORD_DIR}}/target/aarch64-apple-darwin/{{.MODE}}/mirrord"

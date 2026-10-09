@@ -72,6 +72,16 @@ tasks:
         minikube -p {{.CLUSTER_NAME}} ssh "{{.CONTAINER_RUNTIME}} rmi ghcr.io/metalbear-co/operator:$VERSION --force" 2>/dev/null || true
         minikube -p {{.CLUSTER_NAME}} image load ghcr.io/metalbear-co/operator:$VERSION
 
+        # `task operator:crds` applies CRDs and RBAC with plain kubectl, so they carry no Helm
+        # ownership. Once the release is gone, a fresh install refuses to adopt them ("invalid
+        # ownership metadata"). Stamp the release's ownership on them first - idempotent, and
+        # Helm takes them over on install anyway.
+        for r in $(kubectl get crd -o name | grep 'mirrord.metalbear.co' || true) \
+                 $(kubectl get clusterrole,clusterrolebinding -o name | grep -E '/mirrord-operator' || true); do
+          kubectl label "$r" app.kubernetes.io/managed-by=Helm --overwrite >/dev/null
+          kubectl annotate "$r" meta.helm.sh/release-name=mirrord-operator meta.helm.sh/release-namespace=mirrord --overwrite >/dev/null
+        done
+
         echo "Installing helm chart $VERSION..."
         helm upgrade --install mirrord-operator "$CACHE/$VERSION-chart.tgz" \
           --namespace mirrord --create-namespace \
@@ -102,7 +112,25 @@ tasks:
         if [ -n "$MC" ]; then
           echo "$MC" | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
         fi
-      - echo "CRDs from the local chart applied{{if .CLUSTER}} to {{.CLUSTER}}{{end}}."
+      # The local operator runs with the DEPLOYED operator's ServiceAccount
+      # (mirrord makes it use the target pod's token), so a branch that adds
+      # RBAC rules gets 403s until the local chart's ClusterRole is applied
+      # on top of the released one.
+      - helm template mirrord-operator {{.CHARTS_DIR}} -f {{.VALUES_FILE}} -s templates/cluster-role.yaml | kubectl {{.KCTX}} apply --server-side --force-conflicts -f -
+      - echo "CRDs and RBAC from the local chart applied{{if .CLUSTER}} to {{.CLUSTER}}{{end}}."
+
+  whitelist:
+    desc: "Create the whitelist e2e user (customer RBAC only, same as CI) and a kubeconfig for it. CLUSTER=<kube-context> targets another cluster."
+    vars:
+      CLUSTER: '{{.CLUSTER | default ""}}'
+      WHITELIST_KUBECONFIG: "{{.VERSIONS_DIR}}/whitelist-user.kubeconfig"
+    cmds:
+      - "{{.OPERATOR_DIR}}/scripts/e2e_whitelist_user.sh {{.WHITELIST_KUBECONFIG}} {{.CLUSTER}}"
+      - |
+        echo ""
+        echo "Act as a customer (mirrord CLI and tests read MIRRORD_KUBECONFIG, kubectl reads KUBECONFIG):"
+        echo "  export MIRRORD_KUBECONFIG={{.WHITELIST_KUBECONFIG}}"
+        echo "  KUBECONFIG={{.WHITELIST_KUBECONFIG}} kubectl auth whoami"
 
   dev:
     desc: "Run the local operator under mirrord (steals from the deployed operator). Applies local CRDs first. CLUSTER=<kube-context> picks the cluster and its .mirrord/operator-dev.<cluster>.yaml config if present; CONFIG=<path> overrides; SANDBOX_LICENSE=1 to trust the sandbox license issuer."
@@ -117,11 +145,32 @@ tasks:
     cmds:
       - task: crds
         vars: { CLUSTER: "{{.CLUSTER}}" }
-      # Clear stale agent pods and give the deployed operator a clean start so
-      # the steal session attaches to a fresh pod. Force-delete instead of a
-      # rolling restart: the multicluster operators run with hostNetwork, so a
-      # surge pod can never bind the node ports while the old pod is alive —
-      # `rollout restart` wedges on "1 old replicas are pending termination".
+      # The deployed pod is only an anchor for the steal session: it provides
+      # the chart env, the ServiceAccount token and the service endpoint, while
+      # the local operator does all the work. Run it as a sleeping busybox so
+      # that:
+      # - no second operator competes for the leader lease (a released
+      #   operator that wins mid-build leaves the local one serving 404s, or
+      #   stealing the lease back and forth until one shuts down with
+      #   LeadershipLost)
+      # - no /health probes need answering while the local operator boots
+      #   (stolen probes go nowhere until it binds 443, and three misses make
+      #   kubelet kill the container and the agent with it)
+      # `operator:use` restores the real image and probes.
+      - |
+        kubectl {{.KCTX}} patch deployment mirrord-operator -n mirrord --type=strategic -p '{
+          "spec":{"template":{"spec":{"containers":[{
+            "name":"mirrord-operator",
+            "image":"busybox",
+            "imagePullPolicy":"IfNotPresent",
+            "command":["sleep","infinity"],
+            "livenessProbe":null,"readinessProbe":null,"startupProbe":null
+          }]}}}}'
+      # Clear stale agent pods so the steal session attaches to a fresh pod.
+      # Force-delete instead of a rolling restart: the multicluster operators
+      # run with hostNetwork, so a surge pod can never bind the node ports
+      # while the old pod is alive — `rollout restart` wedges on "1 old
+      # replicas are pending termination".
       - kubectl {{.KCTX}} delete pods -n mirrord -l app=mirrord --force --grace-period=0 2>/dev/null || true
       - kubectl {{.KCTX}} delete pods -n mirrord -l app=mirrord-operator --force --grace-period=0 2>/dev/null || true
       - kubectl {{.KCTX}} delete pods -n mirrord -l app.kubernetes.io/name=mirrord-operator --force --grace-period=0 2>/dev/null || true
@@ -133,15 +182,45 @@ tasks:
           kubectl {{.KCTX}} get pods -n mirrord || true
           exit 1
         fi
+      # The local operator reads the front-proxy client CA from the target
+      # pod's /tmp (fs mode `read`). The real operator image writes it there
+      # at startup; the busybox anchor does not, so write it ourselves from
+      # the same kube-system ConfigMap the operator would fetch it from.
+      #
+      # Target the sleeper pod by name, not `deploy/`: right after the patch the
+      # deployment still has the old image's pod for a moment and `kubectl exec
+      # deploy/` may pick it, leaving the sleeper without the file and the local
+      # operator failing with "unable to open certificate". So wait for the
+      # rollout to settle, pick the one Running busybox pod and verify the write.
+      - |
+        kubectl {{.KCTX}} rollout status deployment/mirrord-operator -n mirrord --timeout=120s >/dev/null || true
+        CA=$(kubectl {{.KCTX}} get configmap -n kube-system extension-apiserver-authentication \
+          -o jsonpath='{.data.requestheader-client-ca-file}')
+        for attempt in $(seq 1 12); do
+          POD=$(kubectl {{.KCTX}} get pods -n mirrord -l app.kubernetes.io/name=mirrord-operator \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{range .items[?(@.spec.containers[0].image=="busybox")]}{.metadata.name}{"\n"}{end}' | head -1)
+          if [ -n "$POD" ] && printf '%s' "$CA" | kubectl {{.KCTX}} exec -i -n mirrord "$POD" -- \
+               sh -c 'cat > /tmp/requestheader-client-ca-file.crt' \
+             && kubectl {{.KCTX}} exec -n mirrord "$POD" -- test -s /tmp/requestheader-client-ca-file.crt; then
+            echo "client CA written into $POD"
+            break
+          fi
+          [ "$attempt" = 12 ] && { echo "could not write the client CA into the sleeper pod"; exit 1; }
+          sleep 5
+        done
       # cd in the shell rather than task-level `dir:` — dir templates resolve
       # before dynamic vars like ROOT_DIR, which mangles the path.
       #
       # A released cluster operator runs on a production license, which a local
-      # source build validates with its default issuer key. Only when the
-      # cluster runs the sandbox-built operator (legacy flow, self-signed
-      # license) does the local binary need the sandbox issuer key too.
+      # source build validates with its default issuer key. The sandbox issuer is
+      # additionally baked in at BUILD time (issuer trust is compile-time via
+      # option_env!, a runtime export does nothing), so the local binary also
+      # accepts the sandbox PEM license that .mirrord/operator-dev.yaml points
+      # OPERATOR_LICENSE_PATH at - needed since the deployed license.key expired.
       - |
         cd {{.OPERATOR_DIR}}
+        export OPERATOR_LICENSE_ISSUER_PUBLIC_KEY="$(cat {{.SCRIPTS_DIR}}/license-issuer.pem)"
         cargo build -p operator-service
         codesign -f -s - ./target/debug/operator-service
         rm -rf /tmp/mirrord
@@ -171,6 +250,12 @@ tasks:
         fi
         MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} exec -f "$CONFIG" -- \
           ./target/debug/operator-service
+
+  telemetry:compare:
+    desc: "Time the startup telemetry event with and without the immediate flush: runs operator:dev twice against a local sink (FLUSH_SECS=60, CASES=\"old new\")"
+    interactive: true
+    cmds:
+      - FLUSH_SECS={{.FLUSH_SECS | default "60"}} CASES="{{.CASES | default "old new"}}" {{.SCRIPTS_DIR}}/telemetry-startup-flush.sh
 
   restart:
     desc: Force-restart the operator pod (clears leader lease) and wait until ready

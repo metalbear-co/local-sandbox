@@ -24,3 +24,8 @@ spec:
           value: "test-topic"
         - name: KAFKA_GROUP_ID
           value: "kafkajs-consumer-group"
+        # Not read by the app. split-config-ignored-env.yaml points the split
+        # at it to reproduce a workload that keeps its original group after the
+        # operator patched the wrong variable.
+        - name: KAFKA_GROUP_ID_UNUSED
+          value: "kafkajs-consumer-group"

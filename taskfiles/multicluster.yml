@@ -16,6 +16,8 @@ version: "3"
 #   task multicluster:servicebus:run:local      local consumer via the PRIMARY operator
 #   task multicluster:servicebus:send:match     tenant=test-user -> your local session
 #   task multicluster:servicebus:send:nomatch   tenant=other     -> remote cluster consumer
+#   task multicluster:test:subscribe:full       idempotent setup + `mirrord subscribe` suite (INT-745)
+#   task multicluster:test:subscribe            `mirrord subscribe` sees every cluster's events (INT-745)
 #
 # The heavy lifting (apiserver cert SANs, docker network cross-connect,
 # hostNetwork/hostAliases patches, bearer-token credential secrets, the
@@ -384,12 +386,30 @@ tasks:
       - task: operator:podnetwork
 
   crds:
-    desc: Apply local-chart CRDs to BOTH clusters
+    desc: Apply local-chart CRDs and RBAC to EVERY cluster; members also get the local chart's envoy roles (what the primary needs to reach their aggregated APIs)
     cmds:
-      - task: :operator:crds
-        vars: { CLUSTER: "{{.PRIMARY}}" }
-      - task: :operator:crds
-        vars: { CLUSTER: "{{.REMOTE}}" }
+      - |
+        for CTX in {{.ALL_CTXS}}; do
+          task -d {{.ROOT_DIR}} operator:crds CLUSTER=$CTX
+        done
+      - |
+        # Members run the released chart, and the primary reaches their aggregated
+        # APIs through the `mirrord-operator-envoy-remote` role it renders. A branch
+        # that adds a verb there (`events` for `mirrord subscribe`) only takes effect
+        # once the local chart's roles are applied on top of the released ones.
+        for CTX in {{.ALL_CTXS}}; do
+          [ "$CTX" = "{{.PRIMARY}}" ] && continue
+          ROLES=$(helm template mirrord-operator {{.CHARTS_DIR}} \
+            -f {{.ROOT_DIR}}/operator-values.yaml \
+            -f {{.ROOT_DIR}}/multicluster/operator-values-remote.yaml \
+            -s templates/multi-cluster-roles.yaml 2>/dev/null || true)
+          if [ -n "$ROLES" ]; then
+            echo "$ROLES" | kubectl --context "$CTX" apply --server-side --force-conflicts -f -
+            echo "member envoy roles from the local chart applied to $CTX."
+          else
+            echo "WARN: could not render multi-cluster-roles.yaml for $CTX; the member keeps the released roles"
+          fi
+        done
 
   status:
     desc: Show operators, remote connectivity and split state on both clusters
@@ -409,6 +429,62 @@ tasks:
       - echo "=== split sessions ==="
       - 'echo "[{{.PRIMARY}}]" && kubectl --context {{.PRIMARY}} get mirrordclustersplitsession -A 2>/dev/null || echo "  none"'
       - 'echo "[{{.REMOTE}}]" && kubectl --context {{.REMOTE}} get mirrordclustersplitsession -A 2>/dev/null || echo "  none"'
+
+  subscribe:
+    desc: "Stream a session's events from EVERY cluster through the primary (KEY=<session key>; no KEY = every session)"
+    interactive: true
+    cmds:
+      - MIRRORD_KUBE_CONTEXT={{.PRIMARY}} MIRRORD_CHECK_VERSION=false {{.MIRRORD_BIN}} subscribe --pretty {{if .KEY}}-k {{.KEY}}{{end}}
+
+  prepare:
+    desc: "Bring the multicluster sandbox to a ready state WITHOUT recreating what exists (clusters, operators, fresh tokens, local-chart CRDs/roles, echo-app, branch CLI), then wait for your operator:dev on the primary. MC_NUM_CLUSTERS=2|3, VERSION=latest, OPERATOR=custom deploys your image instead"
+    interactive: true
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_CLUSTERS}} MIRRORD_BIN={{.MIRRORD_BIN}} MIRRORD_DIR={{.MIRRORD_DIR}} NAMESPACE={{.NAMESPACE}} VERSION={{.VERSION | default "latest"}} {{.ROOT_DIR}}/scripts/multicluster-prepare.sh
+
+  dev:up:
+    desc: "Start YOUR operator (../operator) on every cluster as background steals, one log per cluster under /tmp/mc-operator-dev (idempotent; prints the log paths)"
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_CLUSTERS}} {{.ROOT_DIR}}/scripts/multicluster-dev-operators.sh start
+
+  dev:status:
+    desc: "Which clusters are served by a dev operator, with pid and log path"
+    silent: true
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_CLUSTERS}} {{.ROOT_DIR}}/scripts/multicluster-dev-operators.sh status
+
+  dev:logs:
+    desc: "tail -f every dev operator log (Ctrl-C stops tailing only)"
+    interactive: true
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_CLUSTERS}} {{.ROOT_DIR}}/scripts/multicluster-dev-operators.sh logs
+
+  dev:stop:
+    desc: "Stop the background dev operators (pods stay patched to the sleeper; multicluster:operator:use restores a release)"
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_CLUSTERS}} {{.ROOT_DIR}}/scripts/multicluster-dev-operators.sh stop
+
+  test:subscribe:full:
+    desc: "ONE command for the INT-745 proof - multicluster:prepare (idempotent setup, starts your dev operators) followed by the subscribe suite"
+    interactive: true
+    cmds:
+      - task: prepare
+      - task: test:subscribe
+      - |
+        echo ""
+        echo "Dev operators keep running - logs: task multicluster:dev:logs | stop: task multicluster:dev:stop"
+
+  test:subscribe:
+    desc: "Multi-cluster `mirrord subscribe` suite - one subscription on the primary sees every cluster's events (MC_NUM_CLUSTERS=2|3, CASES=\"1 2 3\")"
+    interactive: true
+    cmds:
+      - MC_NUM_CLUSTERS={{.MC_CLUSTERS}} MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-multicluster-subscribe.sh
+      - |
+        echo ""
+        echo "Next:"
+        echo "  task multicluster:subscribe KEY=<key>       # watch one session across clusters by hand"
+        echo "  CASES=3 task multicluster:test:subscribe    # re-run one case"
+        echo "  task multicluster:http:clean                # remove echo-app from the workload clusters"
 
   logs:
     desc: Tail the PRIMARY operator logs (CLUSTER=... overrides)
