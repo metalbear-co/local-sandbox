@@ -28,6 +28,8 @@ func main() {
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("%s: %s %s from %s", name, r.Method, r.URL.Path, r.RemoteAddr)
+		// Plain text, so the echoed path is never rendered as HTML by a browser.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintf(w, "%s on %s: %s %s\n", name, hostname, r.Method, r.URL.Path)
 	})
 	log.Printf("%s listening on %s", name, *listen)
