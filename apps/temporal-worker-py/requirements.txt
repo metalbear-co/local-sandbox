@@ -1,0 +1,2 @@
+# Pinned to the customer-reported version of the Python SDK.
+temporalio==1.23.0

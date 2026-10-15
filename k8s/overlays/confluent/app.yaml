@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: confluent-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: confluent-consumer
+  template:
+    metadata:
+      labels:
+        app: confluent-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: confluent-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: KAFKA_BOOTSTRAP_SERVERS
+          value: "kafka-cluster.test-mirrord.svc.cluster.local:9092"
+        - name: KAFKA_TOPIC_NAME
+          value: "test-topic"
+        - name: KAFKA_GROUP_ID
+          value: "confluent-consumer-group"
+        # The group protocol the pod registers. The operator's forwarder offers
+        # range,roundrobin unless the property list says otherwise.
+        - name: KAFKA_ASSIGNMENT_STRATEGY
+          value: "cooperative-sticky"

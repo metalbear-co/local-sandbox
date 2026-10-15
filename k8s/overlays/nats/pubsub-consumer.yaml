@@ -1,0 +1,41 @@
+# Core NATS pub/sub consumer: subscribes to a plain subject (no JetStream).
+# The NATS_SUBJECT env flips the shared sandbox app into core pub/sub mode.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats-pubsub-consumer
+  namespace: test-mirrord
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nats-pubsub-consumer
+  template:
+    metadata:
+      labels:
+        app: nats-pubsub-consumer
+    spec:
+      initContainers:
+      - name: wait-for-nats
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for NATS to be ready..."
+          until nc -z nats.nats-sandbox.svc.cluster.local 4222 2>/dev/null; do
+            echo "NATS not ready yet, retrying in 2s..."
+            sleep 2
+          done
+          echo "NATS is ready!"
+      containers:
+      - name: consumer
+        image: nats-consumer:local
+        imagePullPolicy: Never
+        env:
+        - name: NATS_URL
+          value: "nats://nats.nats-sandbox.svc.cluster.local:4222"
+        - name: NATS_SUBJECT
+          value: "pubsub-orders.>"
+        - name: APP_NAME
+          value: "nats-pubsub-consumer"

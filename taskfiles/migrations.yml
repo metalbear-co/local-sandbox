@@ -8,6 +8,7 @@ version: "3"
 #   task migrations:flyway:image:run        flyway with IN-IMAGE sql (locations, nothing uploaded)
 #   task migrations:container:run           container flavor: postgres:17 image runs psql via MIRRORD_DB_* env
 #   task migrations:badimage:run            INT-539 repro: unpullable migration image (old operator hangs, fixed one fails fast)
+#   task migrations:pullsecrets:e2e         e2e: migration Job inherits the target's imagePullSecrets, exec + preview phases (Teladoc shape)
 #   task migrations:status                  branch CRDs, migration jobs, latest job logs
 #   task migrations:verify                  query the branch for the tables the migrations created
 #   task migrations:clean                   delete the branches these tasks created
@@ -100,6 +101,15 @@ tasks:
         echo ""
         echo "Session failed as expected. See the branch status.error: task migrations:status"
         echo "Delete the failed branch before rerunning: task migrations:clean"
+
+  pullsecrets:e2e:
+    desc: 'E2E: migration Job inherits the target''s imagePullSecrets - exec + preview phases (fake secret + public image, self-cleaning)'
+    interactive: true
+    dir: '{{.ROOT_DIR}}'
+    cmds:
+      # MIRRORD_BIN is left to the script: it prefers the local debug build and
+      # falls back to PATH, and an exported MIRRORD_BIN still wins.
+      - NAMESPACE={{.NAMESPACE}} {{.ROOT_DIR}}/scripts/test-migrations-pull-secrets.sh
 
   _run:
     internal: true

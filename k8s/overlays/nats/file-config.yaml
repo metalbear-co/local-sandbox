@@ -1,0 +1,13 @@
+# Names for the config-file scenario live in this mounted file, not in env
+# vars - the shape of apps whose config is baked into a ConfigMap (or injected
+# by Vault). The operator resolves the split names from the file and swaps the
+# deployment onto a rewritten copy for the session's duration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-file-config
+  namespace: test-mirrord
+data:
+  nats.yaml: |
+    stream: ORDERS-FILE
+    consumer: orders-file-app

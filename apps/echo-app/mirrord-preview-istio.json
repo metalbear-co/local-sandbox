@@ -1,0 +1,21 @@
+{
+  "target": {
+    "path": "deploy/echo-app",
+    "namespace": "test-istio"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "ports": [8080],
+        "http_filter": {
+          "header_filter": "X-Preview: {{ key }}"
+        }
+      }
+    }
+  }
+}

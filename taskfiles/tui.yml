@@ -1,0 +1,46 @@
+version: "3"
+
+# Target zoo for the mirrord-tui targets wizard: one namespace with every
+# workload kind the browser lists (Deployment + Service, a two-container
+# Deployment for the container drill-down, a bare Pod, a StatefulSet, and
+# a CronJob). Public images only - no build or minikube image load: the
+# workloads all `go run` the same zoo-echo app from a ConfigMap, each on
+# its own port (zoo-web :5678, zoo-sidecar :5679, zoo-sts :5680,
+# zoo-pod :5681).
+#
+#   task tui:deploy    apply the zoo into the tui-zoo namespace
+#   task tui:status    list what the TUI target browser should be showing
+#   task tui:local     build the local stand-in binary for the TUI Command field
+#   task tui:clean     delete the namespace
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  NAMESPACE: tui-zoo
+  OVERLAY: '{{.ROOT_DIR}}/k8s/overlays/tui-zoo'
+
+tasks:
+  deploy:
+    desc: Deploy the target zoo for the mirrord-tui wizard
+    cmds:
+      - kubectl apply -k {{.OVERLAY}}
+      - kubectl -n {{.NAMESPACE}} rollout status deployment --timeout=120s
+      - kubectl -n {{.NAMESPACE}} rollout status statefulset zoo-sts --timeout=120s
+
+  status:
+    desc: List everything the TUI target browser should show
+    cmds:
+      - kubectl -n {{.NAMESPACE}} get deployments,statefulsets,pods,cronjobs,services
+
+  local:
+    desc: Build the local zoo-echo stand-in and print the TUI Command to use
+    cmds:
+      # -C instead of `dir:`, which templates before the dynamic ROOT_DIR
+      # resolves and lands the build in the wrong directory.
+      - go build -C {{.OVERLAY}}/zoo-echo -o zoo-echo main.go
+      - 'echo "TUI Command: {{.OVERLAY}}/zoo-echo/zoo-echo -listen :<workload port>"'
+
+  clean:
+    desc: Remove the target zoo
+    cmds:
+      - kubectl delete namespace {{.NAMESPACE}} --ignore-not-found

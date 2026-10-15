@@ -7,6 +7,11 @@ version: "3"
 #   task temporal:send:match     workflow id test-alice-*  -> your local session
 #   task temporal:send:nomatch   workflow id test-other-*  -> cluster worker
 #
+#   task temporal:test:activity-queue   before/after repro of the operator fix
+#                                for activities scheduled on the default task
+#                                queue by sdk-core workers (Python/TS); uses
+#                                apps/temporal-worker-py as the local worker
+#
 # The split filter lives in k8s/overlays/temporal/mirrord.json
 # (workflow_id matching ^test-alice-). Workflows are started via tctl inside
 # the temporal server pod; MESSAGE becomes the CheckoutWorkflow input.
@@ -109,6 +114,12 @@ tasks:
           test-alice-*) echo "started CheckoutWorkflow $WF_ID input='{{.MESSAGE}}' (-> local session)";;
           *)            echo "started CheckoutWorkflow $WF_ID input='{{.MESSAGE}}' (-> stays in cluster)";;
         esac
+
+  test:activity-queue:
+    desc: "Before/after repro of the activity task-queue rewrite fix (MODE=before|after|both)"
+    interactive: true
+    cmds:
+      - "{{.ROOT_DIR}}/scripts/test-temporal-activity-queue.sh {{.MODE | default \"\"}}"
 
   mtls:deploy:
     desc: Front Temporal with an mTLS nginx proxy and point the operator at it

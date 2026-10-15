@@ -1,0 +1,79 @@
+version: "3"
+
+# S3 bucket branching test env. LocalStack plays the customer's AWS account:
+# the operator clones the target's bucket in it and points the session's
+# bucket env var at the clone - no branch pod, no tunnel. The heavy lifting
+# lives in scripts/test-s3-branch.sh; see its header for the scenario details.
+#
+# The operator must run with `operator.s3Branching: true` (the sandbox
+# operator-values.yaml enables it) - redeploy with `task operator:use` if the
+# deployed one predates the flag.
+
+vars:
+  SCRIPT: '{{.ROOT_DIR}}/scripts/test-s3-branch.sh'
+  NAMESPACE: test-mirrord
+  BRANCH_CRD: branchdatabases.dbs.mirrord.metalbear.co
+  RECORD_CRD: mirrordclusterexternalresources.mirrord.metalbear.co
+
+tasks:
+  test:
+    desc: "Run the full S3 branching e2e: copy, empty and failure scenarios plus the cleanup chain"
+    interactive: true
+    cmds:
+      - "{{.SCRIPT}} all"
+
+  test:copy:
+    desc: "Only the copy scenario (objects, settings, record, env override)"
+    interactive: true
+    cmds:
+      - "{{.SCRIPT}} copy"
+
+  test:empty:
+    desc: "Only the empty-copy scenario"
+    interactive: true
+    cmds:
+      - "{{.SCRIPT}} empty"
+
+  test:failure:
+    desc: "Only the missing-source-bucket failure scenario"
+    interactive: true
+    cmds:
+      - "{{.SCRIPT}} failure"
+
+  status:
+    desc: "Show S3 branches, their bucket records, and mirrord buckets in LocalStack"
+    cmds:
+      - |
+        echo "=== BranchDatabases (S3) ==="
+        kubectl get {{.BRANCH_CRD}} -n {{.NAMESPACE}} -o json 2>/dev/null \
+          | jq -r '.items[] | select(.spec.s3Options != null)
+              | "\(.metadata.name)  phase=\(.status.phase // "-")  bucket=\(.metadata.annotations["operator.metalbear.co/s3-branch-bucket"] // "-")"' \
+          | grep . || echo "none"
+        echo "=== Bucket records ==="
+        kubectl get {{.RECORD_CRD}} 2>/dev/null | grep -E 'NAME|s3-branch-bucket' || echo "none"
+        echo "=== mirrord buckets in LocalStack ==="
+        kubectl exec -n localstack deploy/localstack -- awslocal s3 ls 2>/dev/null \
+          | grep mirrord- || echo "none"
+
+  clean:
+    desc: "Delete S3 test branches, the target app, and mirrord test buckets from LocalStack"
+    cmds:
+      - |
+        kubectl get {{.BRANCH_CRD}} -n {{.NAMESPACE}} -o json 2>/dev/null \
+          | jq -r '.items[] | select(.spec.s3Options != null) | .metadata.name' \
+          | while read -r name; do
+              kubectl delete {{.BRANCH_CRD}} -n {{.NAMESPACE}} "$name" --ignore-not-found
+            done
+        kubectl delete deploy/s3-app -n {{.NAMESPACE}} --ignore-not-found
+      # Versioned buckets refuse a plain force-remove; drop all versions first
+      # (jq runs on the host - the LocalStack image has no jq).
+      - |
+        aws_exec() { kubectl exec -n localstack deploy/localstack -- awslocal "$@"; }
+        for bucket in $(aws_exec s3 ls 2>/dev/null | awk '{print $3}' | grep -E '^mirrord-'); do
+          versions=$(aws_exec s3api list-object-versions --bucket "$bucket" --output json 2>/dev/null \
+            | jq -c '{Objects: ([.Versions // [], .DeleteMarkers // []] | add | map({Key: .Key, VersionId: .VersionId}))}')
+          if [ "$(printf '%s' "$versions" | jq '.Objects | length')" -gt 0 ] 2>/dev/null; then
+            aws_exec s3api delete-objects --bucket "$bucket" --delete "$versions" >/dev/null 2>&1
+          fi
+          aws_exec s3 rb "s3://$bucket" 2>/dev/null && echo "removed $bucket" || echo "could not remove $bucket"
+        done

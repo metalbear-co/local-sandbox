@@ -1,0 +1,9 @@
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: nats-sandbox-config
+  namespace: test-mirrord
+spec:
+  properties:
+  - name: url
+    value: "nats://nats.nats-sandbox.svc.cluster.local:4222"

@@ -1,0 +1,25 @@
+{
+  "target": {
+    "path": {
+      "labels": {
+        "preview-group": "echo-label"
+      }
+    },
+    "namespace": "test-mirrord"
+  },
+  "feature": {
+    "preview": {
+      "ttl_mins": 30,
+      "creation_timeout_secs": 300
+    },
+    "network": {
+      "incoming": {
+        "mode": "steal",
+        "ports": [8080],
+        "http_filter": {
+          "header_filter": "X-Preview: {{ key }}"
+        }
+      }
+    }
+  }
+}

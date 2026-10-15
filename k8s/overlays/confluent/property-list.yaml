@@ -1,0 +1,15 @@
+# Kafka connection for the confluent split, plain. The forwarder joins with
+# librdkafka's default range,roundrobin while the pod registered the group as
+# cooperative-sticky, so the join is rejected with INCONSISTENT_GROUP_PROTOCOL.
+# `task confluent:strategy:on` and `task confluent:fix:on` swap in the variants.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: confluent-kafka-connection
+  namespace: test-mirrord
+spec:
+  properties:
+    - name: bootstrap.servers
+      value: kafka-cluster.test-mirrord.svc.cluster.local:9092
+    - name: security.protocol
+      value: PLAINTEXT

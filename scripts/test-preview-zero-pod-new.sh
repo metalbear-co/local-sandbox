@@ -37,6 +37,7 @@ READY_TIMEOUT="${READY_TIMEOUT:-90}"
 source "$SCRIPT_DIR/preview-zero-pod-lib.sh"
 
 SESSION_NAME="${SESSION_NAME:-preview-zero-pod-new}"
+SESSION_B_NAME="${SESSION_B_NAME:-preview-zero-pod-new-b}"
 
 banner "Zero-pod preview split vs a LOCAL operator:dev (new) operator" \
        "session: $SESSION_NAME  target: deploy/$CONSUMER_DEPLOY (0 replicas)"
@@ -107,6 +108,35 @@ main() {
     return 1
   fi
 
+  # --- Second concurrent preview against the same podless target -------------
+  # Preview A's pod copies the target's labels, so the operator must not mistake it for a
+  # live target pod: session B has to come up as fast as session A did.
+  say "Creating a second session ($SESSION_B_NAME, filter user_id=second-user)"
+  create_preview_session "$SESSION_B_NAME" "$MARKER" "^second-user$" || return 1
+  wait_for_settled_phase "$SESSION_B_NAME" "$READY_TIMEOUT"
+  case "$WAIT_PHASE" in
+    Ready) ok "second session Ready after ${WAIT_ELAPSED}s despite session A's pod being up" ;;
+    Failed)
+      err "second session Failed after ${WAIT_ELAPSED}s: $(session_failure_message "$SESSION_B_NAME")"
+      return 1
+      ;;
+    *)
+      err "second session did not settle within ${READY_TIMEOUT}s (last phase: ${WAIT_PHASE:-<none>})"
+      err "likely the operator counted session A's preview pod as a live target pod"
+      return 1
+      ;;
+  esac
+
+  local match_b_msg="zero-pod-match-b-$RUN_TAG"
+  say "Sending a message for the second session (user_id=second-user): $match_b_msg"
+  send_kafka_message "second-user" "$match_b_msg" || { err "failed to produce to kafka"; return 1; }
+  if wait_for_log_line "$SESSION_B_NAME" "$match_b_msg" 60; then
+    ok "second preview pod received its message"
+  else
+    err "second session's message never showed up in deploy/$SESSION_B_NAME logs"
+    return 1
+  fi
+
   # --- Non-matching message survives until the target scales up -------------
   local nomatch_msg="zero-pod-nomatch-$RUN_TAG"
   say "Sending a non-matching message: $nomatch_msg (no consumer exists yet)"
@@ -135,20 +165,22 @@ main() {
   if [ "$KEEP" = 1 ]; then
     warn "KEEP=1: skipping the teardown-restores-env check"
   else
-    say "Deleting the session; the workload env must be restored"
-    kubectl delete previewsession "$SESSION_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null
+    say "Deleting both sessions; the workload env must be restored"
+    kubectl delete previewsession "$SESSION_NAME" "$SESSION_B_NAME" -n "$NAMESPACE" --ignore-not-found >/dev/null
     wait_for_session_gone "$SESSION_NAME" 90 || return 1
+    wait_for_session_gone "$SESSION_B_NAME" 90 || return 1
     wait_for_unpatch 90 || return 1
     ok "workload unpatched after session deletion"
   fi
 
   verdict pass \
     "Zero-pod queue-split preview works end to end on the new operator:" \
-    "Ready in ${WAIT_ELAPSED}s with 0 target pods, filtered routing verified," \
-    "scale-up picked up the fallback env, teardown restored it."
+    "Ready with 0 target pods, a second concurrent session stayed fast," \
+    "filtered routing verified per session, scale-up picked up the" \
+    "fallback env, teardown restored it."
 }
 
 rc=0
 main || rc=1
-cleanup_scenario "$SESSION_NAME"
+cleanup_scenario "$SESSION_NAME" "$SESSION_B_NAME"
 exit "$rc"

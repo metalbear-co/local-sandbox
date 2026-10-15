@@ -1,0 +1,21 @@
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: nats-pubsub-test-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nats-pubsub-consumer
+  # Bounds the post-session linger for symmetry with the other configs; core
+  # pub/sub has no backlog, so teardown never actually waits on one.
+  drainTimeout: 60
+  clientConfigs:
+    nats: nats-sandbox-config
+  queues:
+  - id: pubsub-orders
+    kind: natsPubSub
+    appConfig:
+      subject:
+      - env: NATS_SUBJECT

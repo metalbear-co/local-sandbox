@@ -16,6 +16,32 @@ task <mod>:branches / logs / logs:branch / status / clean
 label (`BRANCH=<name>` picks a specific one) and lists existing branch CRDs
 when none is running.
 
+## S3 bucket branching
+
+S3 branches have no pod - the operator clones the target's bucket in the
+customer's account (LocalStack here) and rewrites the session's bucket env
+var - so the module has no `query:*`/`shell:*` verbs. Instead one gum script
+(`scripts/test-s3-branch.sh`) deploys everything and walks the scenarios:
+
+```bash
+task s3:test           # copy, empty and failure scenarios + the cleanup chain
+task s3:test:copy      # objects, cloned settings, bucket record, env override
+task s3:test:empty     # branch bucket created with no objects
+task s3:test:failure   # missing source bucket -> Failed with a naming error
+task s3:status         # branches, bucket records, mirrord buckets in LocalStack
+task s3:clean          # sweep test branches, target app and buckets
+```
+
+Until a release ships the S3 controller, the only operator that can run
+these branches is `task operator:dev` from the s3-branching checkout; it gets
+`OPERATOR_S3_BRANCHING=true` from the env override in
+`.mirrord/operator-dev.yaml` (a released chart does not render the flag).
+The script detects the dev operator and labels its sessions with the
+isolation marker like the other modules. During `operator:dev` the deployed
+pod runs as a sleeping busybox anchor (env + ServiceAccount + service
+endpoint only), so the deployed operator is out of the picture entirely;
+`task operator:use` restores it.
+
 ## Query examples per DB
 
 Each module header has copy-pasteable examples; the short version:

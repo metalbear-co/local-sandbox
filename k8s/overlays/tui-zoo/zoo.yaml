@@ -1,0 +1,196 @@
+# A zoo of workload kinds for exercising the mirrord-tui target browser:
+# every kind renders with its own badge, and the multi-container pods
+# exercise the container drill-down.
+#
+# Every workload runs the same zoo-echo Go app (`zoo-echo/main.go`, shipped
+# in as a ConfigMap and `go run` on the public golang image, so deploying
+# still needs no build or image load). Each workload listens on its own
+# port, so several services can run under mirrord locally at the same time
+# without colliding on a local bind:
+#
+#   zoo-web :5678 · zoo-sidecar :5679 · zoo-sts :5680 · zoo-pod :5681
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zoo-web
+  labels:
+    app: zoo-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zoo-web
+  template:
+    metadata:
+      labels:
+        app: zoo-web
+    spec:
+      containers:
+        - name: web
+          image: golang:alpine
+          command: ["go", "run", "/zoo-echo/main.go", "-listen", ":5678"]
+          env:
+            - name: ZOO_NAME
+              value: zoo-web
+          ports:
+            - containerPort: 5678
+          # `go run` compiles first; the probe keeps rollout status honest.
+          readinessProbe:
+            tcpSocket:
+              port: 5678
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          volumeMounts:
+            - name: zoo-echo-src
+              mountPath: /zoo-echo
+      volumes:
+        - name: zoo-echo-src
+          configMap:
+            name: zoo-echo-src
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zoo-web
+spec:
+  selector:
+    app: zoo-web
+  ports:
+    - port: 80
+      targetPort: 5678
+---
+# Two containers, so the pod expands in the browser tree.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zoo-sidecar
+  labels:
+    app: zoo-sidecar
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zoo-sidecar
+  template:
+    metadata:
+      labels:
+        app: zoo-sidecar
+    spec:
+      containers:
+        - name: app
+          image: golang:alpine
+          command: ["go", "run", "/zoo-echo/main.go", "-listen", ":5679"]
+          env:
+            - name: ZOO_NAME
+              value: zoo-sidecar
+          ports:
+            - containerPort: 5679
+          readinessProbe:
+            tcpSocket:
+              port: 5679
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          volumeMounts:
+            - name: zoo-echo-src
+              mountPath: /zoo-echo
+        - name: sidecar
+          image: nginx:alpine
+          ports:
+            - containerPort: 80
+      volumes:
+        - name: zoo-echo-src
+          configMap:
+            name: zoo-echo-src
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: zoo-pod
+  labels:
+    app: zoo-pod
+spec:
+  containers:
+    - name: echo
+      image: golang:alpine
+      command: ["go", "run", "/zoo-echo/main.go", "-listen", ":5681"]
+      env:
+        - name: ZOO_NAME
+          value: zoo-pod
+      ports:
+        - containerPort: 5681
+      readinessProbe:
+        tcpSocket:
+          port: 5681
+        initialDelaySeconds: 5
+        periodSeconds: 3
+      volumeMounts:
+        - name: zoo-echo-src
+          mountPath: /zoo-echo
+  volumes:
+    - name: zoo-echo-src
+      configMap:
+        name: zoo-echo-src
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zoo-sts
+spec:
+  clusterIP: None
+  selector:
+    app: zoo-sts
+  ports:
+    - port: 5680
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: zoo-sts
+spec:
+  serviceName: zoo-sts
+  replicas: 1
+  selector:
+    matchLabels:
+      app: zoo-sts
+  template:
+    metadata:
+      labels:
+        app: zoo-sts
+    spec:
+      containers:
+        - name: echo
+          image: golang:alpine
+          command: ["go", "run", "/zoo-echo/main.go", "-listen", ":5680"]
+          env:
+            - name: ZOO_NAME
+              value: zoo-sts
+          ports:
+            - containerPort: 5680
+          readinessProbe:
+            tcpSocket:
+              port: 5680
+            initialDelaySeconds: 5
+            periodSeconds: 3
+          volumeMounts:
+            - name: zoo-echo-src
+              mountPath: /zoo-echo
+      volumes:
+        - name: zoo-echo-src
+          configMap:
+            name: zoo-echo-src
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: zoo-cron
+spec:
+  schedule: "*/10 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: tick
+              image: busybox
+              command: ["sh", "-c", "echo zoo-cron tick"]

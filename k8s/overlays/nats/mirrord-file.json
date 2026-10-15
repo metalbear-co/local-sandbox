@@ -1,0 +1,21 @@
+{
+  "target": {
+    "path": "deployment/nats-file-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "orders-file": {
+        "queue_type": "NATS",
+        "message_filter": {
+          "tenant": "^acme$"
+        }
+      }
+    },
+    "fs": {
+      "mode": "localwithoverrides",
+      "read_only": ["^/config/"]
+    }
+  }
+}

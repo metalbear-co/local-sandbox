@@ -1,0 +1,269 @@
+--- a/services/crm-server/src/sql_models/ci.rs
++++ b/services/crm-server/src/sql_models/ci.rs
+@@ -371,6 +371,20 @@
+ /// ```
+ #[cfg(test)]
+ mod tests {
++    use std::{
++        net::SocketAddr,
++        sync::{
++            Arc, Mutex,
++            atomic::{AtomicBool, AtomicUsize, Ordering},
++        },
++    };
++
++    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
++    use tokio::{
++        io::{AsyncReadExt, AsyncWriteExt},
++        net::{TcpListener, TcpStream},
++    };
++
+     use super::*;
+ 
+     const ORG: &str = "org-under-test";
+@@ -496,4 +510,245 @@
+             vec![Uuid::from_u128(1)],
+         );
+     }
++
++    /// A TCP relay between the pool and Postgres that can end a connection right after the
++    /// server's next reply is delivered. It ends it with a FIN and no RST, so the client still
++    /// reads that reply fine and only its next read sees end of stream - which is exactly how
++    /// the stale Cloud SQL proxy connection looked from crm-server in production.
++    struct StaleConnectionProxy {
++        address: SocketAddr,
++        /// One cut flag per accepted connection, in the order they were opened.
++        cut_flags: Arc<Mutex<Vec<Arc<AtomicBool>>>>,
++        connections_opened: Arc<AtomicUsize>,
++        shutdown: CancellationToken,
++    }
++
++    impl StaleConnectionProxy {
++        async fn start(upstream_host: String, upstream_port: u16) -> Self {
++            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
++            let address = listener.local_addr().unwrap();
++            let cut_flags = Arc::new(Mutex::new(Vec::new()));
++            let connections_opened = Arc::new(AtomicUsize::new(0));
++            let shutdown = CancellationToken::new();
++
++            tokio::spawn({
++                let cut_flags = cut_flags.clone();
++                let connections_opened = connections_opened.clone();
++                let shutdown = shutdown.clone();
++                async move {
++                    loop {
++                        let client = select! {
++                            _ = shutdown.cancelled() => break,
++                            accepted = listener.accept() => accepted.unwrap().0,
++                        };
++                        let server = TcpStream::connect((upstream_host.as_str(), upstream_port))
++                            .await
++                            .unwrap();
++                        connections_opened.fetch_add(1, Ordering::SeqCst);
++                        let cut_flag = Arc::new(AtomicBool::new(false));
++                        cut_flags.lock().unwrap().push(cut_flag.clone());
++                        tokio::spawn(Self::relay(client, server, cut_flag, shutdown.clone()));
++                    }
++                }
++            });
++
++            Self {
++                address,
++                cut_flags,
++                connections_opened,
++                shutdown,
++            }
++        }
++
++        /// Arms every connection open right now: the next reply the server sends on it is the
++        /// last thing the client gets. Connections opened later are untouched, like a socket
++        /// opened after the sidecar culled the ones that idled through the throttled window.
++        fn cut_open_connections_after_next_reply(&self) {
++            for cut_flag in self.cut_flags.lock().unwrap().iter() {
++                cut_flag.store(true, Ordering::SeqCst);
++            }
++        }
++
++        /// How many armed connections have not been cut yet.
++        fn armed_connections(&self) -> usize {
++            self.cut_flags
++                .lock()
++                .unwrap()
++                .iter()
++                .filter(|cut_flag| cut_flag.load(Ordering::SeqCst))
++                .count()
++        }
++
++        fn connections_opened(&self) -> usize {
++            self.connections_opened.load(Ordering::SeqCst)
++        }
++
++        async fn relay(
++            client: TcpStream,
++            server: TcpStream,
++            cut_after_next_reply: Arc<AtomicBool>,
++            shutdown: CancellationToken,
++        ) {
++            let (mut client_read, mut client_write) = client.into_split();
++            let (mut server_read, mut server_write) = server.into_split();
++            let to_server =
++                tokio::spawn(
++                    async move { tokio::io::copy(&mut client_read, &mut server_write).await },
++                );
++
++            let mut buffer = [0u8; 8192];
++            loop {
++                let read = server_read.read(&mut buffer).await.unwrap_or(0);
++                if read == 0 {
++                    break;
++                }
++                client_write.write_all(&buffer[..read]).await.unwrap();
++
++                if cut_after_next_reply.swap(false, Ordering::SeqCst) {
++                    to_server.abort();
++                    client_write.shutdown().await.unwrap();
++                    // Keep the write half alive until the test ends: dropping it now would turn
++                    // the FIN into an RST as soon as the client's next query lands unread here.
++                    shutdown.cancelled().await;
++                    return;
++                }
++            }
++            to_server.abort();
++        }
++    }
++
++    impl Drop for StaleConnectionProxy {
++        fn drop(&mut self) {
++            self.shutdown.cancel();
++        }
++    }
++
++    /// Production 500 on `GET /api/v1/ci/sessions` (2026-09-04): crm-server runs on Cloud Run
++    /// with the CPU throttled between requests, so the Cloud SQL proxy sidecar only notices
++    /// that an idle connection died when the next request wakes the instance - after the pool's
++    /// pre-acquire ping already passed on it, right before our query. The query then reads EOF
++    /// ("expected to read 5 bytes, got 0 bytes at EOF") and one dead pooled connection becomes
++    /// one failed request. The proxy below ends the connection right after that ping's reply,
++    /// and the storage must answer from a fresh connection instead.
++    #[sqlx::test(migrations = "./migrations")]
++    #[ignore = "requires an active Postgres DB (set with DATABASE_URL)"]
++    async fn a_query_survives_its_connection_dying_after_the_acquire_ping(
++        _pool_opts: PgPoolOptions,
++        connect_opts: PgConnectOptions,
++    ) {
++        let proxy = StaleConnectionProxy::start(
++            connect_opts.get_host().to_owned(),
++            connect_opts.get_port(),
++        )
++        .await;
++        // Same pool settings as `main.rs`: sqlx defaults plus an acquire timeout.
++        let pool = PgPoolOptions::new()
++            .acquire_timeout(Duration::from_secs(5))
++            .connect_with(connect_opts.host("127.0.0.1").port(proxy.address.port()))
++            .await
++            .unwrap();
++        let storage = CiSessionsStorage::new(pool.clone());
++
++        // Leaves one connection idle in the pool once its release-time ping is done.
++        storage
++            .ci_session_start_or_keep_alive(start_request(1, ORG, Some(SessionType::Ci)))
++            .await
++            .unwrap();
++        tokio::time::timeout(Duration::from_secs(5), async {
++            while pool.num_idle() == 0 {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("the warm-up connection never returned to the pool");
++        assert_eq!(proxy.connections_opened(), 1);
++
++        proxy.cut_open_connections_after_next_reply();
++        let uids = storage
++            .active_ci_sessions(GetActiveCiSessionsRequest {
++                organization_id: ORG.to_owned(),
++                session_types: vec![SessionType::Ci as i32],
++            })
++            .await
++            .expect("a pooled connection dying after the acquire ping must not fail the request")
++            .into_iter()
++            .map(|session| session.uid)
++            .collect::<Vec<_>>();
++
++        assert_eq!(uids, vec![Uuid::from_u128(1)]);
++        assert_eq!(
++            proxy.armed_connections(),
++            0,
++            "the proxy never cut the connection, so the stale path was not exercised"
++        );
++        assert_eq!(
++            proxy.connections_opened(),
++            2,
++            "the retry must run on a freshly opened connection"
++        );
++    }
++
++    /// Review follow-up to the test above: the retry must not just take the next idle
++    /// connection from the pool. On Cloud Run every connection that idled through the throttled
++    /// window is cut in the same burst, so the second pooled one dies right after its own ping
++    /// exactly like the first. With two idle connections both armed, the request only survives
++    /// if the retry runs on a socket opened after the cut.
++    #[sqlx::test(migrations = "./migrations")]
++    #[ignore = "requires an active Postgres DB (set with DATABASE_URL)"]
++    async fn a_query_survives_every_idle_connection_dying_after_the_acquire_ping(
++        _pool_opts: PgPoolOptions,
++        connect_opts: PgConnectOptions,
++    ) {
++        let proxy = StaleConnectionProxy::start(
++            connect_opts.get_host().to_owned(),
++            connect_opts.get_port(),
++        )
++        .await;
++        let pool = PgPoolOptions::new()
++            .acquire_timeout(Duration::from_secs(5))
++            .connect_with(connect_opts.host("127.0.0.1").port(proxy.address.port()))
++            .await
++            .unwrap();
++        let storage = CiSessionsStorage::new(pool.clone());
++
++        // Two concurrent warm-ups leave two idle connections in the pool.
++        let (first, second) = tokio::join!(
++            storage.ci_session_start_or_keep_alive(start_request(1, ORG, Some(SessionType::Ci))),
++            storage.ci_session_start_or_keep_alive(start_request(2, ORG, Some(SessionType::Ci))),
++        );
++        first.unwrap();
++        second.unwrap();
++        tokio::time::timeout(Duration::from_secs(5), async {
++            while pool.num_idle() < 2 {
++                tokio::time::sleep(Duration::from_millis(10)).await;
++            }
++        })
++        .await
++        .expect("both warm-up connections never returned to the pool");
++        assert_eq!(
++            proxy.connections_opened(),
++            2,
++            "the warm-ups must have run on two separate connections"
++        );
++
++        proxy.cut_open_connections_after_next_reply();
++        let mut uids = storage
++            .active_ci_sessions(GetActiveCiSessionsRequest {
++                organization_id: ORG.to_owned(),
++                session_types: vec![SessionType::Ci as i32],
++            })
++            .await
++            .expect("the request must survive even though the next pooled connection is stale too")
++            .into_iter()
++            .map(|session| session.uid)
++            .collect::<Vec<_>>();
++        uids.sort();
++
++        assert_eq!(uids, vec![Uuid::from_u128(1), Uuid::from_u128(2)]);
++        assert_eq!(
++            proxy.connections_opened(),
++            3,
++            "the retry must run on a connection opened after the cut, not on the other stale pooled one"
++        );
++    }
+ }

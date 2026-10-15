@@ -1,0 +1,34 @@
+# Split config for the config-file scenario: the stream and consumer names are
+# resolved out of the mounted ConfigMap file via valueSelector, exercising the
+# file-binding path (ConfigMap copy for the cluster pod, session content for
+# the local app) instead of env var rewriting.
+apiVersion: queues.mirrord.metalbear.co/v1
+kind: MirrordSplitConfig
+metadata:
+  name: nats-file-test-config
+  namespace: test-mirrord
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: nats-file-consumer
+  # Bounds the post-session linger: a killed session can leave unconsumed
+  # messages in the main output, and without a cap the split waits on that
+  # backlog forever and leaks its tmp streams.
+  drainTimeout: 60
+  clientConfigs:
+    nats: nats-sandbox-config
+  queues:
+  - id: orders-file
+    kind: nats
+    appConfig:
+      stream:
+      - volume:
+          name: app-config
+          file: nats.yaml
+        valueSelector: ".stream"
+      consumer:
+      - volume:
+          name: app-config
+          file: nats.yaml
+        valueSelector: ".consumer"

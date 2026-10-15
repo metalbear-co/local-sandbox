@@ -1,0 +1,71 @@
+version: "3"
+
+# Disk hygiene for the dev machine. The two things that fill the disk are
+# rustc incremental caches (tens of GB across both repos, regrown on demand)
+# and Docker inside Colima (leaked test containers, stale images, anonymous
+# volumes, build cache). Colima's disk image only shrinks after an fstrim
+# inside the VM, which `clean` runs last.
+#
+#   task disk:size    where the space went (no changes)
+#   task disk:clean   safe cleanup: incremental caches, leaked test containers,
+#                     docker build cache, dangling images, anonymous volumes,
+#                     then fstrim the Colima VM
+#
+# Never touched: the cluster containers (bearkube and the multi-cluster
+# profiles) and their volumes, named volumes, tagged images.
+
+vars:
+  ROOT_DIR:
+    sh: git rev-parse --show-toplevel
+  TARGETS: '{{.ROOT_DIR}}/../operator/target {{.ROOT_DIR}}/../mirrord/target'
+
+tasks:
+  size:
+    desc: Show what is using the disk (cargo targets, Colima, Docker)
+    cmds:
+      - df -h / | tail -1
+      - |
+        for t in {{.TARGETS}}; do
+          [ -d "$t" ] || continue
+          du -sh "$t" "$t"/debug/incremental "$t"/aarch64-apple-darwin/debug/incremental 2>/dev/null || true
+        done
+      - du -sh ~/.colima 2>/dev/null || true
+      - docker system df
+
+  clean:
+    desc: Free disk safely (incremental caches, leaked test containers, docker cache, anonymous volumes, VM trim)
+    cmds:
+      - |
+        for t in {{.TARGETS}}; do
+          rm -rf "$t"/debug/incremental "$t"/aarch64-apple-darwin/debug/incremental
+        done
+        echo "rustc incremental caches removed"
+      # Leaked testcontainers: auto-named containers of the DB/emulator images
+      # the test suites start and sometimes leave behind. Cluster containers
+      # run the kicbase image and are never matched.
+      - |
+        leaked="$(docker ps --format '{{"{{"}}.Names{{"}}"}}\t{{"{{"}}.Image{{"}}"}}' \
+          | grep -E 'postgres:|redis:|mysql:|mariadb:|mongo|mssql|azure-sql|cloud-sdk:emulators|localstack|rabbitmq|kafka|nats' \
+          | cut -f1)"
+        if [ -n "$leaked" ]; then
+          echo "$leaked" | xargs docker rm -f >/dev/null && echo "removed leaked test containers:" && echo "$leaked"
+        else
+          echo "no leaked test containers"
+        fi
+      - docker builder prune -a -f | tail -1
+      - docker image prune -f | tail -1
+      - docker container prune -f | tail -1
+      # Only anonymous (hash-named) dangling volumes; named ones such as the
+      # stopped minikube profiles or mirrord-branch-cargo stay.
+      - |
+        anon="$(docker volume ls -qf dangling=true | grep -E '^[0-9a-f]{64}$' || true)"
+        if [ -n "$anon" ]; then echo "$anon" | xargs docker volume rm >/dev/null && echo "removed $(echo "$anon" | wc -l | tr -d ' ') anonymous volumes"; else echo "no anonymous dangling volumes"; fi
+      - colima ssh -- sudo fstrim -av 2>&1 | tail -1 || true
+      - task: size
+      - |
+        echo ""
+        echo "Still reclaimable by hand if needed:"
+        echo "  docker images            # stale tagged images (re-pullable), docker rmi <image>"
+        echo "  docker volume ls         # stopped minikube profiles: minikube delete -p <profile>"
+        echo "  docker buildx ls         # multiarch builder state: docker buildx rm <name>"
+        echo "  cargo clean in a repo    # last resort, full rebuild"

@@ -1,0 +1,17 @@
+{
+  "target": {
+    "path": "deployment/nats-pubsub-consumer",
+    "namespace": "test-mirrord"
+  },
+  "operator": true,
+  "feature": {
+    "split_queues": {
+      "pubsub-orders": {
+        "queue_type": "NATSPubSub",
+        "message_filter": {
+          "tenant": "^acme$"
+        }
+      }
+    }
+  }
+}

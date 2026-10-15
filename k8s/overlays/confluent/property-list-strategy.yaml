@@ -1,0 +1,17 @@
+# Same connection plus partition.assignment.strategy: the forwarder joins the
+# app's group speaking the same cooperative-sticky protocol, so the group can
+# be shared with no temporary group and no wait for a rollout. Applied by
+# `task confluent:strategy:on`.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: confluent-kafka-connection
+  namespace: test-mirrord
+spec:
+  properties:
+    - name: bootstrap.servers
+      value: kafka-cluster.test-mirrord.svc.cluster.local:9092
+    - name: security.protocol
+      value: PLAINTEXT
+    - name: partition.assignment.strategy
+      value: cooperative-sticky

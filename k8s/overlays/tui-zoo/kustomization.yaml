@@ -1,0 +1,20 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tui-zoo
+
+resources:
+  - namespace.yaml
+  - zoo.yaml
+
+# The zoo-echo source the workloads `go run`. The name stays stable (no
+# content hash) because the bare zoo-pod's volume ref is immutable; after
+# editing main.go, redeploy with `task tui:clean` + `task tui:deploy` to
+# get pods onto the new source.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: zoo-echo-src
+    files:
+      - zoo-echo/main.go

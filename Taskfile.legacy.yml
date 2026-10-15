@@ -352,7 +352,9 @@ tasks:
     desc: Install Argo Rollouts
     cmds:
       - kubectl create namespace argo-rollouts --dry-run=client -o yaml | kubectl apply -f -
-      - kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+      # Server-side apply: the rollouts CRDs exceed the 256KB annotation limit that
+      # client-side apply needs for its last-applied-configuration annotation.
+      - kubectl apply --server-side -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
       - kubectl wait --for=condition=available deployment/argo-rollouts -n argo-rollouts --timeout=300s
 
   infra:argocd:

@@ -1,0 +1,16 @@
+# Same connection plus mirrord.temporary_group_id: the split repoints the pod
+# to a generated temporary group, leaving the original group to the forwarder
+# once the old pod leaves. Applied by `task confluent:fix:on`.
+apiVersion: mirrord.metalbear.co/v1
+kind: MirrordPropertyList
+metadata:
+  name: confluent-kafka-connection
+  namespace: test-mirrord
+spec:
+  properties:
+    - name: bootstrap.servers
+      value: kafka-cluster.test-mirrord.svc.cluster.local:9092
+    - name: security.protocol
+      value: PLAINTEXT
+    - name: mirrord.temporary_group_id
+      value: "true"
