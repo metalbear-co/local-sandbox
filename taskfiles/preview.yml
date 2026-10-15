@@ -24,6 +24,7 @@ version: "3"
 #   task preview:cronjob:start        start a preview of that CronJob (schedule override */1, triggered once on start)
 #   task preview:cronjob:verify       show the preview CronJob, its trigger job, scheduled jobs, and the trigger pod's logs
 #   task preview:test:cronjob         end-to-end script: inherit, override, stop cleanup, invalid schedule, idle rejected, trigger_on_start off
+#   task preview:test:helm            end-to-end script: previews from a Helm chart (--chart/--values/--release-name, feature.preview.helm, preview diff)
 #   task preview:test:service-isolation   end-to-end: prove preview pods stay out of the target Service's dataplane even when readiness is ignored (EXPECT=broken asserts the pre-fix leak instead)
 #   task preview:test:label           end-to-end script: one label-target preview takes X-Preview traffic from two workloads sharing the label; stop hands it back; no-match selector fails
 #   task preview:test:istio           end-to-end: preview delivery on an Istio-injected target under STRICT mTLS (EXPECT=broken asserts the pre-fix failure; needs istio:install)
@@ -596,6 +597,19 @@ tasks:
     desc: End-to-end - CronJob previews (inherit, override + scheduled run, stop cleanup, invalid schedule, idle rejected, trigger_on_start off)
     cmds:
       - MIRRORD_BIN={{.MIRRORD_BIN}} {{.ROOT_DIR}}/scripts/test-preview-cronjob.sh
+
+  test:helm:
+    desc: End-to-end - previews built from a Helm chart (--chart, --values, --release-name, feature.preview.helm, preview diff); values reach the preview only, a wrong release name falls back to the live spec, broken charts create nothing (needs helm, task operator:crds + operator:dev + CLI from the feature branch)
+    vars:
+      PREVIEW_KEY: '{{.PREVIEW_KEY | default "test-helm"}}'
+    cmds:
+      - MIRRORD_BIN={{.MIRRORD_BIN}} NAMESPACE={{.NAMESPACE}} PREVIEW_KEY={{.PREVIEW_KEY}} {{.ROOT_DIR}}/scripts/test-preview-helm.sh
+      - |
+        echo
+        echo "Next:"
+        echo "  KEEP=1 task preview:test:helm   # keep the workload + last preview for inspection"
+        echo "  task preview:status             # list preview sessions"
+        echo "  task preview:clean              # remove leftovers"
 
   cronjob:clean:
     desc: Remove the echo-cron source CronJob
